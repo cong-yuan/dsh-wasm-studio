@@ -14,6 +14,7 @@
     type Discovered,
   } from "$lib/api";
   import { getPlugins, refreshAll, isLoading } from "$lib/state.svelte";
+  import Slot from "$lib/Slot.svelte";
 
   let showLoad = $state(false);
   let busy = $state<string | null>(null);
@@ -243,6 +244,14 @@
       </tbody>
     </table>
   {/if}
+</div>
+
+<div class="card" style="margin-top: 20px;">
+  <div class="card-head"><h2>Plugin detail</h2></div>
+  <div style="padding: 12px 16px;">
+    <!-- plugins render their own detail panels here -->
+    <Slot slot="plugin.detail" empty={true} />
+  </div>
 </div>
 
 {#if showLoad}

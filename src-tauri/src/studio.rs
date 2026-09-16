@@ -285,14 +285,20 @@ impl Studio {
     // -----------------------------------------------------------------------
 
     /// Load a guest into the registry (no-op if already loaded).
-    fn ensure_loaded(&self, slot: &str, path: &str, config: Value) -> Result<()> {
-        if !self.shared.host.is_loaded(slot) {
-            self.shared
-                .host
-                .load(slot, path, config)
-                .with_context(|| format!("loading `{path}` into slot `{slot}`"))?;
+    /// Async: instantiating runs guest code, so it must be off the runtime.
+    async fn ensure_loaded(&self, slot: &str, path: &str, config: Value) -> Result<()> {
+        if self.shared.host.is_loaded(slot) {
+            return Ok(());
         }
-        Ok(())
+        let host = self.shared.host.clone();
+        let slot = slot.to_string();
+        let path = path.to_string();
+        off_runtime(move || {
+            host.load(&slot, &path, config)
+                .map(|_report| ())
+                .with_context(|| format!("loading `{path}` into slot `{slot}`"))
+        })
+        .await
     }
 
     /// Mount the cordis fiber for an **already-loaded** slot. Its `inject` list
@@ -369,7 +375,7 @@ impl Studio {
         if self.is_mounted(slot) {
             self.dispose_fiber(slot).await;
         }
-        self.ensure_loaded(slot, path, config)?;
+        self.ensure_loaded(slot, path, config).await?;
         self.mount_fiber(slot).await
     }
 
@@ -388,7 +394,9 @@ impl Studio {
     pub async fn unmount_inner(&self, slot: &str) -> Result<()> {
         self.dispose_fiber(slot).await;
         if self.shared.host.is_loaded(slot) {
-            self.shared.host.unload(slot)?;
+            let host = self.shared.host.clone();
+            let slot = slot.to_string();
+            off_runtime(move || host.unload(&slot)).await?;
         }
         Ok(())
     }
@@ -441,7 +449,9 @@ impl Studio {
         self.dispose_fiber(slot).await;
 
         // 2. Atomic code swap. On failure the OLD code stays loaded.
-        let result = self.shared.host.reload(slot, &path, None);
+        let host = self.shared.host.clone();
+        let slot_owned = slot.to_string();
+        let result = off_runtime(move || host.reload(&slot_owned, &path, None)).await;
 
         // 3. Remount either way, so the registry and the harness agree.
         self.mount_fiber(slot).await?;
@@ -473,8 +483,12 @@ impl Studio {
     }
 
     /// Push a new config value to a running slot and persist it.
-    pub fn set_slot_config(&self, slot: &str, config: Value) -> Result<bool> {
-        let consumed = self.shared.host.apply_config(slot, config.clone())?;
+    /// Async: `apply_config` may invoke the guest's `plugin_on_config` hook.
+    pub async fn set_slot_config(&self, slot: &str, config: Value) -> Result<bool> {
+        let host = self.shared.host.clone();
+        let slot_owned = slot.to_string();
+        let cfg_in = config.clone();
+        let consumed = off_runtime(move || host.apply_config(&slot_owned, cfg_in)).await?;
         {
             let mut cfg = self.shared.config.lock().unwrap();
             if let Some(entry) = cfg.plugins.get_mut(slot) {
@@ -881,6 +895,30 @@ fn watcher_mtimes(paths: &[PathBuf]) -> std::collections::HashMap<String, u128> 
         }
     }
     out
+}
+
+/// Run `f` on the blocking pool and await it.
+///
+/// **Required for every call that reaches a guest.** `wasmtime-wasi` 44
+/// implements WASI p1 through `runtime::in_tokio`, which does
+/// `Handle::current().block_on(..)`. Invoking that from an async context nests
+/// `block_on` and panics ("Cannot start a runtime from within a runtime"), so a
+/// guest-touching call must never run on a tokio worker thread.
+///
+/// If there is no runtime at all (a synchronous caller, or a test), `f` runs
+/// inline — that path is already safe.
+async fn off_runtime<F, R>(f: F) -> R
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+{
+    if tokio::runtime::Handle::try_current().is_ok() {
+        tokio::task::spawn_blocking(f)
+            .await
+            .expect("blocking task panicked")
+    } else {
+        f()
+    }
 }
 
 /// Run `f` with a tokio runtime context available.

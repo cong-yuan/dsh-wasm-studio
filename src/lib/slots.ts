@@ -127,6 +127,11 @@ export class SlotRegistry {
     return id;
   }
 
+  /** Remove one claim by id. No-op if it is already gone. */
+  unclaim(id: string): void {
+    if (this.contributions.delete(id)) this.bump();
+  }
+
   /**
    * Remove everything owned by `owner` (slot opened + all its claims).
    * Claims *into* the owner's slots are kept — they become pending when their

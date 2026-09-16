@@ -1,5 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import Slot from "$lib/Slot.svelte";
   import {
     getStatus,
     getPlugins,
@@ -63,6 +64,9 @@
     </div>
   </div>
 </div>
+
+<!-- plugins may add dashboard cards -->
+<Slot slot="dashboard.cards" />
 
 {#if getEvents().length}
   <div class="card" style="margin-bottom: 20px;">

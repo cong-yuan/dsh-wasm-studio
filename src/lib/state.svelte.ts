@@ -4,6 +4,7 @@
 // rune-backed functions are clearer than a state library. Pages import these
 // and read them reactively.
 
+import { pluginHost } from "$lib/plugin-runtime";
 import {
   capabilities,
   errorMessage,
@@ -115,10 +116,15 @@ export async function wireEvents(): Promise<void> {
   wired = true;
   await onPluginChanged((ev) => {
     events = [ev, ...events].slice(0, 50);
-    // Any change means the tables may be stale.
+    // Any change means the tables may be stale, and the plugin set may have
+    // changed — so resync the frontend slot registry too.
     refreshAll();
+    pluginHost.sync();
   });
   await onChanged(() => {
     refreshAll();
+    pluginHost.sync();
   });
+  // Initial sync so plugins already loaded show up on first paint.
+  pluginHost.sync();
 }

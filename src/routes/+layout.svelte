@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { page } from "$app/state";
+  import Slot from "$lib/Slot.svelte";
   import {
     refreshAll,
     wireEvents,
@@ -20,6 +21,7 @@
     { href: "/tools", label: "Tools", icon: "⚒", key: "tools" },
     { href: "/services", label: "Services", icon: "◇", key: "services" },
     { href: "/logs", label: "Logs", icon: "≡", key: "logs" },
+    { href: "/settings", label: "Settings", icon: "⚙", key: "settings" },
     { href: "/capabilities", label: "Capabilities", icon: "✦", key: "caps" },
   ];
 
@@ -61,6 +63,10 @@
     {/each}
 
     <div class="spacer"></div>
+
+    <!-- plugins may add sidebar entries -->
+    <Slot slot="sidebar.items" />
+
     {#if getStatus()}
       <div class="faint" style="font-size: 11px; padding: 0 10px;">
         {#if getStatus()?.booted}

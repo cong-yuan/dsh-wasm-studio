@@ -123,7 +123,7 @@ pub async fn set_plugin_config(
     slot: String,
     config: Value,
 ) -> Result<bool, String> {
-    studio.set_slot_config(&slot, config).map_err(err)
+    studio.set_slot_config(&slot, config).await.map_err(err)
 }
 
 /// Validate a `.wasm` without loading it: `(plugin_name, tool_names)`.
@@ -246,6 +246,9 @@ pub fn list_tools(studio: State<'_, Studio>) -> Vec<ToolRow> {
 }
 
 /// Call a tool directly (bypassing the agent loop) with JSON args.
+///
+/// The guest call runs on the blocking pool: `wasmtime-wasi` 44 blocks
+/// internally for WASI calls, which panics on a tokio worker thread.
 #[tauri::command]
 pub async fn call_tool(
     studio: State<'_, Studio>,
@@ -253,7 +256,11 @@ pub async fn call_tool(
     args: Option<Value>,
 ) -> Result<Value, String> {
     let args = args.unwrap_or(Value::Null);
-    studio.host().call_tool(&tool, &args).map_err(err)
+    let host = studio.host().clone();
+    tokio::task::spawn_blocking(move || host.call_tool(&tool, &args))
+        .await
+        .map_err(|e| format!("tool task failed: {e}"))?
+        .map_err(err)
 }
 
 // ---------------------------------------------------------------------------

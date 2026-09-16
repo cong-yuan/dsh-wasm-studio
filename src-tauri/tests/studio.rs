@@ -788,3 +788,91 @@ async fn unloading_a_ui_plugin_removes_its_contribution() {
         "an unloaded plugin must not contribute UI"
     );
 }
+
+// ---------------------------------------------------------------------------
+// End-to-end: two demo plugins, one mounting into the other's slot
+// ---------------------------------------------------------------------------
+
+/// Locate a built demo plugin under the sibling repo's target dir.
+fn demo_plugin(name: &str, file: &str) -> PathBuf {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap(); // /Users/yuan
+    root.join("wasm-plugin-host/target/wasm32-wasip1/release")
+        .join(file)
+}
+
+#[tokio::test]
+async fn demo_plugins_expose_a_cross_plugin_ui_graph() {
+    // A (ui-llm-panel) opens `ui-llm-panel.config` and contributes to
+    // `settings.tabs`. B (ui-theme-widget) injects into A's slot.
+    let a = demo_plugin("ui-llm-panel", "ui_llm_panel.wasm");
+    let b = demo_plugin("ui-theme-widget", "ui_theme_widget.wasm");
+    if !a.exists() || !b.exists() {
+        eprintln!("skipping: build the demo plugins first");
+        return;
+    }
+
+    let dir = tmpdir("e2e-ui");
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    studio
+        .mount_slot("ui-llm-panel", &a.display().to_string(), json!(null))
+        .await
+        .unwrap();
+    studio
+        .mount_slot("ui-theme-widget", &b.display().to_string(), json!(null))
+        .await
+        .unwrap();
+
+    let decls = studio.host().ui_decls();
+    assert_eq!(decls.len(), 2, "both plugins declare UI");
+
+    let a_decl = decls.iter().find(|(s, _)| s == "ui-llm-panel").unwrap().1.clone();
+    let b_decl = decls.iter().find(|(s, _)| s == "ui-theme-widget").unwrap().1.clone();
+
+    // A opens a slot…
+    assert_eq!(a_decl.provides.len(), 1);
+    let opened = &a_decl.provides[0].name;
+    assert_eq!(opened, "ui-llm-panel.config");
+    // …and contributes to a built-in one.
+    assert_eq!(a_decl.injects[0].slot, "settings.tabs");
+    assert!(a_decl.assets.contains_key("entry.js"));
+
+    // B injects into the slot A owns — the cross-plugin link.
+    assert_eq!(b_decl.injects.len(), 1);
+    assert_eq!(
+        &b_decl.injects[0].slot, opened,
+        "B must target the slot A opened"
+    );
+    assert_eq!(b_decl.injects[0].component.as_deref(), Some("ThemeWidget"));
+}
+
+#[tokio::test]
+async fn the_cross_plugin_graph_holds_regardless_of_load_order() {
+    let a = demo_plugin("ui-llm-panel", "ui_llm_panel.wasm");
+    let b = demo_plugin("ui-theme-widget", "ui_theme_widget.wasm");
+    if !a.exists() || !b.exists() {
+        return;
+    }
+
+    // Load B FIRST this time.
+    let dir = tmpdir("e2e-ui-rev");
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    studio
+        .mount_slot("ui-theme-widget", &b.display().to_string(), json!(null))
+        .await
+        .unwrap();
+    studio
+        .mount_slot("ui-llm-panel", &a.display().to_string(), json!(null))
+        .await
+        .unwrap();
+
+    let decls = studio.host().ui_decls();
+    let b_decl = decls.iter().find(|(s, _)| s == "ui-theme-widget").unwrap().1.clone();
+    let a_decl = decls.iter().find(|(s, _)| s == "ui-llm-panel").unwrap().1.clone();
+    // The data is the same; the frontend registry resolves it order-independently
+    // (covered by src/lib/plugin-host.test.ts).
+    assert_eq!(b_decl.injects[0].slot, a_decl.provides[0].name);
+}

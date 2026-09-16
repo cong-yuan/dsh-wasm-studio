@@ -127,6 +127,29 @@ export const startWatch = () => invoke<void>("start_watch");
 export const stopWatch = () => invoke<void>("stop_watch");
 
 // ---------------------------------------------------------------------------
+// Frontend UI contributions
+// ---------------------------------------------------------------------------
+
+/** Where and how a plugin wants to render (mirrors `commands::SlotInjectRow`). */
+export interface SlotInjectRow {
+  slot: string;
+  priority: number;
+  component: string | null;
+}
+
+/** One plugin's frontend contribution (mirrors `commands::UiPlugin`). */
+export interface UiPlugin {
+  slot: string;
+  provides_slots: string[];
+  injects_slots: SlotInjectRow[];
+  assets: Record<string, string>;
+}
+
+/** Every loaded plugin's UI declaration. */
+export const uiContributions = () =>
+  invoke<UiPlugin[]>("ui_contributions");
+
+// ---------------------------------------------------------------------------
 // Tools
 // ---------------------------------------------------------------------------
 
