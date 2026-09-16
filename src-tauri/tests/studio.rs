@@ -694,3 +694,97 @@ fn agent_commands_work_without_a_tokio_runtime_context() {
     assert!(id.is_ok(), "agent commands should work off-runtime: {id:?}");
     assert_eq!(id.unwrap(), "a1");
 }
+
+// ---------------------------------------------------------------------------
+// Frontend UI contributions (plugin-provided slots)
+// ---------------------------------------------------------------------------
+
+/// A plugin whose declaration carries a `ui` block.
+fn wasm_ui_plugin(slot: &str, json_decl: &str) -> Vec<u8> {
+    let decl_off = 64usize;
+    let wat = format!(
+        r#"(module
+          (import "host" "log" (func $log (param i32 i32 i32)))
+          (memory (export "memory") 4)
+          (global $bump (mut i32) (i32.const 8192))
+          (data (i32.const {decl_off}) {decl:?})
+          (func (export "plugin_abi_version") (result i32) (i32.const 1))
+          (func (export "plugin_init") (result i32) (i32.const 0))
+          (func (export "plugin_shutdown"))
+          (func (export "plugin_alloc") (param $n i32) (result i32)
+            (local $p i32)
+            (local.set $p (global.get $bump))
+            (global.set $bump (i32.add (global.get $bump) (local.get $n)))
+            (local.get $p))
+          (func (export "plugin_free") (param i32 i32))
+          (func (export "plugin_describe") (param $o i32) (param $c i32) (result i64)
+            (local $i i32)
+            (if (i32.lt_s (local.get $c) (i32.const {dlen}))
+              (then (return (i64.extend_i32_s (i32.sub (i32.const 0) (i32.const {dlen}))))))
+            (block $d (loop $l
+              (br_if $d (i32.ge_s (local.get $i) (i32.const {dlen})))
+              (i32.store8 (i32.add (local.get $o) (local.get $i))
+                (i32.load8_u (i32.add (i32.const {decl_off}) (local.get $i))))
+              (local.set $i (i32.add (local.get $i) (i32.const 1)))
+              (br $l)))
+            (i64.const {dlen}))
+          (func (export "plugin_invoke")
+            (param i32 i32 i32 i32) (param i32 i32) (result i64) (i64.const 0))
+        )"#,
+        decl_off = decl_off,
+        decl = json_decl,
+        dlen = json_decl.len(),
+    );
+    let _ = slot;
+    wat::parse_str(&wat).expect("ui plugin wat should parse")
+}
+
+#[tokio::test]
+async fn a_plugins_declaration_reaches_the_frontend_ui_contract() {
+    let dir = tmpdir("ui-decl");
+    let decl = r#"{"name":"llm-ui","abi":1,"tools":[],"ui":{
+        "provides":[{"name":"llm-ui.config","description":"provider settings"}],
+        "injects":[{"slot":"settings.tabs","priority":5,"component":"LlmSettings"}],
+        "assets":{"entry.js":"register({});","style.css":".x{}"}}}"#;
+    let wasm = dir.join("llm-ui.wasm");
+    std::fs::write(&wasm, wasm_ui_plugin("llm-ui", decl)).unwrap();
+
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    studio
+        .mount_slot("llm-ui", &wasm.display().to_string(), json!(null))
+        .await
+        .unwrap();
+
+    let ui = studio.host().ui_decls();
+    assert_eq!(ui.len(), 1, "one plugin declares UI");
+    let (slot, d) = &ui[0];
+    assert_eq!(slot, "llm-ui");
+    assert_eq!(d.provides.len(), 1);
+    assert_eq!(d.provides[0].name, "llm-ui.config");
+    assert_eq!(d.injects.len(), 1);
+    assert_eq!(d.injects[0].slot, "settings.tabs");
+    assert_eq!(d.injects[0].priority, 5);
+    assert_eq!(d.injects[0].component.as_deref(), Some("LlmSettings"));
+    assert!(d.assets.contains_key("entry.js"));
+}
+
+#[tokio::test]
+async fn unloading_a_ui_plugin_removes_its_contribution() {
+    let dir = tmpdir("ui-unload");
+    let decl = r#"{"name":"llm-ui","abi":1,"tools":[],"ui":{"provides":[{"name":"llm-ui.config"}]}}"#;
+    let wasm = dir.join("llm-ui.wasm");
+    std::fs::write(&wasm, wasm_ui_plugin("llm-ui", decl)).unwrap();
+
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    studio
+        .mount_slot("llm-ui", &wasm.display().to_string(), json!(null))
+        .await
+        .unwrap();
+    assert_eq!(studio.host().ui_decls().len(), 1);
+
+    studio.unmount_slot("llm-ui").await.unwrap();
+    assert!(
+        studio.host().ui_decls().is_empty(),
+        "an unloaded plugin must not contribute UI"
+    );
+}

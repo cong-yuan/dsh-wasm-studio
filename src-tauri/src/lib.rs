@@ -42,6 +42,7 @@ pub fn run() {
             commands::watch_status,
             commands::start_watch,
             commands::stop_watch,
+            commands::ui_contributions,
             commands::list_tools,
             commands::call_tool,
             commands::list_services,

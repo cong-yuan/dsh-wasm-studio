@@ -163,6 +163,59 @@ pub async fn stop_watch(studio: State<'_, Studio>) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
+// Frontend UI contributions
+// ---------------------------------------------------------------------------
+
+/// One plugin's frontend contribution, as the panel needs it.
+#[derive(Serialize)]
+pub struct UiPlugin {
+    /// The plugin slot that owns this contribution.
+    pub slot: String,
+    /// Slots this plugin **opens** for others to fill.
+    pub provides_slots: Vec<String>,
+    /// Slots this plugin's UI wants to render **inside**.
+    pub injects_slots: Vec<SlotInjectRow>,
+    /// `{ "entry.js": "...", "style.css": "..." }` — the frontend runs these.
+    pub assets: std::collections::BTreeMap<String, String>,
+}
+
+/// Where and how a plugin wants to render.
+#[derive(Serialize)]
+pub struct SlotInjectRow {
+    pub slot: String,
+    pub priority: i32,
+    pub component: Option<String>,
+}
+
+/// Every loaded plugin's UI declaration.
+///
+/// The frontend feeds this into its `SlotRegistry`: each `provides_slots` opens
+/// a slot, each `injects_slots` claims a place. Resolution is order-independent
+/// and reactive (see `src/lib/slots.ts`).
+#[tauri::command]
+pub fn ui_contributions(studio: State<'_, Studio>) -> Vec<UiPlugin> {
+    studio
+        .host()
+        .ui_decls()
+        .into_iter()
+        .map(|(slot, ui)| UiPlugin {
+            slot,
+            provides_slots: ui.provides.into_iter().map(|s| s.name).collect(),
+            injects_slots: ui
+                .injects
+                .into_iter()
+                .map(|i| SlotInjectRow {
+                    slot: i.slot,
+                    priority: i.priority,
+                    component: i.component,
+                })
+                .collect(),
+            assets: ui.assets,
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
 // Tools
 // ---------------------------------------------------------------------------
 
