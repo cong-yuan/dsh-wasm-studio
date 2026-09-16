@@ -1,0 +1,47 @@
+[package]
+name = "dsh-wasm-studio"
+version = "0.1.0"
+description = "A Tauri App"
+authors = ["you"]
+edition = "2021"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[lib]
+# The `_lib` suffix may seem redundant but it is necessary
+# to make the lib name unique and wouldn't conflict with the bin name.
+# This seems to be only an issue on Windows, see https://github.com/rust-lang/cargo/issues/8519
+name = "dsh_wasm_studio_lib"
+crate-type = ["staticlib", "cdylib", "rlib"]
+
+[build-dependencies]
+tauri-build = { version = "2", features = [] }
+
+[dependencies]
+tauri = { version = "2", features = [] }
+tauri-plugin-opener = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+anyhow = "1"
+
+# The WASM plugin runtime and its dsh-rs (cordis) integration.
+wasm-plugin-host = { path = "../../wasm-plugin-host/host" }
+dsh-wasm-host = { path = "../../wasm-plugin-host/dsh-wasm-host" }
+
+# dsh-rs harness + the cordis kernel it is built on. We alias the kernel to
+# `cordis` so our backend code reads exactly like dsh-rs's own.
+dsh-rs = { version = "0.2.0", default-features = false }
+cordis = { package = "cordis-rust", version = "0.2.1" }
+
+
+# Read the optimization guideline for more details: https://tauri.app/concept/size/#cargo-configuration
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true
+
+[dev-dependencies]
+wat = "1"

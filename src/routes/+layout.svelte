@@ -1,0 +1,73 @@
+<script lang="ts">
+  import { onMount } from "svelte";
+  import { page } from "$app/state";
+  import {
+    refreshAll,
+    getStatus,
+    getPlugins,
+    getTools,
+    getServices,
+  } from "$lib/state.svelte";
+  import "../lib/theme.css";
+
+  let { children } = $props();
+
+  const nav = [
+    { href: "/", label: "Overview", icon: "▦", key: "overview" },
+    { href: "/plugins", label: "Plugins", icon: "◈", key: "plugins" },
+    { href: "/tools", label: "Tools", icon: "⚒", key: "tools" },
+    { href: "/services", label: "Services", icon: "◇", key: "services" },
+    { href: "/logs", label: "Logs", icon: "≡", key: "logs" },
+    { href: "/capabilities", label: "Capabilities", icon: "✦", key: "caps" },
+  ];
+
+  // Refresh once on mount, then keep the sidebar counters live.
+  onMount(() => {
+    refreshAll();
+    const t = setInterval(refreshAll, 4000);
+    return () => clearInterval(t);
+  });
+
+  let current = $derived(page.url.pathname);
+
+  function countFor(key: string): number | null {
+    if (key === "plugins") return getPlugins().length;
+    if (key === "tools") return getTools().length;
+    if (key === "services") return getServices().length;
+    return null;
+  }
+</script>
+
+<div class="shell">
+  <aside class="sidebar">
+    <div class="brand">
+      <span class="dot"></span>
+      <span>WASM Studio</span>
+    </div>
+
+    {#each nav as item}
+      <a href={item.href} class="nav-item" class:active={current === item.href}>
+        <span>{item.icon}</span>
+        <span>{item.label}</span>
+        {#if countFor(item.key) !== null}
+          <span class="count">{countFor(item.key)}</span>
+        {/if}
+      </a>
+    {/each}
+
+    <div class="spacer"></div>
+    {#if getStatus()}
+      <div class="faint" style="font-size: 11px; padding: 0 10px;">
+        {#if getStatus()?.booted}
+          <span style="color: var(--ok)">●</span> harness online
+        {:else}
+          <span style="color: var(--warn)">●</span> booting…
+        {/if}
+      </div>
+    {/if}
+  </aside>
+
+  <main class="main">
+    {@render children()}
+  </main>
+</div>
