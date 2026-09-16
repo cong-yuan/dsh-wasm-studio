@@ -44,11 +44,42 @@ src/                  SvelteKit frontend
   lib/theme.css       design tokens (dark, Supabase-flavoured)
   routes/             one page per panel + a sidebar layout
 src-tauri/            Rust backend
-  src/studio.rs       Studio: owns the cordis Context + WasmHost
+  src/studio.rs       Studio: owns the cordis Context + WasmHost,
+                      persistence, and the auto-reload watcher
   src/commands.rs     the #[tauri::command] surface
   src/lib.rs          boot + wire the command handler
   tests/studio.rs     headless integration tests (no window)
 ```
+
+## Persistence
+
+Desired state lives in `<app-data>/studio.json` — in the **host's own**
+`wasm_plugin_host::Config` format, so it is interoperable with the host CLI:
+
+```json
+{
+  "cache": { "dir": "cwasm-cache", "enabled": true },
+  "plugins": {
+    "greet": { "path": "/abs/hello_rust.wasm", "enabled": true,
+               "config": { "greeting": "Hi" } }
+  }
+}
+```
+
+Every load / unload / enable / config change writes the file atomically.
+Enabled plugins are **loaded on boot**, so the app comes back the way you left
+it. A broken or missing persisted plugin is skipped, never fatal to boot.
+
+## Auto-reload
+
+Toggle **auto-reload** on the Plugins page. The backend then watches each
+enabled plugin's `.wasm` (via `notify`, with an mtime fallback) and
+**hot-swaps it in place on rebuild** — atomically: if the new build is broken,
+it is rejected and the running plugin keeps serving. Reloads are reported to the
+UI over `studio://plugins-changed`, including rejections.
+
+This is the same stage-then-commit guarantee as the host CLI, driven here from
+the GUI.
 
 ## Develop
 
@@ -83,7 +114,8 @@ cargo build --release -p hello-rust --target wasm32-wasip1
 
 Then in the app: **Plugins → Load plugin**, slot `greet`, path
 `…/wasm-plugin-host/target/wasm32-wasip1/release/hello_rust.wasm`. The
-**Validate** button checks the file without loading it.
+**Validate** button checks the file without loading it. Or drop `.wasm` files
+into the plugins directory and use **Discover** to list and load them.
 
 ## ⚠️ No capability/permission model yet
 
@@ -101,3 +133,7 @@ Capabilities page restates the warning in-app.)
   drives cordis fibers; tool calls hop to the blocking pool.
 * The harness is booted on Tauri's **global** async runtime, because cordis
   drives each fiber with a tokio task that must outlive boot.
+* Slots are mounted with `WasmSlotPlugin::keeping_loaded`, so disposing a fiber
+  only *deactivates* the slot in the registry — it does not destroy the guest
+  instance. That separation is what makes a hot reload possible (dispose the
+  fiber → swap the code → remount); the studio unloads the guest explicitly.

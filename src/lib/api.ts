@@ -12,12 +12,15 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 export interface StudioStatus {
   booted: boolean;
   plugins_dir: string;
+  config_path: string;
   slot_count: number;
   /** Tools contributed by WASM plugins. */
   wasm_tool_count: number;
   /** Total tools on the harness registry (WASM + dsh built-ins). */
   tool_count: number;
   service_count: number;
+  /** Whether the auto-reload watcher is running. */
+  watching: boolean;
 }
 
 /** One row of the plugins table (mirrors `commands::PluginRow`). */
@@ -28,9 +31,24 @@ export interface PluginRow {
   tool_count: number;
   active: boolean;
   mounted: boolean;
+  /** Persisted desired state. */
+  enabled: boolean;
+  path: string;
   injects: string[];
   provides: string[];
 }
+
+/** A `.wasm` found on disk but not yet configured (mirrors `studio::Discovered`). */
+export interface Discovered {
+  slot: string;
+  path: string;
+}
+
+/** A change event from the backend (mirrors `studio::StudioEvent`). */
+export type StudioEvent =
+  | { kind: "reloaded"; slot: string; tools: string[] }
+  | { kind: "reload_failed"; slot: string; error: string }
+  | { kind: "changed" };
 
 /** One row of the tools table (mirrors `commands::ToolRow`). */
 export interface ToolRow {
@@ -82,14 +100,31 @@ export const loadPlugin = (slot: string, path: string, config?: unknown) =>
 export const unloadPlugin = (slot: string) =>
   invoke<void>("unload_plugin", { slot });
 
-export const reloadPlugin = (slot: string, path?: string) =>
-  invoke<void>("reload_plugin", { slot, path: path ?? null });
+/** Enable or disable a configured slot (loads/unloads to match); persists. */
+export const setPluginEnabled = (slot: string, enabled: boolean) =>
+  invoke<void>("set_plugin_enabled", { slot, enabled });
+
+/** Hot-reload a slot; returns its new tool names. A rejected build is an error
+ *  and leaves the running plugin intact. */
+export const reloadPlugin = (slot: string) =>
+  invoke<string[]>("reload_plugin", { slot });
+
+/** `.wasm` files in the plugins dir that are not yet configured. */
+export const discoverPlugins = () => invoke<Discovered[]>("discover_plugins");
 
 export const setPluginConfig = (slot: string, config: unknown) =>
   invoke<boolean>("set_plugin_config", { slot, config });
 
 export const validatePlugin = (path: string) =>
   invoke<[string, string[]]>("validate_plugin", { path });
+
+// ---------------------------------------------------------------------------
+// Auto-reload
+// ---------------------------------------------------------------------------
+
+export const watchStatus = () => invoke<boolean>("watch_status");
+export const startWatch = () => invoke<void>("start_watch");
+export const stopWatch = () => invoke<void>("stop_watch");
 
 // ---------------------------------------------------------------------------
 // Tools
@@ -124,6 +159,18 @@ export const onLog = (
   handler: (rec: LogRecord) => void,
 ): Promise<UnlistenFn> =>
   listen<LogRecord>("studio://log", (event) => handler(event.payload));
+
+/** Subscribe to plugin change events (load/unload/reload/config). */
+export const onPluginChanged = (
+  handler: (ev: StudioEvent) => void,
+): Promise<UnlistenFn> =>
+  listen<StudioEvent>("studio://plugins-changed", (event) =>
+    handler(event.payload),
+  );
+
+/** Subscribe to the generic "something changed, refetch" signal. */
+export const onChanged = (handler: () => void): Promise<UnlistenFn> =>
+  listen("studio://changed", () => handler());
 
 // ---------------------------------------------------------------------------
 // Capabilities

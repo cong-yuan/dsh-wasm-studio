@@ -6,6 +6,7 @@
     getTools,
     getServices,
     getLastError,
+    getEvents,
     isLoading,
     refreshAll,
   } from "$lib/state.svelte";
@@ -56,12 +57,31 @@
     <div class="value small">{getStatus()?.plugins_dir ?? "—"}</div>
   </div>
   <div class="stat">
-    <div class="label">Harness</div>
+    <div class="label">Auto-reload</div>
     <div class="value small">
-      {getStatus()?.booted ? "dsh-rs base bundle booted" : "boot failed / pending"}
+      {getStatus()?.watching ? "watching .wasm for rebuilds" : "off"}
     </div>
   </div>
 </div>
+
+{#if getEvents().length}
+  <div class="card" style="margin-bottom: 20px;">
+    <div class="card-head"><h2>Recent activity</h2></div>
+    <div style="padding: 8px 0;">
+      {#each getEvents().slice(0, 6) as ev}
+        <div class="log-line" style="grid-template-columns: 1fr;">
+          {#if ev.kind === "reloaded"}
+            <span><span class="badge ok">reloaded</span> <span class="mono">{ev.slot}</span> — tools: {ev.tools.join(", ") || "none"}</span>
+          {:else if ev.kind === "reload_failed"}
+            <span><span class="badge err">reload failed</span> <span class="mono">{ev.slot}</span> — {ev.error}</span>
+          {:else}
+            <span><span class="badge">changed</span></span>
+          {/if}
+        </div>
+      {/each}
+    </div>
+  </div>
+{/if}
 
 <div class="card">
   <div class="card-head">

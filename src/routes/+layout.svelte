@@ -3,6 +3,7 @@
   import { page } from "$app/state";
   import {
     refreshAll,
+    wireEvents,
     getStatus,
     getPlugins,
     getTools,
@@ -24,7 +25,10 @@
   // Refresh once on mount, then keep the sidebar counters live.
   onMount(() => {
     refreshAll();
-    const t = setInterval(refreshAll, 4000);
+    // Live updates arrive as backend events; the interval is only a slow
+    // safety net for anything that does not emit one.
+    wireEvents();
+    const t = setInterval(refreshAll, 8000);
     return () => clearInterval(t);
   });
 
@@ -62,6 +66,12 @@
           <span style="color: var(--ok)">●</span> harness online
         {:else}
           <span style="color: var(--warn)">●</span> booting…
+        {/if}
+        <br />
+        {#if getStatus()?.watching}
+          <span style="color: var(--info)">◉</span> auto-reload on
+        {:else}
+          <span style="color: var(--text-faint)">○</span> auto-reload off
         {/if}
       </div>
     {/if}

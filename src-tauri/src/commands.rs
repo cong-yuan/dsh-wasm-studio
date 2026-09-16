@@ -5,16 +5,16 @@
 //! `Serialize`; a plain message is enough for the UI to show).
 //!
 //! The shape mirrors a Supabase-style admin panel: **list** what exists,
-//! **mutate** it, and **observe** a stream (logs arrive as `studio://log`
-//! events, not by polling).
+//! **mutate** it, and **observe** a stream (logs and change events arrive as
+//! `studio://…` events, not by polling).
 
 use serde::Serialize;
 use serde_json::Value;
 use tauri::State;
 
-use crate::studio::{Studio, StudioStatus};
+use crate::studio::{Discovered, Studio, StudioStatus};
 
-/// Build the `#[tauri::command]` error type from any `anyhow` error.
+/// Build the command error type from any displayable error.
 fn err(e: impl std::fmt::Display) -> String {
     e.to_string()
 }
@@ -23,7 +23,6 @@ fn err(e: impl std::fmt::Display) -> String {
 // Overview
 // ---------------------------------------------------------------------------
 
-/// Headline counters + paths, for the dashboard header.
 #[tauri::command]
 pub fn studio_status(studio: State<'_, Studio>) -> StudioStatus {
     studio.status()
@@ -38,12 +37,15 @@ pub fn studio_status(studio: State<'_, Studio>) -> StudioStatus {
 pub struct PluginRow {
     pub slot: String,
     pub plugin: String,
-    /// `active` | `pending` | `failed` | ...
+    /// `active` | `pending` | ...
     pub state: String,
     pub tool_count: usize,
     pub active: bool,
     /// Whether a cordis fiber is mounted for this slot.
     pub mounted: bool,
+    /// Persisted desired state.
+    pub enabled: bool,
+    pub path: String,
     /// Services this slot declares it needs.
     pub injects: Vec<String>,
     /// Services this slot offers.
@@ -52,14 +54,18 @@ pub struct PluginRow {
 
 #[tauri::command]
 pub fn list_plugins(studio: State<'_, Studio>) -> Vec<PluginRow> {
+    let cfg = studio.config();
     studio
         .host()
         .list_plugins()
         .into_iter()
         .map(|(slot, plugin, state, tool_count, active)| {
             let (injects, provides) = studio.host().deps_of(&slot);
+            let entry = cfg.plugins.get(&slot);
             PluginRow {
                 mounted: studio.is_mounted(&slot),
+                enabled: entry.map(|e| e.enabled).unwrap_or(false),
+                path: entry.map(|e| e.path.clone()).unwrap_or_default(),
                 slot,
                 plugin,
                 state: format!("{state:?}").to_lowercase(),
@@ -72,7 +78,7 @@ pub fn list_plugins(studio: State<'_, Studio>) -> Vec<PluginRow> {
         .collect()
 }
 
-/// Load and mount a `.wasm` into `slot`. Replaces an existing slot of that name.
+/// Load and mount a `.wasm` into `slot`; persists to `studio.json`.
 #[tauri::command]
 pub async fn load_plugin(
     studio: State<'_, Studio>,
@@ -86,47 +92,72 @@ pub async fn load_plugin(
         .map_err(err)
 }
 
-/// Unload a slot and drop its cordis fiber (releasing the wasm instance).
+/// Unload a slot, release its instance, and remove it from the config.
 #[tauri::command]
 pub async fn unload_plugin(studio: State<'_, Studio>, slot: String) -> Result<(), String> {
     studio.unmount_slot(&slot).await.map_err(err)
 }
 
-/// Hot-reload a slot's code from its `.wasm` (atomic; a broken build is rejected).
+/// Enable/disable a configured slot (loads or unloads to match), persisting.
 #[tauri::command]
-pub async fn reload_plugin(
+pub async fn set_plugin_enabled(
     studio: State<'_, Studio>,
     slot: String,
-    path: Option<String>,
+    enabled: bool,
 ) -> Result<(), String> {
-    let path = match path {
-        Some(p) => p,
-        None => studio
-            .host()
-            .registry()
-            .lock()
-            .map_err(err)?
-            .slot_path(&slot)
-            .map(|p| p.display().to_string())
-            .ok_or_else(|| format!("slot `{slot}` is not loaded and no path was given"))?,
-    };
-    studio.reload_slot(&slot, &path).map_err(err)
+    studio.set_enabled(&slot, enabled).await.map_err(err)
 }
 
-/// Push a new config to a running slot (live; no restart).
+/// Hot-reload a slot's code; returns its new tool names. A rejected build
+/// leaves the running plugin intact.
+#[tauri::command]
+pub async fn reload_plugin(studio: State<'_, Studio>, slot: String) -> Result<Vec<String>, String> {
+    studio.reload_slot(&slot).await.map_err(err)
+}
+
+/// Push a new config to a running slot (live; no restart). Returns whether the
+/// guest consumed it via a `plugin_on_config` hook.
 #[tauri::command]
 pub async fn set_plugin_config(
     studio: State<'_, Studio>,
     slot: String,
     config: Value,
 ) -> Result<bool, String> {
-    studio.host().apply_config(&slot, config).map_err(err)
+    studio.set_slot_config(&slot, config).map_err(err)
 }
 
 /// Validate a `.wasm` without loading it: `(plugin_name, tool_names)`.
 #[tauri::command]
-pub fn validate_plugin(studio: State<'_, Studio>, path: String) -> Result<(String, Vec<String>), String> {
+pub fn validate_plugin(
+    studio: State<'_, Studio>,
+    path: String,
+) -> Result<(String, Vec<String>), String> {
     studio.host().validate(&path).map_err(err)
+}
+
+/// Scan the plugins directory for `.wasm` files not yet configured.
+#[tauri::command]
+pub fn discover_plugins(studio: State<'_, Studio>) -> Vec<Discovered> {
+    studio.discover()
+}
+
+// ---------------------------------------------------------------------------
+// Auto-reload
+// ---------------------------------------------------------------------------
+
+#[tauri::command]
+pub fn watch_status(studio: State<'_, Studio>) -> bool {
+    studio.watching()
+}
+
+#[tauri::command]
+pub fn start_watch(studio: State<'_, Studio>) {
+    studio.start_watch();
+}
+
+#[tauri::command]
+pub fn stop_watch(studio: State<'_, Studio>) {
+    studio.stop_watch();
 }
 
 // ---------------------------------------------------------------------------
@@ -174,7 +205,7 @@ pub async fn call_tool(
 // Services (the inject/provide graph)
 // ---------------------------------------------------------------------------
 
-/// One node/edge of the service graph.
+/// One node of the service graph.
 #[derive(Serialize)]
 pub struct ServiceRow {
     pub name: String,
@@ -187,8 +218,6 @@ pub struct ServiceRow {
 #[tauri::command]
 pub fn list_services(studio: State<'_, Studio>) -> Vec<ServiceRow> {
     let host = studio.host();
-    // A service is "dsh" when the host declared it external; otherwise the
-    // registry resolved it to a slot.
     host.services()
         .into_iter()
         .map(|name| {
@@ -213,7 +242,11 @@ pub fn list_services(studio: State<'_, Studio>) -> Vec<ServiceRow> {
 
 /// Fetch buffered logs (newest last). Live updates arrive via `studio://log`.
 #[tauri::command]
-pub fn get_logs(studio: State<'_, Studio>, since_seq: Option<u64>, slot: Option<String>) -> Vec<wasm_plugin_host::LogRecord> {
+pub fn get_logs(
+    studio: State<'_, Studio>,
+    since_seq: Option<u64>,
+    slot: Option<String>,
+) -> Vec<wasm_plugin_host::LogRecord> {
     let all = match slot {
         Some(s) => studio.host().logs_for(&s),
         None => studio.host().logs(),
@@ -229,7 +262,12 @@ pub fn get_logs(studio: State<'_, Studio>, since_seq: Option<u64>, slot: Option<
 pub fn set_log_level(studio: State<'_, Studio>, level: String) -> Result<String, String> {
     let level = wasm_plugin_host::LogLevel::parse(&level)
         .ok_or_else(|| format!("unknown log level `{level}`"))?;
-    studio.host().registry().lock().map_err(err)?.set_log_level(level);
+    studio
+        .host()
+        .registry()
+        .lock()
+        .map_err(err)?
+        .set_log_level(level);
     Ok(level.as_str().to_string())
 }
 
@@ -237,7 +275,6 @@ pub fn set_log_level(studio: State<'_, Studio>, level: String) -> Result<String,
 // Capabilities / introspection
 // ---------------------------------------------------------------------------
 
-/// What this studio can do, so the UI can show a "capabilities" panel.
 #[derive(Serialize)]
 pub struct Capabilities {
     pub dsh_services: Vec<String>,

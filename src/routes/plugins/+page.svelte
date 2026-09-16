@@ -4,14 +4,25 @@
     loadPlugin,
     unloadPlugin,
     reloadPlugin,
+    setPluginEnabled,
     validatePlugin,
+    discoverPlugins,
+    watchStatus,
+    startWatch,
+    stopWatch,
     errorMessage,
+    type Discovered,
   } from "$lib/api";
-  import { getPlugins, refreshAll, setError, isLoading } from "$lib/state.svelte";
+  import { getPlugins, refreshAll, isLoading } from "$lib/state.svelte";
 
   let showLoad = $state(false);
   let busy = $state<string | null>(null);
   let notice = $state<{ kind: "ok" | "err"; text: string } | null>(null);
+  let watching = $state(false);
+
+  // Discover modal.
+  let showDiscover = $state(false);
+  let discovered = $state<Discovered[]>([]);
 
   // Load-form fields.
   let formSlot = $state("");
@@ -20,15 +31,35 @@
   let validating = $state(false);
   let validation = $state<string | null>(null);
 
-  // Shown as the config textarea's placeholder. Held in a variable because a
-  // literal `{...}` in an attribute would be parsed as a JS expression.
   const configPlaceholder = '{ "greeting": "Hi" }';
 
-  onMount(refreshAll);
+  onMount(async () => {
+    await refreshAll();
+    watching = await watchStatus().catch(() => false);
+  });
 
   function flash(kind: "ok" | "err", text: string) {
     notice = { kind, text };
-    setTimeout(() => (notice = null), 5000);
+    setTimeout(() => (notice = null), 6000);
+  }
+
+  async function toggleWatch() {
+    try {
+      if (watching) await stopWatch();
+      else await startWatch();
+      watching = await watchStatus();
+    } catch (e) {
+      flash("err", errorMessage(e));
+    }
+  }
+
+  async function doDiscover() {
+    try {
+      discovered = await discoverPlugins();
+      showDiscover = true;
+    } catch (e) {
+      flash("err", errorMessage(e));
+    }
   }
 
   async function doValidate() {
@@ -78,12 +109,25 @@
   async function doReload(slot: string) {
     busy = slot;
     try {
-      await reloadPlugin(slot);
-      flash("ok", `Reloaded “${slot}”`);
+      const tools = await reloadPlugin(slot);
+      flash("ok", `Reloaded “${slot}” — tools: ${tools.join(", ") || "none"}`);
       await refreshAll();
     } catch (e) {
       // A rejected reload (broken build) leaves the old plugin running.
       flash("err", `Reload rejected — ${errorMessage(e)}`);
+    } finally {
+      busy = null;
+    }
+  }
+
+  async function doToggle(slot: string, enabled: boolean) {
+    busy = slot;
+    try {
+      await setPluginEnabled(slot, enabled);
+      flash("ok", `${enabled ? "Enabled" : "Disabled"} “${slot}”`);
+      await refreshAll();
+    } catch (e) {
+      flash("err", errorMessage(e));
     } finally {
       busy = null;
     }
@@ -95,10 +139,18 @@
     <h1>Plugins</h1>
     <div class="sub">
       Each <code>.wasm</code> is mounted as its own cordis plugin — own fiber,
-      own <code>inject</code>/<code>provide</code>.
+      own <code>inject</code>/<code>provide</code>. State persists across restarts.
     </div>
   </div>
   <div class="toolbar">
+    <button
+      class="ghost"
+      onclick={toggleWatch}
+      title="Watch each plugin's .wasm and hot-reload on rebuild"
+    >
+      {watching ? "◉ auto-reload on" : "○ auto-reload off"}
+    </button>
+    <button onclick={doDiscover}>Discover…</button>
     <button onclick={() => refreshAll()} disabled={isLoading()}>Refresh</button>
     <button class="primary" onclick={() => (showLoad = true)}>Load plugin</button>
   </div>
@@ -113,13 +165,14 @@
 <div class="card">
   {#if getPlugins().length === 0}
     <div class="empty">
-      No plugins loaded yet. Click <strong>Load plugin</strong> and point at a
-      compiled <code>.wasm</code> (e.g. <code>plugins/hello-go/hello_go.wasm</code>).
+      No plugins loaded. Click <strong>Discover</strong> to scan the plugins
+      directory, or <strong>Load plugin</strong> to point at a <code>.wasm</code>.
     </div>
   {:else}
     <table>
       <thead>
         <tr>
+          <th>On</th>
           <th>Slot</th>
           <th>Plugin</th>
           <th>State</th>
@@ -132,6 +185,16 @@
       <tbody>
         {#each getPlugins() as p}
           <tr>
+            <td>
+              <input
+                type="checkbox"
+                style="width: auto;"
+                checked={p.enabled}
+                disabled={busy === p.slot}
+                onchange={(e) => doToggle(p.slot, e.currentTarget.checked)}
+                title="Enable/disable and persist"
+              />
+            </td>
             <td class="mono">{p.slot}</td>
             <td>{p.plugin}</td>
             <td>
@@ -198,11 +261,7 @@
 
       <div class="field">
         <label for="path">Path to .wasm</label>
-        <input
-          id="path"
-          bind:value={formPath}
-          placeholder="/path/to/plugin.wasm"
-        />
+        <input id="path" bind:value={formPath} placeholder="/path/to/plugin.wasm" />
       </div>
 
       <div class="field">
@@ -227,6 +286,60 @@
         >
           {busy === "load" ? "loading…" : "Load"}
         </button>
+      </div>
+    </div>
+  </div>
+{/if}
+
+{#if showDiscover}
+  <div
+    class="overlay"
+    role="presentation"
+    onclick={(e) => e.target === e.currentTarget && (showDiscover = false)}
+  >
+    <div class="modal">
+      <h2>Discovered plugins</h2>
+      {#if discovered.length === 0}
+        <div class="empty">
+          No new <code>.wasm</code> files in the plugins directory. Drop one in
+          and click Discover again.
+        </div>
+      {:else}
+        <table>
+          <thead><tr><th>Slot</th><th>Path</th><th></th></tr></thead>
+          <tbody>
+            {#each discovered as d}
+              <tr>
+                <td class="mono">{d.slot}</td>
+                <td class="mono muted" style="font-size: 11px;">{d.path}</td>
+                <td style="text-align: right;">
+                  <button
+                    class="ghost"
+                    onclick={async () => {
+                      busy = "load";
+                      try {
+                        await loadPlugin(d.slot, d.path);
+                        discovered = discovered.filter((x) => x.slot !== d.slot);
+                        flash("ok", `Loaded “${d.slot}”`);
+                        await refreshAll();
+                      } catch (e) {
+                        flash("err", errorMessage(e));
+                      } finally {
+                        busy = null;
+                      }
+                    }}
+                    disabled={busy === "load"}
+                  >
+                    load
+                  </button>
+                </td>
+              </tr>
+            {/each}
+          </tbody>
+        </table>
+      {/if}
+      <div class="modal-actions">
+        <button onclick={() => (showDiscover = false)}>Close</button>
       </div>
     </div>
   </div>

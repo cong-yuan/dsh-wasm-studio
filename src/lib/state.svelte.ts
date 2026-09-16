@@ -10,11 +10,14 @@ import {
   listPlugins,
   listServices,
   listTools,
+  onChanged,
+  onPluginChanged,
   studioStatus,
   type Capabilities,
   type PluginRow,
   type ServiceRow,
   type StudioStatus,
+  type StudioEvent,
   type ToolRow,
 } from "$lib/api";
 
@@ -89,4 +92,33 @@ export async function ensureCapabilities(): Promise<void> {
 
 export function setError(msg: string | null) {
   lastError = msg;
+}
+
+// ---------------------------------------------------------------------------
+// Live wiring
+// ---------------------------------------------------------------------------
+
+/** Recent backend change events, newest first (shown as a feed). */
+let events = $state<StudioEvent[]>([]);
+export function getEvents() {
+  return events;
+}
+
+let wired = false;
+
+/**
+ * Subscribe to backend events once. A hot reload performed by the watcher (with
+ * no UI action) still lands here, so the panel stays in step without polling.
+ */
+export async function wireEvents(): Promise<void> {
+  if (wired) return;
+  wired = true;
+  await onPluginChanged((ev) => {
+    events = [ev, ...events].slice(0, 50);
+    // Any change means the tables may be stale.
+    refreshAll();
+  });
+  await onChanged(() => {
+    refreshAll();
+  });
 }
