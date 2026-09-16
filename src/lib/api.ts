@@ -173,6 +173,70 @@ export const onChanged = (handler: () => void): Promise<UnlistenFn> =>
   listen("studio://changed", () => handler());
 
 // ---------------------------------------------------------------------------
+// Agents / chat
+// ---------------------------------------------------------------------------
+
+/** One agent as the UI sees it (mirrors `studio::AgentRow`). */
+export interface AgentRow {
+  id: string;
+  status: "idle" | "running";
+  messages: number;
+  turns: number;
+  busy: boolean;
+}
+
+/** One message in a chat transcript (mirrors `studio::ChatMessage`). */
+export interface ChatMessage {
+  role: "user" | "assistant" | "system";
+  text: string;
+  reasoning: string;
+  tool_calls: ChatToolCall[];
+  tool_results: ChatToolResult[];
+}
+
+export interface ChatToolCall {
+  id: string;
+  name: string;
+  arguments: string;
+}
+
+export interface ChatToolResult {
+  tool_call_id: string;
+  content: string;
+  is_error: boolean;
+}
+
+export const createAgent = (
+  provider: string,
+  model: string,
+  cwd?: string,
+  id?: string,
+) =>
+  invoke<string>("create_agent", {
+    id: id ?? null,
+    provider,
+    model,
+    cwd: cwd ?? null,
+  });
+
+export const listAgents = () => invoke<AgentRow[]>("list_agents");
+
+export const sendMessage = (agentId: string, text: string, msgId: string) =>
+  invoke<void>("send_message", { agentId, text, msgId });
+
+export const steerAgent = (agentId: string, text: string, msgId: string) =>
+  invoke<void>("steer_agent", { agentId, text, msgId });
+
+export const cancelAgent = (agentId: string) =>
+  invoke<void>("cancel_agent", { agentId });
+
+export const disposeAgent = (agentId: string) =>
+  invoke<void>("dispose_agent", { agentId });
+
+export const transcript = (agentId: string) =>
+  invoke<ChatMessage[]>("transcript", { agentId });
+
+// ---------------------------------------------------------------------------
 // Capabilities
 // ---------------------------------------------------------------------------
 

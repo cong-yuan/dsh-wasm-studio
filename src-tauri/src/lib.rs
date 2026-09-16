@@ -47,6 +47,13 @@ pub fn run() {
             commands::list_services,
             commands::get_logs,
             commands::set_log_level,
+            commands::create_agent,
+            commands::list_agents,
+            commands::send_message,
+            commands::steer_agent,
+            commands::cancel_agent,
+            commands::dispose_agent,
+            commands::transcript,
             commands::capabilities,
         ])
         .run(tauri::generate_context!())

@@ -525,3 +525,121 @@ async fn disabling_the_cache_in_config_turns_it_off() {
         .disk_cache_enabled();
     assert!(!enabled, "enabled=false in config must disable the cache");
 }
+
+// ---------------------------------------------------------------------------
+// Agents / chat
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_agent_runs_a_turn_over_the_mock_provider() {
+    let dir = tmpdir("agent-turn");
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+
+    let id = studio
+        .create_agent(Some("a1".into()), "mock".into(), "mock-1".into(), Some("/tmp".into()))
+        .expect("agent created");
+    assert_eq!(id, "a1");
+
+    // The mock adapter echoes the user text when unscripted.
+    studio
+        .send_message("a1", "hello there".into(), "u1".into())
+        .await
+        .expect("turn completes");
+
+    let transcript = studio.transcript("a1").unwrap();
+    let user = transcript.iter().find(|m| m.role == "user").expect("user msg");
+    assert_eq!(user.text, "hello there");
+    let assistant = transcript
+        .iter()
+        .find(|m| m.role == "assistant")
+        .expect("assistant reply");
+    assert_eq!(assistant.text, "hello there", "mock echoes the input");
+}
+
+#[tokio::test]
+async fn an_agent_calls_a_wasm_tool_in_a_real_turn() {
+    // The headline: the agent loop dispatches into a WASM plugin's tool and the
+    // result lands in the session transcript. Requires scripting the mock
+    // provider to request the tool, exactly as dsh's own test does.
+    use dsh_rs::api::services::LlmService;
+    use std::sync::Arc;
+
+    let dir = tmpdir("agent-tool");
+    let wasm = dir.join("alpha.wasm");
+    std::fs::write(&wasm, wasm_tool("alpha")).unwrap();
+
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    studio
+        .mount_slot("alpha", &wasm.display().to_string(), json!(null))
+        .await
+        .unwrap();
+
+    // Script: first request the tool, then finish with text.
+    let runtime = studio
+        .ctx()
+        .require::<LlmService>(dsh_rs::api::LLM_SERVICE)
+        .unwrap();
+    runtime.unregister_adapter(&["mock"]);
+    runtime
+        .register_adapter(
+            &["mock"],
+            Arc::new(dsh_rs::llm::adapters::mock::MockAdapter::scripted(vec![
+                dsh_rs::llm::adapters::mock::MockAdapter::tool_call_response(
+                    "call-1",
+                    "alpha_tool",
+                    json!({}),
+                ),
+                dsh_rs::llm::adapters::mock::MockAdapter::text_response("done"),
+            ])),
+        )
+        .unwrap();
+
+    studio
+        .create_agent(Some("a1".into()), "mock".into(), "mock-1".into(), Some("/tmp".into()))
+        .unwrap();
+    studio
+        .send_message("a1", "call the tool".into(), "u1".into())
+        .await
+        .unwrap();
+
+    let transcript = studio.transcript("a1").unwrap();
+    // The tool call was requested…
+    let calls: Vec<_> = transcript
+        .iter()
+        .flat_map(|m| m.tool_calls.iter())
+        .collect();
+    assert!(
+        calls.iter().any(|c| c.name == "alpha_tool"),
+        "the model's tool call should be in the transcript, got {transcript:?}"
+    );
+    // …and its result came back from the WASM guest.
+    let results: Vec<_> = transcript
+        .iter()
+        .flat_map(|m| m.tool_results.iter())
+        .collect();
+    assert!(!results.is_empty(), "a tool result should be present");
+    assert!(
+        results.iter().any(|r| r.content.contains("ran")),
+        "the wasm guest's content should reach the transcript, got {results:?}"
+    );
+    // The turn closed with the model's final text.
+    assert_eq!(transcript.last().unwrap().text, "done");
+}
+
+#[tokio::test]
+async fn two_agents_have_independent_transcripts() {
+    let dir = tmpdir("two-agents");
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    studio.create_agent(Some("a".into()), "mock".into(), "m".into(), None).unwrap();
+    studio.create_agent(Some("b".into()), "mock".into(), "m".into(), None).unwrap();
+
+    studio.send_message("a", "for-a".into(), "u1".into()).await.unwrap();
+    studio.send_message("b", "for-b".into(), "u2".into()).await.unwrap();
+
+    let ta = studio.transcript("a").unwrap();
+    let tb = studio.transcript("b").unwrap();
+    assert!(ta.iter().any(|m| m.text == "for-a"));
+    assert!(!ta.iter().any(|m| m.text == "for-b"), "transcripts must not leak");
+    assert!(tb.iter().any(|m| m.text == "for-b"));
+    assert_eq!(studio.list_agents().len(), 2);
+}

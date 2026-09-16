@@ -31,7 +31,7 @@ dsh-wasm-host = { path = "../../wasm-plugin-host/dsh-wasm-host" }
 
 # dsh-rs harness + the cordis kernel it is built on. We alias the kernel to
 # `cordis` so our backend code reads exactly like dsh-rs's own.
-dsh-rs = { version = "0.2.0", default-features = false }
+dsh-rs = { version = "0.2.0", default-features = false, features = ["openai"] }
 cordis = { package = "cordis-rust", version = "0.2.1" }
 
 

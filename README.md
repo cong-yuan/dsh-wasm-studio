@@ -7,7 +7,7 @@ runtime, and puts a Supabase-style admin panel in front of it.
 ```
 ┌──────────────────────────────────────────────────────────────┐
 │  Svelte 5 (SvelteKit, adapter-static) — admin panel          │
-│  Overview · Plugins · Tools · Services · Logs · Capabilities │
+│  Chat · Overview · Plugins · Tools · Services · Logs · Capabilities │
 └───────────────────────────┬──────────────────────────────────┘
                             │ Tauri IPC (#[tauri::command])
 ┌───────────────────────────▼──────────────────────────────────┐
@@ -69,6 +69,44 @@ Desired state lives in `<app-data>/studio.json` — in the **host's own**
 Every load / unload / enable / config change writes the file atomically.
 Enabled plugins are **loaded on boot**, so the app comes back the way you left
 it. A broken or missing persisted plugin is skipped, never fatal to boot.
+
+## Chat (agent loop)
+
+The **Chat** page drives dsh's agent loop directly: create an agent, send a
+message, and watch the turn run. Tool calls the model requests are dispatched
+into the mounted WASM plugins, and their results appear inline in the
+transcript alongside reasoning blocks.
+
+The `mock` provider route always works — it echoes input, and (as the backend
+tests show) is enough to exercise a full tool call into a `.wasm` guest.
+
+### Wiring a real model
+
+Put an OpenAI-compatible endpoint under `extra.llm` in `studio.json`, then use
+its key as the agent's provider route:
+
+```json
+{
+  "extra": {
+    "llm": {
+      "providers": {
+        "deepseek": {
+          "base_url": "https://api.deepseek.com/v1",
+          "api_key": "sk-…",
+          "model": "deepseek-chat"
+        }
+      }
+    }
+  }
+}
+```
+
+Then **New agent → provider `deepseek`, model `deepseek-chat`**. Providers come
+from `dsh-rs`'s OpenAI adapter, so any OpenAI-compatible service works
+(DeepSeek, OpenRouter, a local vLLM, …).
+
+> The API key sits in `studio.json` as plain text. That is fine for a local
+> single-user app; do not sync that file anywhere.
 
 ## Auto-reload
 

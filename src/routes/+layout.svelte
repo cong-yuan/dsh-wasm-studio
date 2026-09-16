@@ -15,6 +15,7 @@
 
   const nav = [
     { href: "/", label: "Overview", icon: "▦", key: "overview" },
+    { href: "/chat", label: "Chat", icon: "◇", key: "chat" },
     { href: "/plugins", label: "Plugins", icon: "◈", key: "plugins" },
     { href: "/tools", label: "Tools", icon: "⚒", key: "tools" },
     { href: "/services", label: "Services", icon: "◇", key: "services" },

@@ -147,6 +147,10 @@ impl Studio {
         // Boot the dsh harness (agent loop, sessions, tools, llm seam).
         boot_harness(&ctx).await?;
 
+        // Register any model provider from config. Without one the harness can
+        // only run the `mock` route, which is still enough to test tool calls.
+        register_llm_providers(&ctx, &config);
+
         // Tell the WASM registry which dsh services WASM plugins may inject.
         for svc in dsh_services() {
             host.declare_dsh_service(svc);
@@ -683,6 +687,117 @@ impl Studio {
     }
 
     // -----------------------------------------------------------------------
+    // Agents (the chat surface)
+    // -----------------------------------------------------------------------
+
+    /// The agent registry service, or an error if unavailable.
+    fn agents(&self) -> Result<Arc<dsh_rs::api::services::AgentRegistryService>> {
+        self.shared
+            .ctx
+            .require::<dsh_rs::api::services::AgentRegistryService>(dsh_rs::api::AGENTS_SERVICE)
+            .map_err(|e| anyhow::anyhow!("agents service unavailable: {e}"))
+    }
+
+    /// One agent as a UI row.
+    pub fn agent_row(&self, agent: &Arc<dyn dsh_rs::api::services::AgentView>) -> AgentRow {
+        let session = agent.session();
+        AgentRow {
+            id: agent.id().to_string(),
+            status: match agent.status() {
+                dsh_rs::types::AgentStatus::Idle => "idle",
+                dsh_rs::types::AgentStatus::Running => "running",
+            }
+            .to_string(),
+            messages: session.derive_messages().len(),
+            turns: session.events().len(),
+            busy: agent.driver_busy(),
+        }
+    }
+
+    /// Every live agent.
+    pub fn list_agents(&self) -> Vec<AgentRow> {
+        match self.agents() {
+            Ok(reg) => reg.list().iter().map(|a| self.agent_row(a)).collect(),
+            Err(_) => Vec::new(),
+        }
+    }
+
+    /// Create an agent. `provider`/`model` select the route; `cwd` is the tool
+    /// working directory.
+    pub fn create_agent(
+        &self,
+        id: Option<String>,
+        provider: String,
+        model: String,
+        cwd: Option<String>,
+    ) -> Result<String> {
+        let reg = self.agents()?;
+        let options = dsh_rs::types::AgentOptions {
+            provider,
+            model,
+            max_tokens: None,
+        };
+        let agent = reg.create(id, options, cwd, None).map_err(anyhow::Error::msg)?;
+        Ok(agent.id().to_string())
+    }
+
+    fn agent(&self, id: &str) -> Result<Arc<dyn dsh_rs::api::services::AgentView>> {
+        self.agents()?
+            .get(id)
+            .ok_or_else(|| anyhow::anyhow!("no agent `{id}`"))
+    }
+
+    /// Send a user message and wait for the turn to finish.
+    pub async fn send_message(
+        &self,
+        agent_id: &str,
+        text: String,
+        msg_id: String,
+    ) -> Result<()> {
+        let agent = self.agent(agent_id)?;
+        agent.followup(dsh_rs::types::Message::user(
+            msg_id,
+            vec![text_block(text)],
+        ));
+        agent.when_idle().await;
+        Ok(())
+    }
+
+    /// Queue a steer message (delivered at the next step boundary).
+    pub fn steer(&self, agent_id: &str, text: String, msg_id: String) -> Result<()> {
+        let agent = self.agent(agent_id)?;
+        agent.steer(dsh_rs::types::Message::user(msg_id, vec![text_block(text)]));
+        Ok(())
+    }
+
+    /// Cancel the agent's in-flight turn.
+    pub fn cancel_agent(&self, agent_id: &str) -> Result<()> {
+        let agent = self.agent(agent_id)?;
+        agent.cancel(dsh_rs::types::AgentCancelCause::User, true);
+        Ok(())
+    }
+
+    /// Dispose an agent (its session stays readable until disposed separately).
+    pub fn dispose_agent(&self, agent_id: &str) -> Result<()> {
+        let reg = self.agents()?;
+        if let Some(agent) = reg.get(agent_id) {
+            reg.dispose(&agent);
+        }
+        Ok(())
+    }
+
+    /// The full message history of an agent's session, mapped for the UI.
+    pub fn transcript(&self, agent_id: &str) -> Result<Vec<ChatMessage>> {
+        let agent = self.agent(agent_id)?;
+        Ok(agent
+            .session()
+            .derive_messages()
+            .iter()
+            .map(chat_message)
+            .collect())
+    }
+
+    // -----------------------------------------------------------------------
     // Status
     // -----------------------------------------------------------------------
 
@@ -792,4 +907,150 @@ pub struct StudioStatus {
     pub service_count: usize,
     /// Whether the auto-reload watcher is running.
     pub watching: bool,
+}
+
+
+// ---------------------------------------------------------------------------
+// Chat surface types
+// ---------------------------------------------------------------------------
+
+/// One agent as the UI sees it.
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentRow {
+    pub id: String,
+    pub status: String,
+    pub messages: usize,
+    /// Number of session events (turns/steps/tool calls) — a rough activity meter.
+    pub turns: usize,
+    pub busy: bool,
+}
+
+/// One message in a chat transcript.
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatMessage {
+    /// `user` | `assistant` | `system`.
+    pub role: String,
+    /// Visible text (concatenated text blocks).
+    pub text: String,
+    /// Reasoning blocks, kept separate so the UI can collapse them.
+    pub reasoning: String,
+    /// Tool calls the assistant requested.
+    pub tool_calls: Vec<ChatToolCall>,
+    /// Tool results delivered back to the model.
+    pub tool_results: Vec<ChatToolResult>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatToolCall {
+    pub id: String,
+    pub name: String,
+    /// Raw JSON string as the model produced it.
+    pub arguments: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatToolResult {
+    pub tool_call_id: String,
+    pub content: String,
+    pub is_error: bool,
+}
+
+/// A text content block.
+fn text_block(text: impl Into<String>) -> dsh_rs::types::ContentBlock {
+    dsh_rs::types::ContentBlock::Text { text: text.into() }
+}
+
+/// Map a dsh `Message` onto the UI transcript shape.
+fn chat_message(m: &dsh_rs::types::Message) -> ChatMessage {
+    use dsh_rs::types::ContentBlock;
+    let role = match m.role {
+        dsh_rs::types::Role::User => "user",
+        dsh_rs::types::Role::Assistant => "assistant",
+        dsh_rs::types::Role::System => "system",
+    }
+    .to_string();
+
+    let mut text = String::new();
+    let mut reasoning = String::new();
+    let mut tool_calls = Vec::new();
+    let mut tool_results = Vec::new();
+
+    for block in &m.content {
+        match block {
+            ContentBlock::Text { text: t } => text.push_str(t),
+            ContentBlock::Reasoning { text: t } => reasoning.push_str(t),
+            ContentBlock::ToolCall { id, name, arguments } => tool_calls.push(ChatToolCall {
+                id: id.clone(),
+                name: name.clone(),
+                arguments: arguments.clone(),
+            }),
+            ContentBlock::ToolResult {
+                tool_call_id,
+                content,
+                is_error,
+            } => {
+                let inner: String = content
+                    .iter()
+                    .filter_map(|b| b.as_text())
+                    .collect::<Vec<_>>()
+                    .join("");
+                tool_results.push(ChatToolResult {
+                    tool_call_id: tool_call_id.clone(),
+                    content: inner,
+                    is_error: is_error.unwrap_or(false),
+                });
+            }
+        }
+    }
+
+    ChatMessage {
+        role,
+        text,
+        reasoning,
+        tool_calls,
+        tool_results,
+    }
+}
+
+/// Register model providers described by the config's optional `llm` section.
+///
+/// Shape (all optional except `base_url` for a real provider):
+///
+/// ```json
+/// { "llm": {
+///     "providers": {
+///       "deepseek": { "base_url": "https://api.deepseek.com/v1",
+///                     "api_key": "sk-...", "model": "deepseek-chat" }
+///     },
+///     "default": "mock"
+/// }}
+/// ```
+///
+/// The `mock` route is always available (dsh registers it), so an app with no
+/// provider configured can still exercise tool calls.
+fn register_llm_providers(ctx: &cordis::Context, config: &Config) {
+    // The host `Config` has a generic `extra` section precisely so an embedder
+    // can keep its own settings in the same file. Ours live under `extra.llm`.
+    let Some(llm) = config.extra.as_ref().and_then(|e| e.get("llm")) else {
+        return;
+    };
+    let Some(providers) = llm.get("providers").and_then(|p| p.as_object()) else {
+        return;
+    };
+    let Ok(runtime) = ctx.require::<dsh_rs::api::services::LlmService>(dsh_rs::api::LLM_SERVICE)
+    else {
+        return;
+    };
+    for (name, section) in providers {
+        // Each section is an OpenAI-compatible endpoint configuration.
+        match dsh_rs::llm::adapters::openai::OpenAiAdapter::new(section.clone()) {
+            Ok(adapter) => {
+                let adapter: Arc<dyn dsh_rs::api::services::LlmAdapterApi> = Arc::new(adapter);
+                if let Err(e) = runtime.register_adapter(&[name.as_str()], adapter) {
+                    eprintln!("[studio] registering llm provider `{name}` failed: {e}");
+                }
+            }
+            Err(e) => eprintln!("[studio] building llm provider `{name}` failed: {e}"),
+        }
+    }
 }

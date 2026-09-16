@@ -272,6 +272,73 @@ pub fn set_log_level(studio: State<'_, Studio>, level: String) -> Result<String,
 }
 
 // ---------------------------------------------------------------------------
+// Agents / chat
+// ---------------------------------------------------------------------------
+
+/// Create an agent on a provider route; returns its id.
+#[tauri::command]
+pub fn create_agent(
+    studio: State<'_, Studio>,
+    id: Option<String>,
+    provider: String,
+    model: String,
+    cwd: Option<String>,
+) -> Result<String, String> {
+    studio
+        .create_agent(id, provider, model, cwd)
+        .map_err(err)
+}
+
+/// Every live agent.
+#[tauri::command]
+pub fn list_agents(studio: State<'_, Studio>) -> Vec<crate::studio::AgentRow> {
+    studio.list_agents()
+}
+
+/// Send a user message and wait for the turn to finish.
+#[tauri::command]
+pub async fn send_message(
+    studio: State<'_, Studio>,
+    agent_id: String,
+    text: String,
+    msg_id: String,
+) -> Result<(), String> {
+    studio.send_message(&agent_id, text, msg_id).await.map_err(err)
+}
+
+/// Queue a steer message (delivered at the next step boundary).
+#[tauri::command]
+pub fn steer_agent(
+    studio: State<'_, Studio>,
+    agent_id: String,
+    text: String,
+    msg_id: String,
+) -> Result<(), String> {
+    studio.steer(&agent_id, text, msg_id).map_err(err)
+}
+
+/// Cancel the agent's in-flight turn.
+#[tauri::command]
+pub fn cancel_agent(studio: State<'_, Studio>, agent_id: String) -> Result<(), String> {
+    studio.cancel_agent(&agent_id).map_err(err)
+}
+
+/// Dispose an agent.
+#[tauri::command]
+pub fn dispose_agent(studio: State<'_, Studio>, agent_id: String) -> Result<(), String> {
+    studio.dispose_agent(&agent_id).map_err(err)
+}
+
+/// The full message history of an agent's session.
+#[tauri::command]
+pub fn transcript(
+    studio: State<'_, Studio>,
+    agent_id: String,
+) -> Result<Vec<crate::studio::ChatMessage>, String> {
+    studio.transcript(&agent_id).map_err(err)
+}
+
+// ---------------------------------------------------------------------------
 // Capabilities / introspection
 // ---------------------------------------------------------------------------
 
