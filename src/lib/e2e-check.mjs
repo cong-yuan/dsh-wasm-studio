@@ -1,0 +1,105 @@
+// End-to-end chain check.
+//
+// Reads the REAL `ui_contributions` JSON that the Tauri backend emits (piped
+// from `cargo run --example dump_ui`) and drives the REAL frontend
+// `PluginHost` with it. This is the one thing the unit tests cannot cover: that
+// the two sides agree on the wire shape.
+//
+// Usage:
+//   cd src-tauri && cargo run --example dump_ui | node ../src/lib/e2e-check.mjs
+
+import { readFileSync } from "node:fs";
+import { PluginHost } from "./plugin-host.ts";
+
+// Read the payload from stdin (or a file given as argv[2]).
+const input = process.argv[2]
+  ? readFileSync(process.argv[2], "utf8")
+  : readFileSync(0, "utf8");
+
+const plugins = JSON.parse(input);
+if (!Array.isArray(plugins) || plugins.length === 0) {
+  console.error("FAIL: no ui contributions in the payload");
+  process.exit(1);
+}
+
+// A minimal DOM, since this script is not a browser.
+class El {
+  constructor(tag) {
+    this.tag = tag;
+    this.children = [];
+    this.dataset = {};
+    this.textContent = "";
+    this.innerHTML = "";
+    this.listeners = {};
+  }
+  appendChild(c) {
+    this.children.push(c);
+    return c;
+  }
+  remove() {}
+  querySelector() {
+    return null;
+  }
+  addEventListener(k, f) {
+    this.listeners[k] = f;
+  }
+}
+const dom = {
+  createElement: (t) => new El(t),
+  head: () => new El("head"),
+};
+
+const host = new PluginHost(dom, async () => plugins);
+await host.sync();
+
+let failures = 0;
+const check = (label, cond, extra = "") => {
+  console.log(`${cond ? "ok  " : "FAIL"} ${label}${extra ? " — " + extra : ""}`);
+  if (!cond) failures++;
+};
+
+// The whole point: B (theme-widget) must mount into the slot A (llm-panel) owns.
+check(
+  "ui-llm-panel opened its slot",
+  host.slots.listSlots().some((s) => s.name === "ui-llm-panel.config"),
+);
+
+const contribs = host.contributionsFor("ui-llm-panel.config");
+check("exactly one contributor to that slot", contribs.length === 1, `got ${contribs.length}`);
+check("the contributor is ui-theme-widget", contribs[0]?.owner === "ui-theme-widget");
+check("with the ThemeWidget component", contribs[0]?.component === "ThemeWidget");
+
+// Both plugins' components must be registered from their real entry.js.
+check(
+  "ui-theme-widget registered ThemeWidget",
+  !!host.factoryFor(contribs[0]),
+);
+
+const panel = host.slots
+  .listSlots()
+  .find((s) => s.name === "settings.tabs");
+check("settings.tabs is available (built-in)", !!panel);
+
+const panelContribs = host.contributionsFor("settings.tabs");
+check(
+  "ui-llm-panel contributes into settings.tabs",
+  panelContribs.some((c) => c.owner === "ui-llm-panel" && c.component === "LlmPanel"),
+);
+
+// Every declared contribution should be renderable — this is the diagnostic the
+// management page shows.
+const bad = host.diagnostics().filter((d) => d.status !== "ready");
+check("no contribution is stuck", bad.length === 0, JSON.stringify(bad));
+
+// Actually mount the widget and confirm the factory ran into real DOM.
+const parent = new El("div");
+const dispose = host.mount(contribs[0], parent);
+check("mounting appended a wrapper", parent.children.length === 1);
+check(
+  "the plugin's innerHTML was written",
+  parent.children[0].innerHTML.includes("ui-theme-widget"),
+);
+dispose();
+
+console.log(failures === 0 ? "\nALL CHECKS PASSED" : `\n${failures} CHECK(S) FAILED`);
+process.exit(failures === 0 ? 0 : 1);

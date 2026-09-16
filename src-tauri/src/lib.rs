@@ -21,6 +21,7 @@ use tauri::Manager;
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
             // Boot the harness + WASM host once, and keep it as managed state.
             let handle = app.handle().clone();
@@ -31,9 +32,11 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::studio_status,
+            commands::plugin_catalog,
             commands::list_plugins,
             commands::load_plugin,
             commands::unload_plugin,
+            commands::remove_plugin,
             commands::set_plugin_enabled,
             commands::reload_plugin,
             commands::set_plugin_config,

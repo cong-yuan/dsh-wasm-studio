@@ -64,8 +64,6 @@
     </div>
   </div>
 </div>
-
-<!-- plugins may add dashboard cards -->
 <Slot slot="dashboard.cards" />
 
 {#if getEvents().length}

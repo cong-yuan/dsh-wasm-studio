@@ -1,20 +1,18 @@
-<!--
-  Renders every plugin contribution registered into a named slot.
-
-  Usage:
-    <Slot slot="settings.tabs" />
-    <Slot slot="llm-ui.config" />   <!-- a plugin-opened slot -->
-
-  The component is purely a mount point: it asks the host for the current
-  render list and mounts each contribution's component into a child element.
-  Reactivity comes from the host's `subscribe`, so a slot that appears or
-  disappears (its plugin loading/unloading) re-renders automatically — that is
-  rule 2 of the slot registry, made visible.
-
-  C2: components are arbitrary JS that receive a DOM element. This component
-  never inspects what they render.
--->
 <script lang="ts">
+  // Renders every plugin contribution registered into a named slot.
+  //
+  // Usage:
+  //   <Slot slot="settings.tabs" />
+  //   <Slot slot="llm-ui.config" />   <!-- a plugin-opened slot -->
+  //
+  // The component is purely a mount point: it asks the host for the current
+  // render list and mounts each contribution's component into a child element.
+  // Reactivity comes from the host's `subscribe`, so a slot that appears or
+  // disappears (its plugin loading/unloading) re-renders automatically — that
+  // is rule 2 of the slot registry, made visible.
+  //
+  // C2: components are arbitrary JS that receive a DOM element. This component
+  // never inspects what they render.
   import { onDestroy } from "svelte";
   import type { Contribution } from "$lib/slots";
   import { pluginHost } from "$lib/plugin-runtime";

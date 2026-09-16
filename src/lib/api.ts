@@ -36,12 +36,50 @@ export interface PluginRow {
   path: string;
   injects: string[];
   provides: string[];
+  /** Frontend slots this plugin opens for others. */
+  provides_slots: string[];
+  /** Slots this plugin's UI mounts into. */
+  injects_slots: SlotInjectRow[];
+  /** Whether the plugin ships frontend assets (an entry.js). */
+  has_ui: boolean;
 }
 
 /** A `.wasm` found on disk but not yet configured (mirrors `studio::Discovered`). */
 export interface Discovered {
   slot: string;
   path: string;
+}
+
+/** One directory consulted during discovery (mirrors `studio::SearchedRoot`). */
+export interface SearchedRoot {
+  path: string;
+  label: string;
+  exists: boolean;
+  wasm_count: number;
+}
+
+/** One entry of the plugin catalog (mirrors `studio::CatalogEntry`). */
+export interface CatalogEntry {
+  slot: string;
+  plugin: string;
+  path: string;
+  /** Is a guest instance loaded right now? */
+  running: boolean;
+  /** Is it active (injects satisfied)? */
+  active: boolean;
+  /** `active` | `pending` | `stopped` | `available` | ... */
+  state: string;
+  tool_count: number;
+  in_config: boolean;
+  enabled: boolean;
+  exists: boolean;
+}
+
+/** A discovery scan result (mirrors `studio::Discovery`). */
+export interface Discovery {
+  plugins: Discovered[];
+  /** Every directory we looked in, so an empty result is explainable. */
+  searched: SearchedRoot[];
 }
 
 /** A change event from the backend (mirrors `studio::StudioEvent`). */
@@ -97,8 +135,13 @@ export const listPlugins = () => invoke<PluginRow[]>("list_plugins");
 export const loadPlugin = (slot: string, path: string, config?: unknown) =>
   invoke<void>("load_plugin", { slot, path, config: config ?? null });
 
+/** Stop a slot: release its instance but keep it listed (startable again). */
 export const unloadPlugin = (slot: string) =>
   invoke<void>("unload_plugin", { slot });
+
+/** Forget a slot entirely: stop it and delete it from the config. */
+export const removePlugin = (slot: string) =>
+  invoke<void>("remove_plugin", { slot });
 
 /** Enable or disable a configured slot (loads/unloads to match); persists. */
 export const setPluginEnabled = (slot: string, enabled: boolean) =>
@@ -109,8 +152,11 @@ export const setPluginEnabled = (slot: string, enabled: boolean) =>
 export const reloadPlugin = (slot: string) =>
   invoke<string[]>("reload_plugin", { slot });
 
-/** `.wasm` files in the plugins dir that are not yet configured. */
-export const discoverPlugins = () => invoke<Discovered[]>("discover_plugins");
+/** Every plugin the app knows about (running or not). */
+export const pluginCatalog = () => invoke<CatalogEntry[]>("plugin_catalog");
+
+/** Scan every candidate location for `.wasm` files not yet configured. */
+export const discoverPlugins = () => invoke<Discovery>("discover_plugins");
 
 export const setPluginConfig = (slot: string, config: unknown) =>
   invoke<boolean>("set_plugin_config", { slot, config });

@@ -12,7 +12,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tauri::State;
 
-use crate::studio::{Discovered, Studio, StudioStatus};
+use crate::studio::{Studio, StudioStatus};
 
 /// Build the command error type from any displayable error.
 fn err(e: impl std::fmt::Display) -> String {
@@ -50,6 +50,12 @@ pub struct PluginRow {
     pub injects: Vec<String>,
     /// Services this slot offers.
     pub provides: Vec<String>,
+    /// Frontend slots this plugin **opens** for others.
+    pub provides_slots: Vec<String>,
+    /// Slots this plugin's UI mounts **into**.
+    pub injects_slots: Vec<SlotInjectRow>,
+    /// Whether this plugin ships frontend assets (an entry.js).
+    pub has_ui: bool,
 }
 
 #[tauri::command]
@@ -62,6 +68,27 @@ pub fn list_plugins(studio: State<'_, Studio>) -> Vec<PluginRow> {
         .map(|(slot, plugin, state, tool_count, active)| {
             let (injects, provides) = studio.host().deps_of(&slot);
             let entry = cfg.plugins.get(&slot);
+            // The frontend contribution, if any — surfaced here so the Plugins
+            // page can show *what UI a plugin brings*, not just its tools.
+            let ui = studio.host().ui_decl(&slot);
+            let provides_slots = ui
+                .as_ref()
+                .map(|u| u.provides.iter().map(|s| s.name.clone()).collect())
+                .unwrap_or_default();
+            let injects_slots = ui
+                .as_ref()
+                .map(|u| {
+                    u.injects
+                        .iter()
+                        .map(|i| SlotInjectRow {
+                            slot: i.slot.clone(),
+                            priority: i.priority,
+                            component: i.component.clone(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let has_ui = ui.map(|u| !u.assets.is_empty()).unwrap_or(false);
             PluginRow {
                 mounted: studio.is_mounted(&slot),
                 enabled: entry.map(|e| e.enabled).unwrap_or(false),
@@ -73,6 +100,9 @@ pub fn list_plugins(studio: State<'_, Studio>) -> Vec<PluginRow> {
                 active,
                 injects,
                 provides,
+                provides_slots,
+                injects_slots,
+                has_ui,
             }
         })
         .collect()
@@ -96,6 +126,14 @@ pub async fn load_plugin(
 #[tauri::command]
 pub async fn unload_plugin(studio: State<'_, Studio>, slot: String) -> Result<(), String> {
     studio.unmount_slot(&slot).await.map_err(err)
+}
+
+/// Forget a slot entirely: stop it and delete it from the config.
+///
+/// Distinct from [`unload_plugin`], which stops but keeps it listed.
+#[tauri::command]
+pub async fn remove_plugin(studio: State<'_, Studio>, slot: String) -> Result<(), String> {
+    studio.remove_slot(&slot).await.map_err(err)
 }
 
 /// Enable/disable a configured slot (loads or unloads to match), persisting.
@@ -135,9 +173,12 @@ pub fn validate_plugin(
     studio.host().validate(&path).map_err(err)
 }
 
-/// Scan the plugins directory for `.wasm` files not yet configured.
+/// Scan every candidate location for `.wasm` files not yet configured.
+///
+/// Returns both what was found *and* where we looked, so an empty result can
+/// tell the user which directory to drop a plugin into.
 #[tauri::command]
-pub fn discover_plugins(studio: State<'_, Studio>) -> Vec<Discovered> {
+pub fn discover_plugins(studio: State<'_, Studio>) -> crate::studio::Discovery {
     studio.discover()
 }
 
@@ -213,6 +254,16 @@ pub fn ui_contributions(studio: State<'_, Studio>) -> Vec<UiPlugin> {
             assets: ui.assets,
         })
         .collect()
+}
+
+/// Every plugin the app knows about: configured ones (running or stopped) plus
+/// `.wasm` files found on disk.
+///
+/// The Plugins page renders this. It intentionally includes not-running
+/// plugins, so stopping one does not make it vanish.
+#[tauri::command]
+pub fn plugin_catalog(studio: State<'_, Studio>) -> Vec<crate::studio::CatalogEntry> {
+    studio.catalog()
 }
 
 // ---------------------------------------------------------------------------

@@ -3,8 +3,8 @@
   import {
     loadPlugin,
     unloadPlugin,
+    removePlugin,
     reloadPlugin,
-    setPluginEnabled,
     validatePlugin,
     discoverPlugins,
     watchStatus,
@@ -12,9 +12,11 @@
     stopWatch,
     errorMessage,
     type Discovered,
+    type SearchedRoot,
   } from "$lib/api";
-  import { getPlugins, refreshAll, isLoading } from "$lib/state.svelte";
-  import Slot from "$lib/Slot.svelte";
+  import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
+  import { getCatalog, getStatus, refreshAll, isLoading } from "$lib/state.svelte";
+  import { pluginHost } from "$lib/plugin-runtime";
 
   let showLoad = $state(false);
   let busy = $state<string | null>(null);
@@ -24,15 +26,21 @@
   // Discover modal.
   let showDiscover = $state(false);
   let discovered = $state<Discovered[]>([]);
+  let searched = $state<SearchedRoot[]>([]);
 
   // Load-form fields.
   let formSlot = $state("");
   let formPath = $state("");
-  let formConfig = $state("");
   let validating = $state(false);
   let validation = $state<string | null>(null);
 
-  const configPlaceholder = '{ "greeting": "Hi" }';
+  // Live view of which UI contributions actually render, and why not.
+  let hostRevision = $state(0);
+  pluginHost.subscribe(() => (hostRevision += 1));
+  let diagnostics = $derived.by(() => {
+    void hostRevision;
+    return pluginHost.diagnostics();
+  });
 
   onMount(async () => {
     await refreshAll();
@@ -56,8 +64,42 @@
 
   async function doDiscover() {
     try {
-      discovered = await discoverPlugins();
+      const result = await discoverPlugins();
+      discovered = result.plugins;
+      searched = result.searched;
       showDiscover = true;
+    } catch (e) {
+      flash("err", errorMessage(e));
+    }
+  }
+
+  /** Open the app's plugins directory in the OS file manager. */
+  async function revealPluginsDir() {
+    const dir = getStatus()?.plugins_dir;
+    if (!dir) return;
+    try {
+      const { revealItemInDir } = await import("@tauri-apps/plugin-opener");
+      await revealItemInDir(dir);
+    } catch (e) {
+      flash("err", errorMessage(e));
+    }
+  }
+
+  /** Native file picker — removes the "what do I type?" problem entirely. */
+  async function pickFile() {
+    try {
+      const picked = await openFileDialog({
+        multiple: false,
+        filters: [{ name: "WebAssembly", extensions: ["wasm"] }],
+      });
+      if (typeof picked === "string") {
+        formPath = picked;
+        if (!formSlot.trim()) {
+          const base = picked.split("/").pop() ?? "plugin";
+          formSlot = base.replace(/\.wasm$/, "").replace(/-/g, "_");
+        }
+        validation = null;
+      }
     } catch (e) {
       flash("err", errorMessage(e));
     }
@@ -77,14 +119,16 @@
     }
   }
 
-  async function doLoad() {
-    busy = "load";
+  async function doLoad(slot?: string, path?: string) {
+    const s = (slot ?? formSlot).trim();
+    const p = (path ?? formPath).trim();
+    if (!s || !p) return;
+    busy = s;
     try {
-      const cfg = formConfig.trim() ? JSON.parse(formConfig) : null;
-      await loadPlugin(formSlot.trim(), formPath.trim(), cfg);
-      flash("ok", `Loaded slot “${formSlot}”`);
+      await loadPlugin(s, p);
+      flash("ok", `Started “${s}”`);
       showLoad = false;
-      formSlot = formPath = formConfig = "";
+      formSlot = formPath = "";
       validation = null;
       await refreshAll();
     } catch (e) {
@@ -94,11 +138,25 @@
     }
   }
 
-  async function doUnload(slot: string) {
+  async function doStop(slot: string) {
     busy = slot;
     try {
       await unloadPlugin(slot);
-      flash("ok", `Unloaded “${slot}”`);
+      flash("ok", `Stopped “${slot}” (still listed — restart any time)`);
+      await refreshAll();
+    } catch (e) {
+      flash("err", errorMessage(e));
+    } finally {
+      busy = null;
+    }
+  }
+
+  async function doRemove(slot: string) {
+    if (!confirm(`Remove “${slot}” from the list? Its .wasm file is not touched.`)) return;
+    busy = slot;
+    try {
+      await removePlugin(slot);
+      flash("ok", `Removed “${slot}” from the list`);
       await refreshAll();
     } catch (e) {
       flash("err", errorMessage(e));
@@ -114,21 +172,7 @@
       flash("ok", `Reloaded “${slot}” — tools: ${tools.join(", ") || "none"}`);
       await refreshAll();
     } catch (e) {
-      // A rejected reload (broken build) leaves the old plugin running.
       flash("err", `Reload rejected — ${errorMessage(e)}`);
-    } finally {
-      busy = null;
-    }
-  }
-
-  async function doToggle(slot: string, enabled: boolean) {
-    busy = slot;
-    try {
-      await setPluginEnabled(slot, enabled);
-      flash("ok", `${enabled ? "Enabled" : "Disabled"} “${slot}”`);
-      await refreshAll();
-    } catch (e) {
-      flash("err", errorMessage(e));
     } finally {
       busy = null;
     }
@@ -139,8 +183,8 @@
   <div>
     <h1>Plugins</h1>
     <div class="sub">
-      Each <code>.wasm</code> is mounted as its own cordis plugin — own fiber,
-      own <code>inject</code>/<code>provide</code>. State persists across restarts.
+      Every plugin the app knows about. <span style="color: var(--ok)">Green</span>
+      means running; white means stopped or not yet started.
     </div>
   </div>
   <div class="toolbar">
@@ -153,7 +197,6 @@
     </button>
     <button onclick={doDiscover}>Discover…</button>
     <button onclick={() => refreshAll()} disabled={isLoading()}>Refresh</button>
-    <button class="primary" onclick={() => (showLoad = true)}>Load plugin</button>
   </div>
 </div>
 
@@ -164,79 +207,84 @@
 {/if}
 
 <div class="card">
-  {#if getPlugins().length === 0}
+  {#if getCatalog().length === 0}
     <div class="empty">
-      No plugins loaded. Click <strong>Discover</strong> to scan the plugins
-      directory, or <strong>Load plugin</strong> to point at a <code>.wasm</code>.
+      No plugins found. Use <strong>Discover…</strong> to see where the app
+      looks, or drop a <code>.wasm</code> into the plugins directory.
     </div>
   {:else}
     <table>
       <thead>
         <tr>
-          <th>On</th>
           <th>Slot</th>
           <th>Plugin</th>
-          <th>State</th>
+          <th>Status</th>
           <th>Tools</th>
-          <th>Injects</th>
-          <th>Provides</th>
+          <th>Source</th>
           <th></th>
         </tr>
       </thead>
       <tbody>
-        {#each getPlugins() as p}
+        {#each getCatalog() as p}
           <tr>
-            <td>
-              <input
-                type="checkbox"
-                style="width: auto;"
-                checked={p.enabled}
-                disabled={busy === p.slot}
-                onchange={(e) => doToggle(p.slot, e.currentTarget.checked)}
-                title="Enable/disable and persist"
-              />
-            </td>
-            <td class="mono">{p.slot}</td>
-            <td>{p.plugin}</td>
-            <td>
-              <span class="badge" class:ok={p.active} class:warn={!p.active}>
-                {p.state}
-              </span>
-              {#if !p.mounted}<span class="faint" style="font-size: 11px;"> unmounted</span>{/if}
-            </td>
-            <td>{p.tool_count}</td>
-            <td>
-              {#if p.injects.length}
-                <div class="pill-list">
-                  {#each p.injects as s}<span class="badge">{s}</span>{/each}
-                </div>
-              {:else}<span class="faint">—</span>{/if}
+            <!-- The slot name is the row's identity; colour encodes running. -->
+            <td class="mono" class:running={p.running}>{p.slot}</td>
+            <td class:running={p.running}>
+              {p.plugin}
+              {#if !p.exists}
+                <span class="badge err" title="the .wasm file is missing">missing file</span>
+              {/if}
             </td>
             <td>
-              {#if p.provides.length}
-                <div class="pill-list">
-                  {#each p.provides as s}<span class="badge">{s}</span>{/each}
-                </div>
-              {:else}<span class="faint">—</span>{/if}
+              {#if p.running && p.active}
+                <span class="badge ok">running</span>
+              {:else if p.running}
+                <span class="badge warn">{p.state}</span>
+              {:else}
+                <span class="badge">stopped</span>
+              {/if}
+            </td>
+            <td>{p.running ? p.tool_count : "—"}</td>
+            <td class="faint" style="font-size: 11px;">
+              {#if p.in_config}configured{:else}found on disk{/if}
             </td>
             <td>
               <div class="toolbar" style="justify-content: flex-end;">
-                <button
-                  class="ghost"
-                  onclick={() => doReload(p.slot)}
-                  disabled={busy === p.slot}
-                  title="Atomically swap in a rebuilt .wasm"
-                >
-                  reload
-                </button>
-                <button
-                  class="ghost danger"
-                  onclick={() => doUnload(p.slot)}
-                  disabled={busy === p.slot}
-                  title="Unload and release the wasm instance"
-                >
-                  unload
-                </button>
+                {#if p.running}
+                  <button
+                    class="ghost"
+                    onclick={() => doReload(p.slot)}
+                    disabled={busy === p.slot}
+                    title="Atomically swap in a rebuilt .wasm"
+                  >
+                    reload
+                  </button>
+                  <button
+                    class="ghost danger"
+                    onclick={() => doStop(p.slot)}
+                    disabled={busy === p.slot}
+                    title="Stop the plugin (it stays in the list)"
+                  >
+                    stop
+                  </button>
+                  <button
+                    class="ghost"
+                    onclick={() => doRemove(p.slot)}
+                    disabled={busy === p.slot}
+                    title="Forget it (delete from the list; the file is untouched)"
+                  >
+                    remove
+                  </button>
+                {:else}
+                  <button
+                    class="ghost"
+                    onclick={() => doLoad(p.slot, p.path)}
+                    disabled={busy === p.slot || !p.exists}
+                    title="Start this plugin"
+                  >
+                    {busy === p.slot ? "starting…" : "start"}
+                  </button>
+                {/if}
               </div>
             </td>
           </tr>
@@ -247,11 +295,40 @@
 </div>
 
 <div class="card" style="margin-top: 20px;">
-  <div class="card-head"><h2>Plugin detail</h2></div>
-  <div style="padding: 12px 16px;">
-    <!-- plugins render their own detail panels here -->
-    <Slot slot="plugin.detail" empty={true} />
+  <div class="card-head">
+    <h2>Frontend UI</h2>
+    <span class="faint" style="font-size: 11px;">
+      {diagnostics.length} contribution(s)
+    </span>
   </div>
+  {#if diagnostics.length === 0}
+    <div class="empty">
+      No running plugin declares frontend UI. A plugin opts in by adding a
+      <code>ui</code> block to its declaration (see <code>docs/ABI.md</code>).
+    </div>
+  {:else}
+    <table>
+      <thead>
+        <tr><th>Plugin</th><th>Target slot</th><th>Component</th><th>Status</th></tr>
+      </thead>
+      <tbody>
+        {#each diagnostics as d}
+          <tr>
+            <td class="mono">{d.owner}</td>
+            <td class="mono">{d.slot}</td>
+            <td class="mono faint">{d.component ?? "—"}</td>
+            <td>
+              {#if d.status === "ready"}
+                <span class="badge ok">ready</span>
+              {:else}
+                <span class="badge warn">{d.status}</span>
+              {/if}
+            </td>
+          </tr>
+        {/each}
+      </tbody>
+    </table>
+  {/if}
 </div>
 
 {#if showLoad}
@@ -261,7 +338,7 @@
     onclick={(e) => e.target === e.currentTarget && (showLoad = false)}
   >
     <div class="modal">
-      <h2>Load a WASM plugin</h2>
+      <h2>Start a WASM plugin</h2>
 
       <div class="field">
         <label for="slot">Slot (stable identity, survives reload)</label>
@@ -270,12 +347,18 @@
 
       <div class="field">
         <label for="path">Path to .wasm</label>
-        <input id="path" bind:value={formPath} placeholder="/path/to/plugin.wasm" />
-      </div>
-
-      <div class="field">
-        <label for="config">Config JSON (optional, injected into the guest)</label>
-        <textarea id="config" rows="3" bind:value={formConfig} placeholder={configPlaceholder}></textarea>
+        <div class="toolbar">
+          <input
+            id="path"
+            bind:value={formPath}
+            placeholder="pick a file, or type a path"
+            style="flex:1"
+          />
+          <button type="button" onclick={pickFile}>Browse…</button>
+        </div>
+        <div class="faint" style="font-size: 11px; margin-top: 4px;">
+          Tip: <strong>Discover…</strong> lists every <code>.wasm</code> already on disk.
+        </div>
       </div>
 
       {#if validation}
@@ -290,10 +373,10 @@
         <button onclick={() => (showLoad = false)}>Cancel</button>
         <button
           class="primary"
-          onclick={doLoad}
-          disabled={busy === "load" || !formSlot.trim() || !formPath.trim()}
+          onclick={() => doLoad()}
+          disabled={busy !== null || !formSlot.trim() || !formPath.trim()}
         >
-          {busy === "load" ? "loading…" : "Load"}
+          {busy ? "starting…" : "Start"}
         </button>
       </div>
     </div>
@@ -309,9 +392,28 @@
     <div class="modal">
       <h2>Discovered plugins</h2>
       {#if discovered.length === 0}
-        <div class="empty">
-          No new <code>.wasm</code> files in the plugins directory. Drop one in
-          and click Discover again.
+        <div class="empty" style="text-align: left;">
+          <p style="margin-top: 0;">
+            No unconfigured <code>.wasm</code> files found. Directories searched:
+          </p>
+          <table>
+            <thead><tr><th>Directory</th><th>Kind</th><th>Exists</th></tr></thead>
+            <tbody>
+              {#each searched as r}
+                <tr>
+                  <td class="mono" style="font-size: 11px;">{r.path}</td>
+                  <td class="faint">{r.label}</td>
+                  <td>
+                    {#if r.exists}<span class="badge ok">yes</span>{:else}<span class="badge err">no</span>{/if}
+                  </td>
+                </tr>
+              {/each}
+            </tbody>
+          </table>
+          <p class="muted" style="margin-bottom: 0;">
+            Drop a <code>.wasm</code> into the <strong>app plugin directory</strong>
+            above, or use <strong>Start a plugin → Browse…</strong>.
+          </p>
         </div>
       {:else}
         <table>
@@ -324,32 +426,40 @@
                 <td style="text-align: right;">
                   <button
                     class="ghost"
-                    onclick={async () => {
-                      busy = "load";
-                      try {
-                        await loadPlugin(d.slot, d.path);
-                        discovered = discovered.filter((x) => x.slot !== d.slot);
-                        flash("ok", `Loaded “${d.slot}”`);
-                        await refreshAll();
-                      } catch (e) {
-                        flash("err", errorMessage(e));
-                      } finally {
-                        busy = null;
-                      }
-                    }}
-                    disabled={busy === "load"}
+                    onclick={() => doLoad(d.slot, d.path)}
+                    disabled={busy !== null}
                   >
-                    load
+                    start
                   </button>
                 </td>
               </tr>
             {/each}
           </tbody>
         </table>
+        <details style="margin-top: 12px;">
+          <summary class="faint" style="font-size: 11px; cursor: pointer;">
+            searched {searched.length} location(s)
+          </summary>
+          <div style="margin-top: 8px;">
+            {#each searched as r}
+              <div class="faint mono" style="font-size: 11px;">
+                {r.path} <span style="opacity:.6">— {r.wasm_count} new</span>
+              </div>
+            {/each}
+          </div>
+        </details>
       {/if}
       <div class="modal-actions">
+        <button onclick={revealPluginsDir}>Open plugins folder</button>
         <button onclick={() => (showDiscover = false)}>Close</button>
       </div>
     </div>
   </div>
 {/if}
+
+<style>
+  /* Running plugins are green; stopped ones keep the normal text colour. */
+  .running {
+    color: var(--ok);
+  }
+</style>

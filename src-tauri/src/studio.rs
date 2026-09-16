@@ -49,7 +49,6 @@
 //! host CLI's supervisor, not a bespoke schema. Enabled plugins are loaded on
 //! boot; every mutation writes the file back.
 
-use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -380,11 +379,34 @@ impl Studio {
     }
 
     /// Unload a slot and drop its fiber, removing it from `studio.json`.
+    /// **Stop** a slot: unload the guest and dismount its fiber, but **keep it
+    /// in the config** so it stays listed and can be started again.
+    ///
+    /// This used to delete the config entry, which made "stop" indistinguishable
+    /// from "forget": the plugin vanished from the UI and discovery would not
+    /// offer it back (its path was still configured). Stopping is not removing.
     pub async fn unmount_slot(&self, slot: &str) -> Result<()> {
         self.unmount_inner(slot).await?;
-        let mut cfg = self.shared.config.lock().unwrap();
-        cfg.plugins.remove(slot);
-        drop(cfg);
+        // Mark disabled rather than deleting, if we know about it.
+        {
+            let mut cfg = self.shared.config.lock().unwrap();
+            if let Some(entry) = cfg.plugins.get_mut(slot) {
+                entry.enabled = false;
+            }
+        }
+        self.save()?;
+        self.fire(StudioEvent::Changed);
+        Ok(())
+    }
+
+    /// **Remove** a slot entirely: stop it and delete it from the config.
+    /// Use this when you want the plugin forgotten, not merely stopped.
+    pub async fn remove_slot(&self, slot: &str) -> Result<()> {
+        self.unmount_inner(slot).await?;
+        {
+            let mut cfg = self.shared.config.lock().unwrap();
+            cfg.plugins.remove(slot);
+        }
         self.save()?;
         self.fire(StudioEvent::Changed);
         Ok(())
@@ -558,39 +580,96 @@ impl Studio {
     }
 
     /// Scan the plugins directory for `.wasm` files not already configured.
-    pub fn discover(&self) -> Vec<Discovered> {
-        let configured: BTreeMap<String, String> = self
+    /// Find candidate `.wasm` plugins in every place we look.
+    ///
+    /// Discovery used to scan a single (usually empty) app-data directory, which
+    /// meant "Discover" almost always found nothing and gave no clue why. It now
+    /// searches several sensible roots and reports all of them — including the
+    /// ones that do not exist — so the UI can say *where to put a plugin*.
+    pub fn discover(&self) -> Discovery {
+        // Canonicalise configured paths too: discovered paths are canonical
+        // (symlinks like macOS's /var -> /private/var resolved), so comparing
+        // raw strings would miss a plugin that is already loaded.
+        let canon = |p: String| {
+            std::fs::canonicalize(&p)
+                .map(|c| c.display().to_string())
+                .unwrap_or(p)
+        };
+        let configured: std::collections::HashSet<String> = self
             .config()
             .plugins
-            .into_iter()
-            .map(|(k, v)| (k, v.path))
+            .values()
+            .map(|v| canon(v.path.clone()))
             .collect();
 
-        let mut out = Vec::new();
-        let Ok(rd) = std::fs::read_dir(&self.shared.plugins_dir) else {
-            return out;
-        };
-        for entry in rd.flatten() {
-            let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("wasm") {
-                continue;
+        let mut roots = Vec::new();
+        // 1. The app's own plugin directory — the canonical place to drop files.
+        roots.push((self.shared.plugins_dir.clone(), "app plugin directory"));
+        // 2. Each configured plugin's directory (you already have plugins there).
+        for e in self.config().plugins.values() {
+            if let Some(dir) = self.resolve(&e.path).parent() {
+                roots.push((dir.to_path_buf(), "configured plugin directory"));
             }
-            let slot = path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("plugin")
-                .to_string();
-            let path_str = path.display().to_string();
-            if configured.get(&slot) == Some(&path_str) {
-                continue; // already configured identically
+        }
+        // 3. Sibling build outputs, so a freshly-built demo is discoverable.
+        //    `<app-data>/../../wasm-plugin-host/target/wasm32-wasip1/release`
+        if let Some(base) = self.shared.plugins_dir.parent() {
+            for rel in [
+                "../../../wasm-plugin-host/target/wasm32-wasip1/release",
+                "../../wasm-plugin-host/target/wasm32-wasip1/release",
+                "../wasm-plugin-host/target/wasm32-wasip1/release",
+            ] {
+                let p = base.join(rel);
+                if p.exists() {
+                    roots.push((p, "wasm-plugin-host build output"));
+                }
             }
-            out.push(Discovered {
-                slot,
-                path: path_str,
+        }
+
+        let mut found = Vec::new();
+        let mut searched: Vec<SearchedRoot> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = Default::default();
+
+        for (dir, label) in roots {
+            // Normalise away `..` segments so the UI shows a real path.
+            let dir = dir.canonicalize().unwrap_or(dir);
+            let exists = dir.is_dir();
+            let mut count = 0usize;
+            if exists {
+                if let Ok(rd) = std::fs::read_dir(&dir) {
+                    for entry in rd.flatten() {
+                        let path = entry.path();
+                        if path.extension().and_then(|e| e.to_str()) != Some("wasm") {
+                            continue;
+                        }
+                        let path_str = path.display().to_string();
+                        if configured.contains(&canon(path_str.clone()))
+                            || !seen.insert(path_str.clone())
+                        {
+                            continue;
+                        }
+                        count += 1;
+                        found.push(Discovered {
+                            slot: path
+                                .file_stem()
+                                .and_then(|s| s.to_str())
+                                .unwrap_or("plugin")
+                                .to_string(),
+                            path: path_str,
+                        });
+                    }
+                }
+            }
+            searched.push(SearchedRoot {
+                path: dir.display().to_string(),
+                label: label.to_string(),
+                exists,
+                wasm_count: count,
             });
         }
-        out.sort_by(|a, b| a.slot.cmp(&b.slot));
-        out
+
+        found.sort_by(|a, b| a.slot.cmp(&b.slot));
+        Discovery { plugins: found, searched }
     }
 
     // -----------------------------------------------------------------------
@@ -838,6 +917,81 @@ impl Studio {
     }
 
     // -----------------------------------------------------------------------
+    // Catalog — every plugin the app knows about
+    // -----------------------------------------------------------------------
+
+    /// Build the full plugin catalog: everything **configured** plus everything
+    /// **discoverable on disk**, with a running status for each.
+    ///
+    /// This is what the Plugins page lists. It deliberately includes plugins
+    /// that are *not* running, so the UI can show "available but not started"
+    /// rather than hiding them — and so a plugin never disappears when it is
+    /// stopped.
+    pub fn catalog(&self) -> Vec<CatalogEntry> {
+        use std::collections::BTreeMap;
+
+        // Running plugins, keyed by slot.
+        let running: BTreeMap<String, (String, String, usize, bool)> = self
+            .shared
+            .host
+            .list_plugins()
+            .into_iter()
+            .map(|(slot, plugin, state, tools, active)| {
+                (slot, (plugin, format!("{state:?}").to_lowercase(), tools, active))
+            })
+            .collect();
+
+        let mut out: Vec<CatalogEntry> = Vec::new();
+
+        // 1. Everything in the config (running or not).
+        let cfg = self.config();
+        for (slot, entry) in &cfg.plugins {
+            let path = self.resolve(&entry.path);
+            let path_s = path.display().to_string();
+            let canon = canon_path(&path_s);
+            let run = running.get(slot);
+            out.push(CatalogEntry {
+                slot: slot.clone(),
+                plugin: run.map(|r| r.0.clone()).unwrap_or_else(|| slot.clone()),
+                path: path_s,
+                running: run.is_some(),
+                active: run.map(|r| r.3).unwrap_or(false),
+                state: run
+                    .map(|r| r.1.clone())
+                    .unwrap_or_else(|| "stopped".to_string()),
+                tool_count: run.map(|r| r.2).unwrap_or(0),
+                in_config: true,
+                enabled: entry.enabled,
+                exists: path.exists(),
+                _canon: canon,
+            });
+        }
+
+        // 2. Anything discoverable on disk that is not already configured.
+        for q in self.discover().plugins {
+            if out.iter().any(|e| canon_path(&e.path) == canon_path(&q.path)) {
+                continue;
+            }
+            out.push(CatalogEntry {
+                slot: q.slot.clone(),
+                plugin: q.slot,
+                path: q.path,
+                running: false,
+                active: false,
+                state: "available".to_string(),
+                tool_count: 0,
+                in_config: false,
+                enabled: false,
+                exists: true,
+                _canon: String::new(),
+            });
+        }
+
+        out.sort_by(|a, b| a.slot.cmp(&b.slot));
+        out
+    }
+
+    // -----------------------------------------------------------------------
     // Status
     // -----------------------------------------------------------------------
 
@@ -868,6 +1022,24 @@ impl Studio {
 pub struct Discovered {
     pub slot: String,
     pub path: String,
+}
+
+/// The result of a discovery scan: what was found, and where we looked.
+#[derive(Debug, Clone, Serialize)]
+pub struct Discovery {
+    pub plugins: Vec<Discovered>,
+    /// Every directory consulted, so the UI can explain an empty result.
+    pub searched: Vec<SearchedRoot>,
+}
+
+/// One directory consulted during discovery.
+#[derive(Debug, Clone, Serialize)]
+pub struct SearchedRoot {
+    pub path: String,
+    pub label: String,
+    pub exists: bool,
+    /// How many *new* `.wasm` files were found here.
+    pub wasm_count: usize,
 }
 
 fn slot_for_path(cfg: &Mutex<Config>, path: &str) -> Option<String> {
@@ -1136,4 +1308,34 @@ fn register_llm_providers(ctx: &cordis::Context, config: &Config) {
             Err(e) => eprintln!("[studio] building llm provider `{name}` failed: {e}"),
         }
     }
+}
+
+
+/// One row of the plugin catalog: known, and whether it is running.
+#[derive(Debug, Clone, Serialize)]
+pub struct CatalogEntry {
+    pub slot: String,
+    pub plugin: String,
+    pub path: String,
+    /// Is a guest instance loaded right now?
+    pub running: bool,
+    /// Is it *active* (injects satisfied)? `false` for a running-but-pending plugin.
+    pub active: bool,
+    /// `active` | `pending` | `stopped` | `available` | ...
+    pub state: String,
+    pub tool_count: usize,
+    /// Is it part of the persisted config?
+    pub in_config: bool,
+    pub enabled: bool,
+    /// Does the `.wasm` file actually exist?
+    pub exists: bool,
+    #[serde(skip)]
+    pub _canon: String,
+}
+
+/// Canonical form of a path, or the path unchanged if it cannot be resolved.
+fn canon_path(p: &str) -> String {
+    std::fs::canonicalize(p)
+        .map(|c| c.display().to_string())
+        .unwrap_or_else(|_| p.to_string())
 }

@@ -63,8 +63,6 @@
     {/each}
 
     <div class="spacer"></div>
-
-    <!-- plugins may add sidebar entries -->
     <Slot slot="sidebar.items" />
 
     {#if getStatus()}

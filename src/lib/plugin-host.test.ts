@@ -201,3 +201,164 @@ test("entry.js can register slots and claims imperatively too", async () => {
   assert.equal(c.length, 1);
   assert.equal(c[0].component, "Inner");
 });
+
+// --- Diagnostics: explaining "I don't see it" ------------------------------
+
+test("diagnostics reports a contribution whose slot is missing", async () => {
+  const plugin: UiPlugin = {
+    slot: "waiter",
+    provides_slots: [],
+    injects_slots: [{ slot: "nobody.opened", priority: 0, component: "X" }],
+    assets: {},
+  };
+  const host = new PluginHost(fakeDom(), sourceOf([plugin]).get);
+  await host.sync();
+  const d = host.diagnostics();
+  assert.equal(d.length, 1);
+  assert.equal(d[0].status, "waiting for slot");
+  assert.equal(d[0].slotOpen, false);
+});
+
+test("diagnostics reports a declared-but-unregistered component", async () => {
+  const plugin: UiPlugin = {
+    slot: "p",
+    provides_slots: ["p.slot"],
+    // declares component "Missing" but entry.js never registers it
+    injects_slots: [{ slot: "p.slot", priority: 0, component: "Missing" }],
+    assets: { "entry.js": `studio.register("Other", () => {});` },
+  };
+  const host = new PluginHost(fakeDom(), sourceOf([plugin]).get);
+  await host.sync();
+  const d = host.diagnostics();
+  assert.equal(d.length, 1);
+  assert.equal(d[0].status, "component not registered");
+  assert.equal(d[0].hasFactory, false);
+});
+
+test("diagnostics reports ready when everything lines up", async () => {
+  const plugin: UiPlugin = {
+    slot: "p",
+    provides_slots: ["p.slot"],
+    injects_slots: [{ slot: "p.slot", priority: 0, component: "OK" }],
+    assets: { "entry.js": `studio.register("OK", () => {});` },
+  };
+  const host = new PluginHost(fakeDom(), sourceOf([plugin]).get);
+  await host.sync();
+  const d = host.diagnostics();
+  assert.equal(d[0].status, "ready");
+  assert.equal(d[0].hasFactory, true);
+});
+
+test("the cross-plugin pair both read as ready", async () => {
+  const host = new PluginHost(fakeDom(), sourceOf([PLUGIN_LLM_UI, PLUGIN_THEME]).get);
+  await host.sync();
+  const statuses = host
+    .diagnostics()
+    .filter((d) => d.slot === "llm-ui.config")
+    .map((d) => `${d.owner}:${d.status}`);
+  assert.deepEqual(statuses, ["theme:ready"]);
+});
+
+// --- A plugin OPENING a slot must render its children ----------------------
+//
+// The gap this closes: a plugin could declare `provides: [some.slot]`, but
+// nothing rendered that slot's children, so contributors were invisible. A
+// plugin now calls `studio.renderSlot(name, el)` inside its own UI, and the
+// host mounts the children there — including contributors that arrive later.
+
+/** An opener whose entry.js hosts a sub-slot, recording the container it used. */
+function openerPlugin(sub: string): { plugin: UiPlugin; lastContainer: () => FakeEl | null } {
+  let container: FakeEl | null = null;
+  const plugin: UiPlugin = {
+    slot: "opener",
+    provides_slots: [sub],
+    injects_slots: [],
+    assets: {
+      "entry.js": `
+        studio.register("Panel", (el) => {
+          const sub = document.createElement("div");
+          el.appendChild(sub);
+          const dispose = studio.renderSlot("${sub}", sub);
+          return () => dispose();
+        });
+        studio.inject("settings.tabs", "Panel", 0);
+      `,
+    },
+  };
+  return { plugin, lastContainer: () => container };
+}
+
+/** A contributor that registers a component and claims a place in `slot`. */
+function contributorPlugin(owner: string, slot: string, component: string): UiPlugin {
+  return {
+    slot: owner,
+    provides_slots: [],
+    injects_slots: [{ slot, priority: 0, component }],
+    assets: {
+      "entry.js": `studio.register("${component}", (el) => { el.textContent = "${owner}"; });`,
+    },
+  };
+}
+
+test("renderSlot mounts a contributor into the opener's own DOM", async () => {
+  // The host must expose `document`-like creation to plugin js, so give the
+  // fake DOM a global-ish createElement the entry.js can call.
+  const dom = fakeDom();
+  const g = globalThis as unknown as { document: unknown };
+  const prev = g.document;
+  g.document = { createElement: (t: string) => new FakeEl(t) };
+
+  try {
+    const { plugin } = openerPlugin("hosted.slot");
+    const src = sourceOf([plugin, contributorPlugin("guest", "hosted.slot", "G")]);
+    const host = new PluginHost(dom, src.get);
+    await host.sync();
+
+    // The opener rendered into settings.tabs; find that wrapper and confirm the
+    // guest was mounted inside it.
+    const tabContribs = host.contributionsFor("settings.tabs");
+    assert.equal(tabContribs.length, 1, "opener claims a place in settings.tabs");
+    const parent = new FakeEl("div");
+    host.mount(tabContribs[0], parent as unknown as HTMLElement);
+    // parent -> wrapper(panel) -> sub -> holder(guest)
+    const panel = parent.children[0];
+    assert.ok(panel, "a wrapper was appended");
+    const nested = panel.children[0];
+    assert.ok(nested, "the opener created a sub-container");
+    assert.ok(
+      nested.children.length >= 1,
+      `the guest was mounted into the opener's container (children=${nested.children.length})`,
+    );
+  } finally {
+    g.document = prev;
+  }
+});
+
+test("a contributor arriving later fills an already-rendered opener container", async () => {
+  const dom = fakeDom();
+  const g = globalThis as unknown as { document: unknown };
+  const prev = g.document;
+  g.document = { createElement: (t: string) => new FakeEl(t) };
+  try {
+    const { plugin } = openerPlugin("hosted.slot");
+    const src = sourceOf([plugin]);
+    const host = new PluginHost(dom, src.get);
+    await host.sync();
+
+    const tabContribs = host.contributionsFor("settings.tabs");
+    const parent = new FakeEl("div");
+    host.mount(tabContribs[0], parent as unknown as HTMLElement);
+    const nested = parent.children[0].children[0];
+    assert.equal(nested.children.length, 0, "nothing contributed yet");
+
+    // The guest loads afterwards; a re-sync must fill the existing container.
+    src.set([plugin, contributorPlugin("guest", "hosted.slot", "G")]);
+    await host.sync();
+    assert.ok(
+      nested.children.length >= 1,
+      "the late contributor appeared without the opener re-rendering",
+    );
+  } finally {
+    g.document = prev;
+  }
+});

@@ -131,7 +131,6 @@
     </div>
   </div>
   <div class="toolbar">
-    <!-- plugins may add actions here -->
     <Slot slot="agent.actions" />
     {#if activeAgent?.busy}
       <span class="badge warn">running</span>

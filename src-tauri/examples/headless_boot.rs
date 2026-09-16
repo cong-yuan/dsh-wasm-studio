@@ -6,6 +6,7 @@
 //! where the "no reactor running" crash lived.
 
 use dsh_wasm_studio_lib::studio::Studio;
+use serde_json;
 
 fn main() -> anyhow::Result<()> {
     // Tauri normally owns a global runtime; mimic that here.
@@ -34,6 +35,30 @@ fn main() -> anyhow::Result<()> {
     })
     .join()
     .expect("thread must not panic")?;
+
+    // Load the two demo UI plugins if they have been built, and print what the
+    // frontend would receive. This is the manual check for the UI chain.
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).parent().unwrap().parent().unwrap();
+    let rel = root.join("wasm-plugin-host/target/wasm32-wasip1/release");
+    let a = rel.join("ui_llm_panel.wasm");
+    let b = rel.join("ui_theme_widget.wasm");
+    if a.exists() && b.exists() {
+        handle.block_on(studio.mount_slot("ui-llm-panel", &a.display().to_string(), serde_json::Value::Null))?;
+        handle.block_on(studio.mount_slot("ui-theme-widget", &b.display().to_string(), serde_json::Value::Null))?;
+        println!("--- ui declarations the frontend receives ---");
+        for (slot, ui) in studio.host().ui_decls() {
+            println!("plugin `{slot}`:");
+            for p in &ui.provides {
+                println!("  opens slot: {}", p.name);
+            }
+            for i in &ui.injects {
+                println!("  mounts into: {} (component={:?}, priority={})", i.slot, i.component, i.priority);
+            }
+            println!("  assets: {:?}", ui.assets.keys().collect::<Vec<_>>());
+        }
+    } else {
+        println!("(demo UI plugins not built; skip)");
+    }
 
     // Send a message (mock echoes) and print the transcript.
     handle.block_on(studio.send_message("demo", "hello".into(), "u1".into()))?;

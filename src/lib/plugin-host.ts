@@ -49,6 +49,30 @@ export interface MountContext {
   component: string;
 }
 
+/** Why a contribution is (or is not) rendering. */
+export interface ContributionDiagnostic {
+  owner: string;
+  slot: string;
+  component: string | null;
+  /** Is the target slot currently open? */
+  slotOpen: boolean;
+  /** Did the owner register the named component? */
+  hasFactory: boolean;
+  /** A human-readable verdict. */
+  status:
+    | "waiting for slot"
+    | "no component named"
+    | "component not registered"
+    | "ready";
+}
+
+/** A container a plugin opened for a slot, plus what is currently in it. */
+interface SlotTarget {
+  slot: string;
+  el: HTMLElement;
+  holders: Map<string, HTMLElement>;
+}
+
 /** A component factory: render into `el`, optionally return a disposer. */
 export type ComponentFactory = (
   el: HTMLElement,
@@ -65,6 +89,14 @@ export interface StudioApi {
   provideSlot(name: string, description?: string): void;
   /** Claim a place inside a slot. Usually declared in the WASM `ui` block. */
   inject(slot: string, component: string, priority?: number): void;
+  /**
+   * Render the children of a slot **into `el`** — the missing half of opening a
+   * slot. A plugin that opens `my.slot` must also call this somewhere in its own
+   * UI, or nothing it hosts will ever appear.
+   *
+   * Returns a disposer; call it when that part of the DOM goes away.
+   */
+  renderSlot(slot: string, el: HTMLElement): () => void;
   /** Unregister everything this plugin registered (called on unload). */
   dispose(): void;
 }
@@ -126,6 +158,12 @@ class PluginHandle {
     for (const [k, v] of Object.entries(map)) this.register(k, v);
   }
 
+  /**
+   * Containers a plugin asked us to render a slot into. Kept so a re-sync (a
+   * new contributor arriving) can refresh them without the plugin re-rendering.
+   */
+  readonly slotTargets: SlotTarget[] = [];
+
   provideSlot(name: string, description?: string): void {
     this.reg.openSlot(this.owner, name, description);
     this.onChanged();
@@ -139,6 +177,7 @@ class PluginHandle {
   dispose(): void {
     this.disposed = true;
     this.factories.clear();
+    this.slotTargets.length = 0;
   }
 }
 
@@ -155,6 +194,8 @@ export class PluginHost {
   /** Claim ids created from each plugin's *declarative* `injects`, so a re-sync
    *  replaces them instead of accumulating duplicates. */
   private declClaims = new Map<string, string[]>();
+  /** Refreshers for plugin-opened slot containers (re-run on every change). */
+  private slotRefreshers = new Set<() => void>();
 
   private readonly source: ContributionsSource;
 
@@ -238,6 +279,10 @@ export class PluginHost {
     for (const owner of [...this.handles.keys()]) {
       if (!seen.has(owner)) this.release(owner);
     }
+
+    // A plugin that *opens* a slot must show its children; refresh every such
+    // container now that slots/claims may have changed.
+    this.refreshPluginSlots();
     this.notify();
   }
 
@@ -253,6 +298,7 @@ export class PluginHost {
       components: (m) => handle.registerMany(m),
       provideSlot: (n, d) => handle.provideSlot(n, d),
       inject: (s, c, pr) => handle.inject(s, c, pr),
+      renderSlot: (name, el) => this.renderSlotInto(handle, name, el),
       dispose: () => handle.dispose(),
     };
     this.currentApi = api;
@@ -301,6 +347,63 @@ export class PluginHost {
     this.notify();
   }
 
+  /**
+   * Render the children of `slot` into `el`, and keep them in sync.
+   *
+   * This is how a plugin that **opens** a slot displays what others contribute.
+   * The returned disposer detaches everything and forgets the container.
+   */
+  renderSlotInto(handle: PluginHandle, slot: string, el: HTMLElement): () => void {
+    const target: SlotTarget = { slot, el, holders: new Map() };
+    handle.slotTargets.push(target);
+    const refresh = () => this.refreshSlotTarget(target);
+    refresh();
+    // Remember how to refresh, so a later change re-renders this container.
+    this.slotRefreshers.add(refresh);
+    return () => {
+      this.slotRefreshers.delete(refresh);
+      const i = handle.slotTargets.indexOf(target);
+      if (i >= 0) handle.slotTargets.splice(i, 1);
+      el.replaceChildren();
+    };
+  }
+
+  /** Re-render every plugin-opened slot container (called after a change). */
+  private refreshPluginSlots(): void {
+    for (const target of this.allSlotTargets()) this.refreshSlotTarget(target);
+  }
+
+  private allSlotTargets(): SlotTarget[] {
+    const out: SlotTarget[] = [];
+    for (const h of this.handles.values()) out.push(...h.slotTargets);
+    return out;
+  }
+
+  private refreshSlotTarget(target: SlotTarget): void {
+    const wanted = this.slots.mountsFor(target.slot);
+    const keyOf = (c: Contribution) => `${c.owner}:${c.slot}:${c.component ?? ""}`;
+    const wantedKeys = new Set(wanted.map(keyOf));
+
+    // Drop contributions that no longer belong (owner unloaded, claim gone).
+    for (const [key, holder] of [...target.holders]) {
+      if (!wantedKeys.has(key)) {
+        this.unmount(key);
+        holder.remove();
+        target.holders.delete(key);
+      }
+    }
+    // Add the new ones.
+    for (const c of wanted) {
+      const key = keyOf(c);
+      if (target.holders.has(key)) continue;
+      const holder = this.dom.createElement("div");
+      holder.dataset.contribution = key;
+      target.el.appendChild(holder);
+      this.mount(c, holder);
+      target.holders.set(key, holder);
+    }
+  }
+
   /** The component factory for a contribution, if the owner registered one. */
   factoryFor(c: Contribution): ComponentFactory | undefined {
     if (!c.component) return undefined;
@@ -310,6 +413,38 @@ export class PluginHost {
   /** The current render list for one slot (reactive read). */
   contributionsFor(slot: string): Contribution[] {
     return this.slots.mountsFor(slot);
+  }
+
+  /**
+   * A diagnostic view of every contribution a plugin declared, and why it may
+   * not be visible. This is what turns "I don't see it" into a specific cause:
+   * the target slot is missing, or the component was never registered.
+   */
+  diagnostics(): ContributionDiagnostic[] {
+    const out: ContributionDiagnostic[] = [];
+    // Reuse the registry's own mount list plus its pending set, so we cover
+    // both mounted and waiting contributions.
+    const all = [...this.slots.mounts().map((m) => m.contribution), ...this.slots.pending()];
+    for (const c of all) {
+      const slotOpen = this.slots.listSlots().some((s) => s.name === c.slot);
+      const factory = this.factoryFor(c);
+      out.push({
+        owner: c.owner,
+        slot: c.slot,
+        component: c.component ?? null,
+        slotOpen,
+        hasFactory: !!factory,
+        status: !slotOpen
+          ? "waiting for slot"
+          : !c.component
+            ? "no component named"
+            : !factory
+              ? "component not registered"
+              : "ready",
+      });
+    }
+    out.sort((a, b) => a.owner.localeCompare(b.owner) || a.slot.localeCompare(b.slot));
+    return out;
   }
 
   // -------------------------------------------------------------------------

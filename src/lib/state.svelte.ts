@@ -9,12 +9,14 @@ import {
   capabilities,
   errorMessage,
   listPlugins,
+  pluginCatalog,
   listServices,
   listTools,
   onChanged,
   onPluginChanged,
   studioStatus,
   type Capabilities,
+  type CatalogEntry,
   type PluginRow,
   type ServiceRow,
   type StudioStatus,
@@ -24,8 +26,10 @@ import {
 
 /** Headline status. `null` until first load. */
 let status = $state<StudioStatus | null>(null);
-/** Plugin table rows. */
+/** Plugin table rows (running plugins only). */
 let plugins = $state<PluginRow[]>([]);
+/** Every known plugin, running or not. */
+let catalog = $state<CatalogEntry[]>([]);
 /** Tool table rows. */
 let tools = $state<ToolRow[]>([]);
 /** Service graph rows. */
@@ -42,6 +46,9 @@ export function getStatus() {
 }
 export function getPlugins() {
   return plugins;
+}
+export function getCatalog() {
+  return catalog;
 }
 export function getTools() {
   return tools;
@@ -64,14 +71,16 @@ export async function refreshAll(): Promise<void> {
   loading = true;
   lastError = null;
   try {
-    const [s, p, t, svc] = await Promise.all([
+    const [s, p, cat, t, svc] = await Promise.all([
       studioStatus(),
       listPlugins(),
+      pluginCatalog(),
       listTools(),
       listServices(),
     ]);
     status = s;
     plugins = p;
+    catalog = cat;
     tools = t;
     services = svc;
   } catch (e) {

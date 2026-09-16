@@ -216,10 +216,16 @@ async fn loading_a_plugin_persists_it_to_the_config_file() {
     assert!(entry.enabled);
     assert_eq!(entry.config, Some(json!({ "k": 1 })));
 
-    // …and unloading removes it.
+    // Stopping keeps the entry but marks it disabled — "stop" is not "forget".
     studio.unmount_slot("alpha").await.unwrap();
     let cfg = wasm_plugin_host::Config::load(studio.config_path()).unwrap();
-    assert!(cfg.plugins.get("alpha").is_none(), "unload must forget it");
+    let entry = cfg.plugins.get("alpha").expect("stop keeps the entry");
+    assert!(!entry.enabled, "a stopped plugin is disabled, not deleted");
+
+    // Removing is the explicit way to forget it.
+    studio.remove_slot("alpha").await.unwrap();
+    let cfg = wasm_plugin_host::Config::load(studio.config_path()).unwrap();
+    assert!(cfg.plugins.get("alpha").is_none(), "remove_slot forgets it");
 }
 
 #[tokio::test]
@@ -401,8 +407,8 @@ async fn discover_finds_wasm_files_in_the_plugins_dir() {
 
     let studio = Studio::with_hook(None, None, dir).await.unwrap();
     let found = studio.discover();
-    assert_eq!(found.len(), 1, "got {found:?}");
-    assert_eq!(found[0].slot, "found");
+    assert_eq!(found.plugins.len(), 1, "got {found:?}");
+    assert_eq!(found.plugins[0].slot, "found");
 }
 
 // ---------------------------------------------------------------------------
@@ -794,7 +800,7 @@ async fn unloading_a_ui_plugin_removes_its_contribution() {
 // ---------------------------------------------------------------------------
 
 /// Locate a built demo plugin under the sibling repo's target dir.
-fn demo_plugin(name: &str, file: &str) -> PathBuf {
+fn demo_plugin(file: &str) -> PathBuf {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()
@@ -808,8 +814,8 @@ fn demo_plugin(name: &str, file: &str) -> PathBuf {
 async fn demo_plugins_expose_a_cross_plugin_ui_graph() {
     // A (ui-llm-panel) opens `ui-llm-panel.config` and contributes to
     // `settings.tabs`. B (ui-theme-widget) injects into A's slot.
-    let a = demo_plugin("ui-llm-panel", "ui_llm_panel.wasm");
-    let b = demo_plugin("ui-theme-widget", "ui_theme_widget.wasm");
+    let a = demo_plugin("ui_llm_panel.wasm");
+    let b = demo_plugin("ui_theme_widget.wasm");
     if !a.exists() || !b.exists() {
         eprintln!("skipping: build the demo plugins first");
         return;
@@ -851,8 +857,8 @@ async fn demo_plugins_expose_a_cross_plugin_ui_graph() {
 
 #[tokio::test]
 async fn the_cross_plugin_graph_holds_regardless_of_load_order() {
-    let a = demo_plugin("ui-llm-panel", "ui_llm_panel.wasm");
-    let b = demo_plugin("ui-theme-widget", "ui_theme_widget.wasm");
+    let a = demo_plugin("ui_llm_panel.wasm");
+    let b = demo_plugin("ui_theme_widget.wasm");
     if !a.exists() || !b.exists() {
         return;
     }
@@ -875,4 +881,196 @@ async fn the_cross_plugin_graph_holds_regardless_of_load_order() {
     // The data is the same; the frontend registry resolves it order-independently
     // (covered by src/lib/plugin-host.test.ts).
     assert_eq!(b_decl.injects[0].slot, a_decl.provides[0].name);
+}
+
+#[tokio::test]
+async fn list_plugins_surfaces_ui_metadata_for_the_management_page() {
+    // The Plugins page must be able to show what UI a plugin brings — not just
+    // its tools. This pins the fields it reads.
+    let dir = tmpdir("ui-in-list");
+    let decl = r#"{"name":"llm-ui","abi":1,"tools":[],"ui":{
+        "provides":[{"name":"llm-ui.config"}],
+        "injects":[{"slot":"settings.tabs","priority":3,"component":"Panel"}],
+        "assets":{"entry.js":"studio.register('Panel', () => {});"}}}"#;
+    let wasm = dir.join("llm-ui.wasm");
+    std::fs::write(&wasm, wasm_ui_plugin("llm-ui", decl)).unwrap();
+
+    let studio = Studio::with_hook(None, None, dir.clone()).await.unwrap();
+    studio
+        .mount_slot("llm-ui", &wasm.display().to_string(), json!(null))
+        .await
+        .unwrap();
+
+    // UI metadata is reachable from the host (used by the command layer).
+    let ui = studio.host().ui_decl("llm-ui").expect("ui decl");
+    assert_eq!(ui.provides[0].name, "llm-ui.config");
+    assert_eq!(ui.injects[0].slot, "settings.tabs");
+    assert_eq!(ui.injects[0].component.as_deref(), Some("Panel"));
+    assert!(ui.assets.contains_key("entry.js"));
+
+    // And a plugin with no ui block reports none.
+    let plain = dir.join("plain.wasm");
+    std::fs::write(&plain, wasm_tool("plain")).unwrap();
+    studio
+        .mount_slot("plain", &plain.display().to_string(), json!(null))
+        .await
+        .unwrap();
+    assert!(
+        studio.host().ui_decl("plain").is_none(),
+        "a backend-only plugin has no UI declaration"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Discovery: finding plugins without the user knowing where to look
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn discover_finds_wasm_in_the_app_plugin_directory() {
+    let dir = tmpdir("disc-app");
+    let plugins = dir.join("plugins");
+    std::fs::create_dir_all(&plugins).unwrap();
+    std::fs::write(plugins.join("alpha.wasm"), wasm_tool("alpha")).unwrap();
+    std::fs::write(plugins.join("notes.txt"), b"ignore me").unwrap();
+
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    let d = studio.discover();
+
+    assert_eq!(d.plugins.len(), 1, "only .wasm files count");
+    assert_eq!(d.plugins[0].slot, "alpha");
+    // The app plugin dir must be among the searched roots, so the UI can point
+    // the user at it when nothing is found.
+    assert!(
+        d.searched
+            .iter()
+            .any(|r| r.label == "app plugin directory" && r.exists),
+        "searched roots: {:?}",
+        d.searched
+    );
+}
+
+#[tokio::test]
+async fn discover_reports_every_location_even_when_empty() {
+    // The empty case is the one that used to be a dead end. It must now explain
+    // itself: which directories were consulted and whether they exist.
+    let dir = tmpdir("disc-empty");
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    let d = studio.discover();
+
+    assert!(d.plugins.is_empty());
+    assert!(!d.searched.is_empty(), "must report where it looked");
+    let app_root = d
+        .searched
+        .iter()
+        .find(|r| r.label == "app plugin directory")
+        .expect("the app plugin directory is always reported");
+    assert!(app_root.exists, "the app creates it on boot");
+    assert_eq!(app_root.wasm_count, 0);
+}
+
+#[tokio::test]
+async fn discover_skips_already_configured_plugins() {
+    let dir = tmpdir("disc-configured");
+    let plugins = dir.join("plugins");
+    std::fs::create_dir_all(&plugins).unwrap();
+    let wasm = plugins.join("alpha.wasm");
+    std::fs::write(&wasm, wasm_tool("alpha")).unwrap();
+
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    studio
+        .mount_slot("alpha", &wasm.display().to_string(), json!(null))
+        .await
+        .unwrap();
+
+    let d = studio.discover();
+    assert!(
+        d.plugins.is_empty(),
+        "a configured plugin should not be offered again: {:?}",
+        d.plugins
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Catalog: the Plugins list must show every known plugin, running or not
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn catalog_lists_a_configured_but_stopped_plugin() {
+    // The bug this guards: stopping a plugin used to make it vanish from the
+    // list, and discovery would not offer it again either.
+    let dir = tmpdir("cat-stopped");
+    let wasm = dir.join("alpha.wasm");
+    std::fs::write(&wasm, wasm_tool("alpha")).unwrap();
+    let path = wasm.display().to_string();
+
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    studio.mount_slot("alpha", &path, json!(null)).await.unwrap();
+    assert_eq!(studio.catalog().len(), 1);
+
+    // Stop it — it stays in the config, so it must stay in the catalog.
+    studio.unmount_slot("alpha").await.unwrap();
+    let cat = studio.catalog();
+    assert_eq!(cat.len(), 1, "a stopped plugin must remain listed: {cat:?}");
+    let e = &cat[0];
+    assert_eq!(e.slot, "alpha");
+    assert!(!e.running, "it is stopped");
+    assert!(e.in_config, "still configured");
+    assert!(e.exists, "its file is still there");
+    assert_eq!(e.state, "stopped");
+}
+
+#[tokio::test]
+async fn catalog_includes_a_discovered_plugin_never_started() {
+    let dir = tmpdir("cat-available");
+    let plugins = dir.join("plugins");
+    std::fs::create_dir_all(&plugins).unwrap();
+    std::fs::write(plugins.join("beta.wasm"), wasm_tool("beta")).unwrap();
+
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    let cat = studio.catalog();
+    let e = cat.iter().find(|e| e.slot == "beta").expect("discovered plugin listed");
+    assert!(!e.running, "not started");
+    assert!(!e.in_config, "not configured yet");
+    assert_eq!(e.state, "available");
+    assert!(e.exists);
+}
+
+#[tokio::test]
+async fn a_running_plugin_reports_as_running_in_the_catalog() {
+    let dir = tmpdir("cat-running");
+    let wasm = dir.join("alpha.wasm");
+    std::fs::write(&wasm, wasm_tool("alpha")).unwrap();
+
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    studio
+        .mount_slot("alpha", &wasm.display().to_string(), json!(null))
+        .await
+        .unwrap();
+
+    let cat = studio.catalog();
+    assert_eq!(cat.len(), 1);
+    assert!(cat[0].running);
+    assert!(cat[0].active);
+    assert_eq!(cat[0].tool_count, 1);
+}
+
+#[tokio::test]
+async fn catalog_does_not_duplicate_a_running_plugin_that_is_also_discoverable() {
+    // A started plugin is both "configured" and "on disk" — it must appear once.
+    let dir = tmpdir("cat-dedup");
+    let plugins = dir.join("plugins");
+    std::fs::create_dir_all(&plugins).unwrap();
+    let wasm = plugins.join("alpha.wasm");
+    std::fs::write(&wasm, wasm_tool("alpha")).unwrap();
+
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    studio
+        .mount_slot("alpha", &wasm.display().to_string(), json!(null))
+        .await
+        .unwrap();
+
+    let cat = studio.catalog();
+    let alpha_rows = cat.iter().filter(|e| e.slot == "alpha").count();
+    assert_eq!(alpha_rows, 1, "no duplicate rows: {cat:?}");
+    assert!(cat[0].running);
 }
