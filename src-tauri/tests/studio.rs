@@ -643,3 +643,54 @@ async fn two_agents_have_independent_transcripts() {
     assert!(tb.iter().any(|m| m.text == "for-b"));
     assert_eq!(studio.list_agents().len(), 2);
 }
+
+#[test]
+fn agent_commands_work_without_a_tokio_runtime_context() {
+    // Regression for a real crash: a *synchronous* Tauri command runs with NO
+    // tokio runtime context, while dsh spawns the agent driver (and emits
+    // disposal events) with a bare `tokio::spawn` — which panics with "there is
+    // no reactor running".
+    //
+    // Every other test in this file is `#[tokio::test]`, so it always has a
+    // reactor and could never catch this. A plain `std::thread` reproduces the
+    // sync-command situation exactly.
+    let dir = tmpdir("plain-thread");
+    let studio = tauri::async_runtime::block_on(async {
+        Studio::with_hook(None, None, dir).await.unwrap()
+    });
+
+    let result = std::thread::spawn(move || {
+        // Exercise EVERY studio method a synchronous command can reach, so a
+        // future spawn-capable path cannot slip through this test.
+        let id = studio.create_agent(
+            Some("a1".into()),
+            "mock".into(),
+            "mock-1".into(),
+            Some("/tmp".into()),
+        )?;
+
+        // Read-only paths (several sync commands).
+        let _ = studio.status();
+        studio.list_agents();
+        let _ = studio.transcript("a1")?;
+        let _ = studio.host().services();
+        let _ = studio.host().list_plugins();
+        studio.discover();
+        studio.watching();
+        studio.config();
+
+        // Mutating paths with no spawn (signal-only).
+        studio.steer("a1", "hurry".into(), "s1".into())?;
+        studio.cancel_agent("a1")?;
+
+        // The one that emits an event (and therefore spawns).
+        studio.dispose_agent("a1")?;
+
+        Ok::<String, anyhow::Error>(id)
+    })
+    .join();
+
+    let id = result.expect("the thread must not panic");
+    assert!(id.is_ok(), "agent commands should work off-runtime: {id:?}");
+    assert_eq!(id.unwrap(), "a1");
+}

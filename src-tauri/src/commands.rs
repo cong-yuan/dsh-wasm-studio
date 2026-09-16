@@ -155,9 +155,11 @@ pub fn start_watch(studio: State<'_, Studio>) {
     studio.start_watch();
 }
 
+/// Async so joining the watcher thread never blocks the UI thread.
 #[tauri::command]
-pub fn stop_watch(studio: State<'_, Studio>) {
+pub async fn stop_watch(studio: State<'_, Studio>) -> Result<(), String> {
     studio.stop_watch();
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -276,8 +278,13 @@ pub fn set_log_level(studio: State<'_, Studio>, level: String) -> Result<String,
 // ---------------------------------------------------------------------------
 
 /// Create an agent on a provider route; returns its id.
+///
+/// **Async on purpose.** dsh spawns the agent's driver task with a bare
+/// `tokio::spawn`, so this must run inside a tokio runtime context. A
+/// synchronous `#[tauri::command]` would not, and would panic with "there is no
+/// reactor running".
 #[tauri::command]
-pub fn create_agent(
+pub async fn create_agent(
     studio: State<'_, Studio>,
     id: Option<String>,
     provider: String,
@@ -324,8 +331,11 @@ pub fn cancel_agent(studio: State<'_, Studio>, agent_id: String) -> Result<(), S
 }
 
 /// Dispose an agent.
+///
+/// Async for the same reason as [`create_agent`]: disposal emits a session
+/// event, and cordis's fire-and-forget dispatch uses `tokio::spawn`.
 #[tauri::command]
-pub fn dispose_agent(studio: State<'_, Studio>, agent_id: String) -> Result<(), String> {
+pub async fn dispose_agent(studio: State<'_, Studio>, agent_id: String) -> Result<(), String> {
     studio.dispose_agent(&agent_id).map_err(err)
 }
 

@@ -24,6 +24,24 @@
 //! **never hold a lock across an `.await`**. `mounted` and `config` guards are
 //! always dropped before awaiting a fiber.
 //!
+//! ## Runtime context (important)
+//!
+//! dsh and cordis both use a **bare `tokio::spawn`** on a few paths — the agent
+//! driver (`loop_driver::spawn_driver`), fire-and-forget event dispatch
+//! (`cordis::events::emit`), and fiber convergence
+//! (`cordis::fiber::request_epoch`). A bare spawn **panics with "there is no
+//! reactor running"** outside a tokio runtime context.
+//!
+//! A *synchronous* Tauri command runs with no such context. So:
+//!
+//! * commands that can reach a spawn are `async fn` (Tauri then drives them on
+//!   its runtime), and
+//! * the studio methods themselves also guard with [`in_runtime`], so the
+//!   library is correct even when called off-runtime.
+//!
+//! This mattered in practice: creating an agent from the GUI crashed the app
+//! until both halves were fixed.
+//!
 //! ## Persistence
 //!
 //! Desired state lives in `<app-data>/studio.json`, in the *host's own*
@@ -731,14 +749,18 @@ impl Studio {
         model: String,
         cwd: Option<String>,
     ) -> Result<String> {
-        let reg = self.agents()?;
-        let options = dsh_rs::types::AgentOptions {
-            provider,
-            model,
-            max_tokens: None,
-        };
-        let agent = reg.create(id, options, cwd, None).map_err(anyhow::Error::msg)?;
-        Ok(agent.id().to_string())
+        // `reg.create` spawns the agent's driver task with a bare `tokio::spawn`,
+        // so a runtime context is mandatory here.
+        in_runtime(|| {
+            let reg = self.agents()?;
+            let options = dsh_rs::types::AgentOptions {
+                provider,
+                model,
+                max_tokens: None,
+            };
+            let agent = reg.create(id, options, cwd, None).map_err(anyhow::Error::msg)?;
+            Ok(agent.id().to_string())
+        })
     }
 
     fn agent(&self, id: &str) -> Result<Arc<dyn dsh_rs::api::services::AgentView>> {
@@ -779,11 +801,15 @@ impl Studio {
 
     /// Dispose an agent (its session stays readable until disposed separately).
     pub fn dispose_agent(&self, agent_id: &str) -> Result<()> {
-        let reg = self.agents()?;
-        if let Some(agent) = reg.get(agent_id) {
-            reg.dispose(&agent);
-        }
-        Ok(())
+        // Disposal emits an `agent/disposed` event, and cordis's fire-and-forget
+        // dispatch uses a bare `tokio::spawn`.
+        in_runtime(|| {
+            let reg = self.agents()?;
+            if let Some(agent) = reg.get(agent_id) {
+                reg.dispose(&agent);
+            }
+            Ok(())
+        })
     }
 
     /// The full message history of an agent's session, mapped for the UI.
@@ -855,6 +881,25 @@ fn watcher_mtimes(paths: &[PathBuf]) -> std::collections::HashMap<String, u128> 
         }
     }
     out
+}
+
+/// Run `f` with a tokio runtime context available.
+///
+/// dsh's agent driver (`loop_driver::spawn_driver`) and cordis's
+/// fire-and-forget event dispatch both call a **bare `tokio::spawn`**, which
+/// panics with "there is no reactor running" outside a runtime. A
+/// *synchronous* Tauri command runs without one — so any studio method that can
+/// reach those paths must guarantee a context.
+///
+/// The `try_current` check matters: `block_on` panics if called from inside a
+/// runtime, so we only ever take that branch when there is none. The tasks
+/// spawned under Tauri's global runtime outlive this call.
+fn in_runtime<R>(f: impl FnOnce() -> R) -> R {
+    if tokio::runtime::Handle::try_current().is_ok() {
+        f()
+    } else {
+        tauri::async_runtime::block_on(async { f() })
+    }
 }
 
 /// Install the dsh base bundle on `ctx`.
