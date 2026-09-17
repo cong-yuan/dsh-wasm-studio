@@ -32,6 +32,46 @@ export const BUILTIN_SLOTS = [
   "plugin.detail",
 ] as const;
 
+/** The app's own slot names. Compile-time known, so typos are caught. */
+export type BuiltinSlot = (typeof BUILTIN_SLOTS)[number];
+
+declare const PLUGIN_SLOT: unique symbol;
+
+/**
+ * A slot name opened by a plugin, at runtime.
+ *
+ * Branded, so a plain string is **not** silently assignable: a typo like
+ * `slot="settings.tab"` fails to compile instead of quietly rendering nothing.
+ * Construct one with {@link pluginSlot}:
+ *
+ * ```ts
+ * <Slot slot={pluginSlot(someNameFromBackend)} />
+ * ```
+ */
+export type PluginSlotName = string & { readonly [PLUGIN_SLOT]: true };
+
+/**
+ * A slot name in a UI position: a built-in, or a plugin-opened slot.
+ *
+ * The built-ins are typed, so `<Slot slot="settings.tab" />` is a compile
+ * error (verified: the branded form makes `svelte-check` reject the typo). A
+ * plugin-opened slot cannot be known at compile time — its name arrives from
+ * WASM as data — so it must be passed through {@link pluginSlot}, which is the
+ * explicit "I know this is a runtime name" marker.
+ *
+ * dsh-web solves the same problem with a module-augmented `SlotMap`, which
+ * works because their plugins are TypeScript compiled into the same program and
+ * the slot names are therefore compile-time constants. WASM plugin names are
+ * data, not code, so that trick does not transfer; typing the built-ins and
+ * branding the rest is the honest subset.
+ */
+export type SlotName = BuiltinSlot | PluginSlotName;
+
+/** Mark a string as a plugin-opened slot name (see {@link PluginSlotName}). */
+export function pluginSlot(name: string): PluginSlotName {
+  return name as PluginSlotName;
+}
+
 /** A slot opened by the app or a plugin. */
 export interface Slot {
   /** Globally unique name. */

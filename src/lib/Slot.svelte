@@ -14,12 +14,15 @@
   // C2: components are arbitrary JS that receive a DOM element. This component
   // never inspects what they render.
   import { onDestroy } from "svelte";
-  import type { Contribution } from "$lib/slots";
+  import type { Contribution, SlotName } from "$lib/slots";
   import { pluginHost } from "$lib/plugin-runtime";
 
   interface Props {
-    /** The slot to render. */
-    slot: string;
+    /**
+     * The slot to render. Built-in names are typed, so a typo in one is a
+     * compile error; plugin-created slot names are arbitrary strings.
+     */
+    slot: SlotName;
     /** Rendered when the slot has no contributors at all. */
     empty?: boolean;
   }
