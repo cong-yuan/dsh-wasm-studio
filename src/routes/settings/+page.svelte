@@ -31,6 +31,12 @@
     void revision;
     return pluginHost.slots.resolve().filter((r) => r.hidden);
   });
+  // Adjustments that fight over the same contribution. Resolution is by load
+  // order; this only reports, so a vanished panel has an explanation.
+  let conflicts = $derived.by(() => {
+    void revision;
+    return pluginHost.slots.adjustmentConflicts();
+  });
 </script>
 
 <div class="page-head">
@@ -100,6 +106,31 @@
           <span class="badge warn">{p.owner} → {p.slot}</span>
         {/each}
       </div>
+    </div>
+  {/if}
+
+  {#if conflicts.length}
+    <div class="empty" style="text-align: left; margin-top: 12px; border-color: #f0a02055;">
+      <strong>Contested adjustments</strong>
+      <span class="faint">
+        — two plugins adjusting the same contribution. The later-loaded one
+        wins; the other's intent has no effect.
+      </span>
+      <table class="table" style="margin-top: 8px;">
+        <thead>
+          <tr><th>Target</th><th>Action</th><th>Won</th><th>Had no effect</th></tr>
+        </thead>
+        <tbody>
+          {#each conflicts as c}
+            <tr>
+              <td class="mono faint">{c.target}</td>
+              <td><span class="badge warn">{c.action}</span></td>
+              <td class="mono ok">{c.winner}</td>
+              <td class="mono faint">{c.losers.join(", ")}</td>
+            </tr>
+          {/each}
+        </tbody>
+      </table>
     </div>
   {/if}
 

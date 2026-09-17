@@ -456,3 +456,94 @@ test("globMatch handles literals, prefixes and full wildcards", () => {
   assert.equal(globMatch("*.tabs", "settings.tabs"), true);
   assert.equal(globMatch("a.c", "a.b"), false, "dots are literal, not regex");
 });
+
+// --- Conflict reporting ----------------------------------------------------
+//
+// Resolution is by load order (deliberate: a later plugin may override an
+// earlier one). But two plugins disagreeing about the same contribution used to
+// be fully silent — a panel vanishes and nothing says why. These pin the
+// reporting, NOT the resolution order.
+
+test("reports two plugins hiding the same contribution", () => {
+  const reg = new SlotRegistry();
+  reg.openSlot("app", "settings.tabs");
+  reg.claim("llm-ui", "settings.tabs", 0, "Panel");
+  reg.setAdjustments("hider-a", [
+    { owner: "hider-a", slot: "settings.tabs", from: "llm-ui", action: "hide" },
+  ]);
+  reg.setAdjustments("hider-b", [
+    { owner: "hider-b", slot: "*", action: "hide" },
+  ]);
+
+  const conflicts = reg.adjustmentConflicts();
+  assert.equal(conflicts.length, 1);
+  assert.equal(conflicts[0].action, "hide");
+  assert.equal(conflicts[0].winner, "hider-b", "last in load order wins");
+  assert.deepEqual(conflicts[0].losers, ["hider-a"]);
+  // And the resolution itself is unchanged.
+  assert.equal(reg.mounts().length, 0);
+});
+
+test("reports two plugins replacing the same contribution", () => {
+  const reg = new SlotRegistry();
+  reg.openSlot("app", "settings.tabs");
+  reg.claim("llm-ui", "settings.tabs", 0, "Panel");
+  reg.setAdjustments("a", [
+    { owner: "a", slot: "*", action: "replace", component: "FromA" },
+  ]);
+  reg.setAdjustments("b", [
+    { owner: "b", slot: "*", action: "replace", component: "FromB" },
+  ]);
+
+  const conflicts = reg.adjustmentConflicts();
+  assert.equal(conflicts.length, 1);
+  assert.equal(conflicts[0].action, "replace");
+  assert.equal(conflicts[0].winner, "b");
+  assert.equal(reg.mountsFor("settings.tabs")[0].component, "FromB", "b won");
+});
+
+test("hide-then-unhide is an override, not a conflict", () => {
+  const reg = new SlotRegistry();
+  reg.openSlot("app", "settings.tabs");
+  reg.claim("llm-ui", "settings.tabs", 0, "Panel");
+  reg.setAdjustments("hider", [{ owner: "hider", slot: "*", action: "hide" }]);
+  reg.setAdjustments("restorer", [
+    { owner: "restorer", slot: "settings.tabs", from: "llm-ui", action: "unhide" },
+  ]);
+  // Different actions on the same target: that is the intended override path.
+  assert.deepEqual(reg.adjustmentConflicts(), []);
+  assert.equal(reg.mounts().length, 1, "the unhide took effect");
+});
+
+test("adjustments to different contributions are not conflicts", () => {
+  const reg = new SlotRegistry();
+  reg.openSlot("app", "settings.tabs");
+  reg.claim("a", "settings.tabs", 0, "A");
+  reg.claim("b", "settings.tabs", 0, "B");
+  reg.setAdjustments("x", [{ owner: "x", slot: "settings.tabs", from: "a", action: "hide" }]);
+  reg.setAdjustments("y", [{ owner: "y", slot: "settings.tabs", from: "b", action: "hide" }]);
+  assert.deepEqual(reg.adjustmentConflicts(), [], "they target different claims");
+});
+
+test("one plugin hiding the same thing twice is not a conflict", () => {
+  const reg = new SlotRegistry();
+  reg.openSlot("app", "settings.tabs");
+  reg.claim("llm-ui", "settings.tabs", 0, "Panel");
+  reg.setAdjustments("solo", [
+    { owner: "solo", slot: "settings.tabs", action: "hide" },
+    { owner: "solo", slot: "*", action: "hide" },
+  ]);
+  assert.deepEqual(reg.adjustmentConflicts(), [], "a plugin cannot conflict with itself");
+});
+
+test("a conflict disappears when the losing plugin is released", () => {
+  const reg = new SlotRegistry();
+  reg.openSlot("app", "settings.tabs");
+  reg.claim("llm-ui", "settings.tabs", 0, "Panel");
+  reg.setAdjustments("a", [{ owner: "a", slot: "*", action: "hide" }]);
+  reg.setAdjustments("b", [{ owner: "b", slot: "*", action: "hide" }]);
+  assert.equal(reg.adjustmentConflicts().length, 1);
+
+  reg.release("b");
+  assert.deepEqual(reg.adjustmentConflicts(), [], "no longer contested");
+});

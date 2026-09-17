@@ -147,6 +147,17 @@ export interface Resolved {
   replacedBy?: { owner: string; component: string };
 }
 
+/** Two or more plugins adjusting the same contribution the same way. */
+export interface AdjustmentConflict {
+  /** `owner:slot:component` of the contested contribution. */
+  target: string;
+  action: AdjustAction;
+  /** The owner whose adjustment won (last in load order). */
+  winner: string;
+  /** Owners whose adjustment had no effect. */
+  losers: string[];
+}
+
 /** Glob matching: an exact string, or a `*` anywhere matching any run. */
 export function globMatch(pattern: string | undefined, value: string): boolean {
   if (pattern === undefined) return true;
@@ -328,6 +339,68 @@ export class SlotRegistry {
   /** Every adjustment currently in effect (for the slot inspector). */
   listAdjustments(): Adjustment[] {
     return this.adjustOrder.flatMap((o) => this.adjustments.get(o) ?? []);
+  }
+
+  /**
+   * Adjustments that fight over the same contribution.
+   *
+   * Resolution is by load order (last wins), which is *deliberate* — a later
+   * plugin should be able to override an earlier one. But when two plugins
+   * disagree about the same target, "which one won" is not something the user
+   * can see, and the losing plugin's intent silently disappears. Slot-name
+   * conflicts are an error here, so silence on this one is inconsistent.
+   *
+   * This does **not** change resolution — it reports, so the UI can explain a
+   * vanished panel instead of leaving it a mystery.
+   *
+   * The model is dsh-web's semantic-attribute contract, which requires conflict
+   * arbitration to NOT depend on load order. We do not have per-region owners
+   * yet, so this surfaces the dependence rather than pretending it away.
+   */
+  adjustmentConflicts(): AdjustmentConflict[] {
+    const byTarget = new Map<string, { owner: string; adj: Adjustment }[]>();
+    for (const owner of this.adjustOrder) {
+      for (const adj of this.adjustments.get(owner) ?? []) {
+        // Key on what the adjustment acts upon, per contribution it matches.
+        for (const c of this.contributions.values()) {
+          if (!this.slots.has(c.slot)) continue;
+          if (!globMatch(adj.slot, c.slot)) continue;
+          if (!globMatch(adj.from, c.owner)) continue;
+          const key = `${c.owner}:${c.slot}:${c.component ?? ""}`;
+          const list = byTarget.get(key) ?? [];
+          list.push({ owner, adj });
+          byTarget.set(key, list);
+        }
+      }
+    }
+
+    const out: AdjustmentConflict[] = [];
+    for (const [key, entries] of byTarget) {
+      // Group by the action taken, so `hide` by two plugins is a conflict but
+      // `hide` by one and `priority` by another is not.
+      const byAction = new Map<AdjustAction, { owner: string; adj: Adjustment }[]>();
+      for (const e of entries) {
+        const list = byAction.get(e.adj.action) ?? [];
+        list.push(e);
+        byAction.set(e.adj.action, list);
+      }
+      for (const [action, group] of byAction) {
+        // One plugin adjusting the same thing twice is a quirk of its own
+        // declaration, not a conflict between plugins.
+        const owners = [...new Set(group.map((g) => g.owner))];
+        if (owners.length < 2) continue;
+        const winner = group[group.length - 1].owner;
+        out.push({
+          target: key,
+          action,
+          // The winner is the last in load order, which is what resolution did.
+          winner,
+          losers: owners.filter((o) => o !== winner),
+        });
+      }
+    }
+    out.sort((a, b) => a.target.localeCompare(b.target) || a.action.localeCompare(b.action));
+    return out;
   }
 
   /**
