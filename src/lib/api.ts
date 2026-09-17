@@ -173,6 +173,34 @@ export const startWatch = () => invoke<void>("start_watch");
 export const stopWatch = () => invoke<void>("stop_watch");
 
 // ---------------------------------------------------------------------------
+// Plugin windows
+// ---------------------------------------------------------------------------
+
+/** A window a plugin declares (mirrors `studio::PluginWindow`). */
+export interface PluginWindow {
+  label: string;
+  slot: string;
+  name: string;
+  component: string;
+  title: string;
+  width: number;
+  height: number;
+  /** `auto` (host opens on activate) or `manual`. */
+  open: string;
+}
+
+/** Every window the running plugins declare. */
+export const pluginWindows = () => invoke<PluginWindow[]>("plugin_windows");
+
+/** What a given window label should render (null for the main window). */
+export const pluginWindowFor = (label: string) =>
+  invoke<PluginWindow | null>("plugin_window_for", { label });
+
+/** Open (or focus) a plugin window by label. */
+export const openPluginWindow = (label: string) =>
+  invoke<void>("open_plugin_window", { label });
+
+// ---------------------------------------------------------------------------
 // Frontend UI contributions
 // ---------------------------------------------------------------------------
 

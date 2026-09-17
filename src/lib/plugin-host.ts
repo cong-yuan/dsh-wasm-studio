@@ -410,6 +410,41 @@ export class PluginHost {
     return this.handles.get(c.owner)?.factories.get(c.component);
   }
 
+  /** Look up a component a plugin registered, by owner + name. */
+  factoryForComponent(owner: string, name: string): ComponentFactory | undefined {
+    return this.handles.get(owner)?.factories.get(name);
+  }
+
+  /**
+   * Mount a plugin component **outside** the slot system — used by plugin
+   * windows, where a component is rendered full-window rather than into a slot.
+   * `key` identifies the instance so it can be unmounted later.
+   */
+  mountComponent(
+    owner: string,
+    name: string,
+    key: string,
+    el: HTMLElement,
+  ): () => void {
+    const factory = this.factoryForComponent(owner, name);
+    if (!factory) return () => {};
+    const existing = this.live.get(key);
+    if (existing) return () => this.unmount(key);
+
+    const wrapper = this.dom.createElement("div");
+    wrapper.dataset.plugin = owner;
+    wrapper.dataset.component = name;
+    el.appendChild(wrapper);
+    const teardown = factory(wrapper, { slot: `window:${name}`, owner, component: name }) ?? undefined;
+    this.live.set(key, {
+      contribution: { owner, slot: `window:${name}`, priority: 0, component: name },
+      factory,
+      el: wrapper,
+      teardown,
+    });
+    return () => this.unmount(key);
+  }
+
   /** The current render list for one slot (reactive read). */
   contributionsFor(slot: string): Contribution[] {
     return this.slots.mountsFor(slot);

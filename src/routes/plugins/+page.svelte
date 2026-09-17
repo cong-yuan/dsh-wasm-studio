@@ -7,11 +7,14 @@
     reloadPlugin,
     validatePlugin,
     discoverPlugins,
+    pluginWindows,
+    openPluginWindow,
     watchStatus,
     startWatch,
     stopWatch,
     errorMessage,
     type Discovered,
+    type PluginWindow,
     type SearchedRoot,
   } from "$lib/api";
   import { open as openFileDialog } from "@tauri-apps/plugin-dialog";
@@ -34,6 +37,18 @@
   let validating = $state(false);
   let validation = $state<string | null>(null);
 
+  // Windows the running plugins declare.
+  let windows = $state<PluginWindow[]>([]);
+
+  async function loadWindows() {
+    try {
+      windows = await pluginWindows();
+    } catch (e) {
+      windows = [];
+      void e;
+    }
+  }
+
   // Live view of which UI contributions actually render, and why not.
   let hostRevision = $state(0);
   pluginHost.subscribe(() => (hostRevision += 1));
@@ -44,8 +59,15 @@
 
   onMount(async () => {
     await refreshAll();
+    await loadWindows();
     watching = await watchStatus().catch(() => false);
   });
+
+  /** Refresh both the plugins and the window list. */
+  async function refreshBoth() {
+    await refreshAll();
+    await loadWindows();
+  }
 
   function flash(kind: "ok" | "err", text: string) {
     notice = { kind, text };
@@ -130,7 +152,7 @@
       showLoad = false;
       formSlot = formPath = "";
       validation = null;
-      await refreshAll();
+      await refreshBoth();
     } catch (e) {
       flash("err", errorMessage(e));
     } finally {
@@ -143,7 +165,7 @@
     try {
       await unloadPlugin(slot);
       flash("ok", `Stopped “${slot}” (still listed — restart any time)`);
-      await refreshAll();
+      await refreshBoth();
     } catch (e) {
       flash("err", errorMessage(e));
     } finally {
@@ -157,7 +179,7 @@
     try {
       await removePlugin(slot);
       flash("ok", `Removed “${slot}” from the list`);
-      await refreshAll();
+      await refreshBoth();
     } catch (e) {
       flash("err", errorMessage(e));
     } finally {
@@ -170,7 +192,7 @@
     try {
       const tools = await reloadPlugin(slot);
       flash("ok", `Reloaded “${slot}” — tools: ${tools.join(", ") || "none"}`);
-      await refreshAll();
+      await refreshBoth();
     } catch (e) {
       flash("err", `Reload rejected — ${errorMessage(e)}`);
     } finally {
@@ -196,7 +218,7 @@
       {watching ? "◉ auto-reload on" : "○ auto-reload off"}
     </button>
     <button onclick={doDiscover}>Discover…</button>
-    <button onclick={() => refreshAll()} disabled={isLoading()}>Refresh</button>
+    <button onclick={() => refreshBoth()} disabled={isLoading()}>Refresh</button>
   </div>
 </div>
 
@@ -286,6 +308,60 @@
                   </button>
                 {/if}
               </div>
+            </td>
+          </tr>
+        {/each}
+      </tbody>
+    </table>
+  {/if}
+</div>
+
+<div class="card" style="margin-top: 20px;">
+  <div class="card-head">
+    <h2>Plugin windows</h2>
+    <span class="faint" style="font-size: 11px;">
+      {windows.length} declared
+    </span>
+  </div>
+  {#if windows.length === 0}
+    <div class="empty">
+      No running plugin declares a window. A plugin opts in by adding a
+      <code>windows</code> array to its <code>ui</code> block.
+    </div>
+  {:else}
+    <table>
+      <thead>
+        <tr><th>Window</th><th>Plugin</th><th>Component</th><th>Opens</th><th></th></tr>
+      </thead>
+      <tbody>
+        {#each windows as w}
+          <tr>
+            <td>
+              {w.title}
+              <div class="mono faint" style="font-size: 10px;">{w.label}</div>
+            </td>
+            <td class="mono">{w.slot}</td>
+            <td class="mono faint">{w.component}</td>
+            <td>
+              {#if w.open === "auto"}
+                <span class="badge ok">auto</span>
+              {:else}
+                <span class="badge">manual</span>
+              {/if}
+            </td>
+            <td style="text-align: right;">
+              <button
+                class="ghost"
+                onclick={async () => {
+                  try {
+                    await openPluginWindow(w.label);
+                  } catch (e) {
+                    flash("err", errorMessage(e));
+                  }
+                }}
+              >
+                open window
+              </button>
             </td>
           </tr>
         {/each}

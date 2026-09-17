@@ -65,6 +65,14 @@ fn main() -> anyhow::Result<()> {
     handle.block_on(studio.mount_slot("ui-llm-panel", &a.display().to_string(), serde_json::Value::Null))?;
     handle.block_on(studio.mount_slot("ui-theme-widget", &b.display().to_string(), serde_json::Value::Null))?;
 
+    eprintln!("--- declared plugin windows ---");
+    for w in studio.plugin_windows() {
+        eprintln!(
+            "  label={:<32} slot={:<14} component={:<12} open={}",
+            w.label, w.slot, w.component, w.open
+        );
+    }
+
     // Mirror `commands::ui_contributions` exactly.
     let out: Vec<serde_json::Value> = studio
         .host()

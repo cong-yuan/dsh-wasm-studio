@@ -81,6 +81,11 @@ pub enum StudioEvent {
 struct Shared {
     ctx: cordis::Context,
     host: WasmHost,
+    /// The Tauri app handle, kept so the studio can open/close plugin windows
+    /// (and clean them up when a plugin stops). `None` in headless tests.
+    app: Mutex<Option<tauri::AppHandle>>,
+    /// Windows currently open on behalf of plugins: label -> owning slot.
+    open_windows: Mutex<std::collections::HashMap<String, String>>,
     /// slot -> its cordis fiber (the slot's own plugin instance).
     mounted: Mutex<Vec<(String, FiberHandle)>>,
     /// The single shared flow-bridge fiber.
@@ -186,6 +191,8 @@ impl Studio {
             shared: Arc::new(Shared {
                 ctx,
                 host,
+                app: Mutex::new(None),
+                open_windows: Mutex::new(std::collections::HashMap::new()),
                 mounted: Mutex::new(Vec::new()),
                 bridge: Mutex::new(Some(bridge)),
                 plugins_dir,
@@ -227,6 +234,9 @@ impl Studio {
             Some(change_hook),
             app_data,
         ))?;
+
+        // Remember the handle so plugin windows can be created/closed later.
+        *studio.shared.app.lock().unwrap() = Some(app.clone());
 
         // Start the filesystem watcher (best-effort; the app works without it).
         studio.start_watch();
@@ -375,7 +385,10 @@ impl Studio {
             self.dispose_fiber(slot).await;
         }
         self.ensure_loaded(slot, path, config).await?;
-        self.mount_fiber(slot).await
+        self.mount_fiber(slot).await?;
+        // A plugin may ask for a window to appear with it (`open: "auto"`).
+        self.open_auto_windows(slot);
+        Ok(())
     }
 
     /// Unload a slot and drop its fiber, removing it from `studio.json`.
@@ -414,6 +427,9 @@ impl Studio {
 
     /// Unmount without persisting (used by the watcher / reload path).
     pub async fn unmount_inner(&self, slot: &str) -> Result<()> {
+        // Close windows first: a window showing a dead plugin's component would
+        // render nothing.
+        self.close_plugin_windows(slot);
         self.dispose_fiber(slot).await;
         if self.shared.host.is_loaded(slot) {
             let host = self.shared.host.clone();
@@ -917,6 +933,132 @@ impl Studio {
     }
 
     // -----------------------------------------------------------------------
+    // Plugin windows
+    // -----------------------------------------------------------------------
+
+    /// The window label for one of a plugin's declared windows.
+    ///
+    /// Namespaced by the slot so two plugins cannot collide, and stable so the
+    /// window's *own* JS can look up what it should render.
+    pub fn window_label(slot: &str, name: &str) -> String {
+        let safe = |s: &str| {
+            s.chars()
+                .map(|c| if c.is_ascii_alphanumeric() || c == '-' || c == '_' { c } else { '-' })
+                .collect::<String>()
+        };
+        format!("plugin-{}-{}", safe(slot), safe(name))
+    }
+
+    /// Every window a plugin declares, as the frontend needs it.
+    ///
+    /// Includes the derived `label`, so the UI can both open the window and,
+    /// inside that window, discover what to render.
+    pub fn plugin_windows(&self) -> Vec<PluginWindow> {
+        let mut out = Vec::new();
+        for (slot, ui) in self.shared.host.ui_decls() {
+            for w in ui.windows {
+                out.push(PluginWindow {
+                    label: Self::window_label(&slot, &w.name),
+                    slot: slot.clone(),
+                    name: w.name,
+                    component: w.component,
+                    title: w.title.unwrap_or_else(|| slot.clone()),
+                    width: w.width.unwrap_or(900.0),
+                    height: w.height.unwrap_or(640.0),
+                    open: match w.open {
+                        wasm_plugin_host::WindowOpen::Auto => "auto",
+                        wasm_plugin_host::WindowOpen::Manual => "manual",
+                    }
+                    .to_string(),
+                });
+            }
+        }
+        out
+    }
+
+    /// Look up one declared window by its (already derived) label.
+    pub fn plugin_window_by_label(&self, label: &str) -> Option<PluginWindow> {
+        self.plugin_windows().into_iter().find(|w| w.label == label)
+    }
+
+    /// Open (or focus) a plugin's declared window.
+    ///
+    /// The window loads the app itself; the frontend sees its own label, asks
+    /// [`Studio::plugin_window_by_label`], and renders that component full-window.
+    pub fn open_plugin_window(&self, label: &str) -> Result<()> {
+        use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
+
+        let spec = self
+            .plugin_window_by_label(label)
+            .ok_or_else(|| anyhow::anyhow!("no plugin declares a window labelled `{label}`"))?;
+
+        let app = self
+            .shared
+            .app
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("no app handle (headless mode)"))?;
+
+        // Already open? Just focus it — do not create a second one.
+        if let Some(existing) = app.get_webview_window(label) {
+            let _ = existing.set_focus();
+            return Ok(());
+        }
+
+        let url = WebviewUrl::App(format!("index.html?plugin-window={label}").into());
+        let win = WebviewWindowBuilder::new(&app, label, url)
+            .title(&spec.title)
+            .inner_size(spec.width, spec.height)
+            .build()
+            .with_context(|| format!("building plugin window `{label}`"))?;
+        let _ = win.set_focus();
+
+        self.shared
+            .open_windows
+            .lock()
+            .unwrap()
+            .insert(label.to_string(), spec.slot.clone());
+        Ok(())
+    }
+
+    /// Close every window owned by `slot` (called when it stops).
+    pub fn close_plugin_windows(&self, slot: &str) {
+        use tauri::Manager;
+        let Some(app) = self.shared.app.lock().unwrap().clone() else {
+            return;
+        };
+        let labels: Vec<String> = {
+            let mut map = self.shared.open_windows.lock().unwrap();
+            let mine: Vec<String> = map
+                .iter()
+                .filter(|(_, owner)| owner.as_str() == slot)
+                .map(|(l, _)| l.clone())
+                .collect();
+            for l in &mine {
+                map.remove(l);
+            }
+            mine
+        };
+        for label in labels {
+            if let Some(win) = app.get_webview_window(&label) {
+                let _ = win.close();
+            }
+        }
+    }
+
+    /// Open every `auto` window belonging to an active slot.
+    fn open_auto_windows(&self, slot: &str) {
+        for w in self.plugin_windows() {
+            if w.slot == slot && w.open == "auto" {
+                if let Err(e) = self.open_plugin_window(&w.label) {
+                    eprintln!("[studio] auto-open window `{}` failed: {e}", w.label);
+                }
+            }
+        }
+    }
+
+    // -----------------------------------------------------------------------
     // Catalog — every plugin the app knows about
     // -----------------------------------------------------------------------
 
@@ -1338,4 +1480,23 @@ fn canon_path(p: &str) -> String {
     std::fs::canonicalize(p)
         .map(|c| c.display().to_string())
         .unwrap_or_else(|_| p.to_string())
+}
+
+
+/// One window a plugin declares, with its derived label.
+#[derive(Debug, Clone, Serialize)]
+pub struct PluginWindow {
+    /// The real Tauri window label (namespaced by the owning slot).
+    pub label: String,
+    /// The plugin slot that declares it.
+    pub slot: String,
+    /// The plugin-local name from the declaration.
+    pub name: String,
+    /// Which registered component to render in the window.
+    pub component: String,
+    pub title: String,
+    pub width: f64,
+    pub height: f64,
+    /// `auto` (host opens it when the plugin activates) or `manual`.
+    pub open: String,
 }

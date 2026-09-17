@@ -1,6 +1,7 @@
 <script lang="ts">
   import { onMount } from "svelte";
   import { page } from "$app/state";
+  import { getCurrentWindow } from "@tauri-apps/api/window";
   import Slot from "$lib/Slot.svelte";
   import {
     refreshAll,
@@ -13,6 +14,18 @@
   import "../lib/theme.css";
 
   let { children } = $props();
+
+  // A plugin window (`plugin-*`) shows only its own content — no sidebar.
+  // If we are not running inside Tauri (e.g. a plain dev server), the window
+  // API would throw, so treat that as the main window.
+  let isPluginWindow = $state(false);
+  onMount(() => {
+    try {
+      isPluginWindow = getCurrentWindow().label.startsWith("plugin-");
+    } catch {
+      isPluginWindow = false;
+    }
+  });
 
   const nav = [
     { href: "/", label: "Overview", icon: "▦", key: "overview" },
@@ -45,6 +58,12 @@
   }
 </script>
 
+{#if isPluginWindow}
+  <!-- A plugin window: render only the route, filling the window. -->
+  <div class="plugin-window-root">
+    {@render children()}
+  </div>
+{:else}
 <div class="shell">
   <aside class="sidebar">
     <div class="brand">
@@ -86,3 +105,10 @@
     {@render children()}
   </main>
 </div>
+{/if}
+
+<style>
+  .plugin-window-root {
+    height: 100vh;
+  }
+</style>

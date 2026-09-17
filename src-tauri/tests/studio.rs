@@ -1074,3 +1074,131 @@ async fn catalog_does_not_duplicate_a_running_plugin_that_is_also_discoverable()
     assert_eq!(alpha_rows, 1, "no duplicate rows: {cat:?}");
     assert!(cat[0].running);
 }
+
+// ---------------------------------------------------------------------------
+// Plugin windows (scheme A: the window loads the app and renders a component)
+// ---------------------------------------------------------------------------
+
+/// A plugin declaring a `ui.windows` array.
+fn wasm_window_plugin(slot: &str, decl: &str) -> Vec<u8> {
+    wasm_ui_plugin(slot, decl)
+}
+
+#[tokio::test]
+async fn a_plugin_can_declare_a_window() {
+    let dir = tmpdir("win-decl");
+    let decl = r#"{"name":"llm-ui","abi":1,"tools":[],"ui":{
+        "assets":{"entry.js":"studio.register('Adv', () => {});"},
+        "windows":[{
+            "name":"advanced","component":"Adv","title":"Advanced",
+            "width":640,"height":480,"open":"manual"
+        }]}}"#;
+    let wasm = dir.join("llm-ui.wasm");
+    std::fs::write(&wasm, wasm_window_plugin("llm-ui", decl)).unwrap();
+
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    studio
+        .mount_slot("llm-ui", &wasm.display().to_string(), json!(null))
+        .await
+        .unwrap();
+
+    let wins = studio.plugin_windows();
+    assert_eq!(wins.len(), 1, "one window declared");
+    let w = &wins[0];
+    // The label is namespaced by the slot, so two plugins cannot collide.
+    assert_eq!(w.label, "plugin-llm-ui-advanced");
+    assert_eq!(w.slot, "llm-ui");
+    assert_eq!(w.component, "Adv");
+    assert_eq!(w.title, "Advanced");
+    assert_eq!(w.width, 640.0);
+    assert_eq!(w.height, 480.0);
+    assert_eq!(w.open, "manual");
+}
+
+#[tokio::test]
+async fn a_window_is_looked_up_by_its_own_label() {
+    // This is what a plugin window does on startup: it knows only its label.
+    let dir = tmpdir("win-lookup");
+    let decl = r#"{"name":"p","abi":1,"tools":[],"ui":{
+        "windows":[{"name":"panel","component":"Panel"}]}}"#;
+    let wasm = dir.join("p.wasm");
+    std::fs::write(&wasm, wasm_window_plugin("p", decl)).unwrap();
+
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    studio
+        .mount_slot("p", &wasm.display().to_string(), json!(null))
+        .await
+        .unwrap();
+
+    let found = studio.plugin_window_by_label("plugin-p-panel");
+    assert!(found.is_some(), "lookup by derived label works");
+    assert_eq!(found.unwrap().component, "Panel");
+
+    // An unknown label is None, not a panic — that is the main window's case.
+    assert!(studio.plugin_window_by_label("main").is_none());
+}
+
+#[tokio::test]
+async fn two_plugins_may_use_the_same_window_name_without_collision() {
+    let dir = tmpdir("win-namespace");
+    let decl_a = r#"{"name":"a","abi":1,"tools":[],"ui":{
+        "windows":[{"name":"settings","component":"A"}]}}"#;
+    let decl_b = r#"{"name":"b","abi":1,"tools":[],"ui":{
+        "windows":[{"name":"settings","component":"B"}]}}"#;
+    let wa = dir.join("a.wasm");
+    let wb = dir.join("b.wasm");
+    std::fs::write(&wa, wasm_window_plugin("a", decl_a)).unwrap();
+    std::fs::write(&wb, wasm_window_plugin("b", decl_b)).unwrap();
+
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    studio.mount_slot("a", &wa.display().to_string(), json!(null)).await.unwrap();
+    studio.mount_slot("b", &wb.display().to_string(), json!(null)).await.unwrap();
+
+    let wins = studio.plugin_windows();
+    assert_eq!(wins.len(), 2);
+    let labels: Vec<&str> = wins.iter().map(|w| w.label.as_str()).collect();
+    assert!(labels.contains(&"plugin-a-settings"));
+    assert!(labels.contains(&"plugin-b-settings"));
+}
+
+#[tokio::test]
+async fn stopping_a_plugin_removes_its_windows_from_the_list() {
+    let dir = tmpdir("win-stop");
+    let decl = r#"{"name":"p","abi":1,"tools":[],"ui":{
+        "windows":[{"name":"panel","component":"Panel"}]}}"#;
+    let wasm = dir.join("p.wasm");
+    std::fs::write(&wasm, wasm_window_plugin("p", decl)).unwrap();
+
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    studio.mount_slot("p", &wasm.display().to_string(), json!(null)).await.unwrap();
+    assert_eq!(studio.plugin_windows().len(), 1);
+
+    studio.unmount_slot("p").await.unwrap();
+    assert!(
+        studio.plugin_windows().is_empty(),
+        "a stopped plugin declares no windows"
+    );
+}
+
+#[tokio::test]
+async fn opening_an_unknown_window_is_a_clear_error_not_a_panic() {
+    // Headless (no app handle) and unknown label must both be errors, never a
+    // panic — the command layer turns them into a message for the UI.
+    let dir = tmpdir("win-unknown");
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    let err = studio.open_plugin_window("plugin-nope-x").unwrap_err();
+    assert!(
+        err.to_string().contains("no plugin declares a window"),
+        "got: {err}"
+    );
+}
+
+#[tokio::test]
+async fn window_labels_are_sanitised_for_tauri() {
+    // Tauri labels allow only alphanumerics plus - / : _ ; a plugin name with
+    // other characters must not produce an invalid label.
+    assert_eq!(
+        Studio::window_label("my.plugin", "a b/c"),
+        "plugin-my-plugin-a-b-c"
+    );
+}

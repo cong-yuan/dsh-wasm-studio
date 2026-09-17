@@ -267,6 +267,35 @@ pub fn plugin_catalog(studio: State<'_, Studio>) -> Vec<crate::studio::CatalogEn
 }
 
 // ---------------------------------------------------------------------------
+// Plugin windows
+// ---------------------------------------------------------------------------
+
+/// Every window the running plugins declare, with its derived label.
+#[tauri::command]
+pub fn plugin_windows(studio: State<'_, Studio>) -> Vec<crate::studio::PluginWindow> {
+    studio.plugin_windows()
+}
+
+/// What a given window should render.
+///
+/// A plugin window loads the app; on startup the frontend passes its *own*
+/// window label here and gets back the plugin + component to mount, or `None`
+/// for the main window.
+#[tauri::command]
+pub fn plugin_window_for(
+    studio: State<'_, Studio>,
+    label: String,
+) -> Option<crate::studio::PluginWindow> {
+    studio.plugin_window_by_label(&label)
+}
+
+/// Open (or focus) one of a plugin's declared windows.
+#[tauri::command]
+pub fn open_plugin_window(studio: State<'_, Studio>, label: String) -> Result<(), String> {
+    studio.open_plugin_window(&label).map_err(err)
+}
+
+// ---------------------------------------------------------------------------
 // Tools
 // ---------------------------------------------------------------------------
 

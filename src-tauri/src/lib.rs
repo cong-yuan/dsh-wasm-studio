@@ -32,6 +32,9 @@ pub fn run() {
         })
         .invoke_handler(tauri::generate_handler![
             commands::studio_status,
+            commands::plugin_windows,
+            commands::plugin_window_for,
+            commands::open_plugin_window,
             commands::plugin_catalog,
             commands::list_plugins,
             commands::load_plugin,
