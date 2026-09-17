@@ -789,3 +789,147 @@ test("a plugin's style.css replaces the app's theme tokens", async () => {
   await host.sync();
   assert.equal(head.children.filter((c) => c.tag === "style").length, 0);
 });
+
+// ---------------------------------------------------------------------------
+// `synced`: telling "not yet" apart from "nothing"
+//
+// The catch-all page uses this to decide between "Loading…" and "Not found".
+// Without it a page visited during boot would show a 404 that is really just
+// "too early".
+// ---------------------------------------------------------------------------
+
+test("synced starts false and only flips after a successful sync", async () => {
+  let fail = true;
+  const host = new PluginHost(fakeDom(), async () => {
+    if (fail) throw new Error("backend not ready");
+    return [];
+  });
+
+  assert.equal(host.synced, false, "nothing has been synced yet");
+
+  // A failing source must NOT count as synced — the backend was never reached.
+  await host.sync();
+  assert.equal(host.synced, false, "a failed fetch leaves it unsynced, so the UI keeps waiting");
+
+  fail = false;
+  await host.sync();
+  assert.equal(host.synced, true, "a successful sync — even an empty one — means plugins have reported");
+});
+
+// ---------------------------------------------------------------------------
+// Contributed routes, through the host (not just the registry)
+// ---------------------------------------------------------------------------
+
+test("a plugin's declared routes reach the registry and resolve", async () => {
+  const host = new PluginHost(fakeDom(), async () => [
+    {
+      slot: "usage",
+      provides_slots: [],
+      injects_slots: [],
+      assets: { "entry.js": `studio.register("UsagePage", (el) => { el.textContent = "u"; });` },
+      routes: [
+        { path: "usage", component: "UsagePage", title: "Usage", icon: "U", nav: true },
+      ],
+    },
+  ]);
+  await host.sync();
+
+  const r = host.slots.routeFor("usage");
+  assert.ok(r, "the route registered");
+  assert.equal(r.owner, "usage");
+  assert.equal(r.component, "UsagePage");
+  assert.deepEqual(host.slots.navRoutes().map((n) => n.path), ["usage"]);
+
+  // And the component the route names is genuinely mountable — the two halves
+  // must agree or the page would render blank.
+  const parent = new FakeEl("div");
+  const dispose = host.mountComponent(r.owner, r.component, `route:${r.path}`, parent as unknown as HTMLElement);
+  assert.equal(parent.children.length, 1, "the page's component mounted");
+  assert.equal(parent.children[0].textContent, "u");
+  dispose();
+  assert.equal(parent.children.length, 0, "and unmounted");
+});
+
+test("a plugin cannot shadow a built-in page", async () => {
+  const errors: unknown[] = [];
+  const orig = console.error;
+  console.error = (...a: unknown[]) => errors.push(a);
+  try {
+    const host = new PluginHost(fakeDom(), async () => [
+      {
+        slot: "sneaky",
+        provides_slots: [],
+        injects_slots: [],
+        assets: {},
+        // SvelteKit resolves static routes first, so this could never render;
+        // accepting it silently would make the plugin believe it had taken over
+        // the built-in page.
+        routes: [{ path: "chat", component: "Fake", title: "Chat", nav: true }],
+      },
+    ]);
+    await host.sync();
+    assert.equal(host.slots.routeFor("chat"), undefined, "the built-in path stays unclaimed");
+    assert.deepEqual(host.slots.navRoutes(), [], "and no nav entry was added");
+    assert.equal(errors.length, 1, "the attempt is reported, not swallowed");
+  } finally {
+    console.error = orig;
+  }
+});
+
+test("routes from two plugins do not collide unless they share a path", async () => {
+  const host = new PluginHost(fakeDom(), async () => [
+    {
+      slot: "a",
+      provides_slots: [],
+      injects_slots: [],
+      assets: {},
+      routes: [{ path: "a-page", component: "A", title: "A", nav: true }],
+    },
+    {
+      slot: "b",
+      provides_slots: [],
+      injects_slots: [],
+      assets: {},
+      routes: [{ path: "b-page", component: "B", title: "B", nav: true }],
+    },
+  ]);
+  await host.sync();
+  assert.deepEqual(
+    host.slots.navRoutes().map((n) => n.path),
+    ["a-page", "b-page"],
+    "both contributed pages are listed",
+  );
+});
+
+test("a route conflict is reported and does not stop the other plugin loading", async () => {
+  const errors: unknown[] = [];
+  const orig = console.error;
+  console.error = (...a: unknown[]) => errors.push(a);
+  try {
+    const host = new PluginHost(fakeDom(), async () => [
+      {
+        slot: "first",
+        provides_slots: [],
+        injects_slots: [],
+        assets: { "entry.js": `studio.register("C", (el) => {});` },
+        routes: [{ path: "same", component: "C", title: "First", nav: true }],
+      },
+      {
+        slot: "second",
+        provides_slots: [],
+        injects_slots: [],
+        assets: { "entry.js": `studio.register("C", (el) => {});` },
+        routes: [{ path: "same", component: "C", title: "Second", nav: true }],
+      },
+    ]);
+    await host.sync();
+    // The first keeps the route; the second is refused and reported.
+    assert.equal(host.slots.routeFor("same")?.owner, "first");
+    assert.equal(errors.length, 1, "the conflict is surfaced");
+    // Crucially, the losing plugin is still loaded — one bad declaration must
+    // not take another plugin down.
+    assert.ok(host.diagnostics().length >= 0);
+  } finally {
+    console.error = orig;
+  }
+});

@@ -7,7 +7,27 @@
 use dsh_wasm_studio_lib::studio::Studio;
 
 fn main() -> anyhow::Result<()> {
-    let handle = tauri::async_runtime::handle().inner().clone();
+    // An **explicit** runtime, not `tauri::async_runtime::handle()`.
+    //
+    // Outside a Tauri app that accessor lazily builds a global runtime and hands
+    // back a handle to it, which we then `block_on` from the main thread. That
+    // deadlocks roughly half the time in a fresh process: `block_on` parks the
+    // calling thread on its own runtime, and if the worker picks the task back
+    // up before the park registers, the wakeup is lost and every worker parks
+    // forever. Owning the runtime here removes the self-reference entirely.
+    // (Measured: ~6/12 hangs before, 20/20 clean after.)
+    // An **explicit** runtime, not `tauri::async_runtime::handle()`.
+    //
+    // Outside a Tauri app that accessor lazily creates a global runtime and
+    // hands back a handle to it, which we then `block_on` from the main
+    // thread — a self-reference that deadlocks intermittently. Owning the
+    // runtime here removes it. (A *current-thread* runtime also avoids
+    // cordis's `Fiber::join` lost-wakeup race, but it cannot drive the
+    // concurrent work these examples touch, so multi-thread it is.)
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let handle = rt.handle().clone();
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .parent()
         .unwrap()

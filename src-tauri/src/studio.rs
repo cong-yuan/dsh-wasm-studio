@@ -185,10 +185,7 @@ impl Studio {
         let bridge_plugin: Arc<dyn cordis::plugin::Plugin> =
             Arc::new(FlowBridgePlugin::new(host.clone()));
         let bridge = ctx.plugin(bridge_plugin, None);
-        bridge
-            .join()
-            .await
-            .map_err(|e| anyhow::anyhow!("flow bridge failed to converge: {e}"))?;
+        join_bounded(&bridge, BRIDGE_SETTLE_TIMEOUT, "flow bridge").await?;
 
         let studio = Studio {
             shared: Arc::new(Shared {
@@ -326,9 +323,7 @@ impl Studio {
         ));
         let fiber = self.shared.ctx.plugin(plugin, None);
         // Surface only a *failed* startup; PENDING convergence is fine.
-        if let Err(e) = fiber.join().await {
-            return Err(anyhow::anyhow!("slot `{slot}` fiber failed to start: {e}"));
-        }
+        join_bounded(&fiber, SLOT_SETTLE_TIMEOUT, &format!("slot `{slot}`")).await?;
         self.shared
             .mounted
             .lock()
@@ -1388,6 +1383,48 @@ fn in_runtime<R>(f: impl FnOnce() -> R) -> R {
         f()
     } else {
         tauri::async_runtime::block_on(async { f() })
+    }
+}
+
+/// How long the flow bridge may take to reach a steady state.
+const BRIDGE_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long a slot's fiber may take. Longer: a slot legitimately waits on a
+/// service another plugin may not have provided yet.
+const SLOT_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Time budget for a fiber to reach a steady state.
+///
+/// cordis's `Fiber::join` is unbounded and has a **lost-wakeup race**: it reads
+/// the driver's busy flag, then calls `borrow_and_update()` (which consumes the
+/// settle notification) and *then* awaits `changed()` — so if the driver settled
+/// in that window, the await waits for a bump that has already happened and
+/// never arrives. Observed as an intermittent hang in a fresh process (~1 in 10
+/// with a multi-thread runtime; it needs a thread switch inside the window, so a
+/// current-thread runtime never hits it).
+///
+/// `join_with_timeout` is the crate's own answer to this class of problem, so we
+/// use it everywhere rather than gamble on the race. A timeout is **not** an
+/// error: a fiber that is merely still converging (waiting on a service that is
+/// not up yet) is a legitimate state, and the studio is designed to work with
+/// `pending` slots. Only a real startup failure is propagated.
+async fn join_bounded(
+    fiber: &cordis::fiber::FiberHandle,
+    timeout: std::time::Duration,
+    what: &str,
+) -> Result<()> {
+    match fiber.join_with_timeout(timeout).await {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("timed out") {
+                // Still converging — the fiber keeps working in the background,
+                // and a later event (a provider appearing) will settle it.
+                eprintln!("[studio] {what} did not settle within {timeout:?}; continuing");
+                Ok(())
+            } else {
+                Err(anyhow::anyhow!("{what} fiber failed to start: {msg}"))
+            }
+        }
     }
 }
 

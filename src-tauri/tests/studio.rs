@@ -1379,3 +1379,64 @@ async fn params_are_queued_until_the_window_opens() {
     assert_eq!(studio.take_pending_params("plugin-p-panel"), Some(json!({ "sel": "x" })));
     assert_eq!(studio.take_pending_params("plugin-p-panel"), None);
 }
+
+// ---------------------------------------------------------------------------
+// Bounded fiber joins
+//
+// cordis's `Fiber::join` has a lost-wakeup race (it consumes the settle
+// notification with `borrow_and_update` and then awaits the *next* one), which
+// shows up as an intermittent hang in a fresh process. The studio therefore
+// never calls the unbounded form.
+// ---------------------------------------------------------------------------
+
+/// A slot whose inject no one provides must still load.
+///
+/// **What this does and does not prove.** It pins the *semantics* the bounded
+/// join relies on: a plugin held back by an unsatisfied inject is a legitimate
+/// state, not a mount failure, and it stays inactive. It does **not** reproduce
+/// cordis's lost-wakeup race — a pending fiber has already settled (`dirty`
+/// false, no live task), so even the unbounded `join()` returns at once.
+/// The race needs a *settling* fiber and a thread switch inside a narrow window;
+/// it is what `join_bounded` guards against, and it was reproduced out of band
+/// (~1 in 10 fresh processes, multi-thread runtime only).
+#[tokio::test]
+async fn a_slot_that_cannot_settle_still_loads() {
+    let dir = tmpdir("bounded-join");
+    // This plugin injects a service nothing provides, so it stays pending
+    // forever. With an unbounded join the mount below would hang.
+    let wasm = dir.join("waiter.wasm");
+    // Declares a *service* inject nothing provides, so the fiber never settles.
+    std::fs::write(
+        &wasm,
+        wasm_ui_plugin(
+            "waiter",
+            r#"{"name":"waiter","abi":1,"tools":[],"injects":["nobody-provides-this"]}"#,
+        ),
+    )
+    .unwrap();
+
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    let mounted = studio
+        .mount_slot("waiter", &wasm.display().to_string(), json!(null))
+        .await;
+    assert!(
+        mounted.is_ok(),
+        "a pending slot is a legitimate state, not a mount failure: {mounted:?}"
+    );
+    let entry = studio
+        .catalog()
+        .into_iter()
+        .find(|e| e.slot == "waiter")
+        .expect("it is listed");
+    assert!(entry.running, "the guest is mounted");
+    // `(slot, plugin, state, tools, active)` — an unsatisfied inject means its
+    // effects are not registered, so `active` must be false.
+    let (_, _, _, tool_count, active) = studio
+        .host()
+        .list_plugins()
+        .into_iter()
+        .find(|(s, ..)| s == "waiter")
+        .expect("the slot is known to the host");
+    assert!(!active, "an unsatisfied inject leaves the plugin inactive");
+    assert_eq!(tool_count, 0);
+}

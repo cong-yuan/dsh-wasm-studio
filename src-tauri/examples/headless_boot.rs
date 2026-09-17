@@ -10,7 +10,21 @@ use serde_json;
 
 fn main() -> anyhow::Result<()> {
     // Tauri normally owns a global runtime; mimic that here.
-    let handle = tauri::async_runtime::handle().inner().clone();
+    // An **explicit** runtime — see the note in `dump_ui.rs` for why borrowing
+    // Tauri's lazily-created global handle and `block_on`-ing it deadlocks
+    // intermittently outside a Tauri app.
+    // An **explicit** runtime, not `tauri::async_runtime::handle()`.
+    //
+    // Outside a Tauri app that accessor lazily creates a global runtime and
+    // hands back a handle to it, which we then `block_on` from the main
+    // thread — a self-reference that deadlocks intermittently. Owning the
+    // runtime here removes it. (A *current-thread* runtime also avoids
+    // cordis's `Fiber::join` lost-wakeup race, but it cannot drive the
+    // concurrent work these examples touch, so multi-thread it is.)
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()?;
+    let handle = rt.handle().clone();
     let studio = handle.block_on(async {
         let dir = std::env::temp_dir().join("studio-headless");
         let _ = std::fs::remove_dir_all(&dir);
