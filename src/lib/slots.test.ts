@@ -10,6 +10,7 @@ import assert from "node:assert/strict";
 
 import {
   BUILTIN_SLOTS,
+  globMatch,
   SlotConflictError,
   SlotRegistry,
 } from "./slots.ts";
@@ -278,4 +279,180 @@ test("backend wire format: unloading through release() hides and restores", () =
     assets: {},
   });
   assert.equal(reg.mountsFor("llm-ui.config").length, 1, "restored");
+});
+
+// --- Adjustments: a later plugin reshaping earlier UI ----------------------
+//
+// This is the capability the project exists for, so the tests are deliberately
+// blunt about the two properties that make it usable: a later plugin wins, and
+// releasing the adjuster restores the original.
+
+test("a later plugin can hide an earlier plugin's contribution", () => {
+  const reg = new SlotRegistry();
+  reg.openSlot("app", "settings.tabs");
+  reg.claim("llm-ui", "settings.tabs", 0, "LlmPanel");
+  assert.equal(reg.mounts().length, 1, "visible before adjustment");
+
+  reg.setAdjustments("curator", [
+    { owner: "curator", slot: "settings.tabs", from: "llm-ui", action: "hide" },
+  ]);
+
+  assert.equal(reg.mounts().length, 0, "hidden after adjustment");
+  // The claim still exists — hiding is not deletion.
+  assert.equal(reg.resolve().length, 1);
+  assert.equal(reg.resolve()[0].hidden, true);
+});
+
+test("releasing the adjuster restores the hidden contribution (reversibility)", () => {
+  const reg = new SlotRegistry();
+  reg.openSlot("app", "settings.tabs");
+  reg.claim("llm-ui", "settings.tabs", 0, "LlmPanel");
+  reg.setAdjustments("curator", [
+    { owner: "curator", slot: "*", action: "hide" },
+  ]);
+  assert.equal(reg.mounts().length, 0);
+
+  reg.release("curator");
+  assert.equal(reg.mounts().length, 1, "back to declared state");
+  assert.equal(reg.listAdjustments().length, 0, "adjustment is gone too");
+});
+
+test("a later plugin can re-show what an earlier plugin hid (load order wins)", () => {
+  const reg = new SlotRegistry();
+  reg.openSlot("app", "settings.tabs");
+  reg.claim("llm-ui", "settings.tabs", 0, "LlmPanel");
+  reg.setAdjustments("hider", [{ owner: "hider", slot: "*", action: "hide" }]);
+  assert.equal(reg.mounts().length, 0);
+
+  reg.setAdjustments("restorer", [
+    { owner: "restorer", slot: "settings.tabs", from: "llm-ui", action: "unhide" },
+  ]);
+  assert.equal(reg.mounts().length, 1, "later unhide wins");
+});
+
+test("priority adjustments reorder a slot, absolutely and by delta", () => {
+  const reg = new SlotRegistry();
+  reg.openSlot("app", "settings.tabs");
+  reg.claim("a", "settings.tabs", 0, "A");
+  reg.claim("b", "settings.tabs", 10, "B");
+  assert.deepEqual(reg.mountsFor("settings.tabs").map((c) => c.owner), ["a", "b"]);
+
+  reg.setAdjustments("curator", [
+    { owner: "curator", slot: "settings.tabs", from: "b", action: "priority", to: -5 },
+  ]);
+  assert.deepEqual(
+    reg.mountsFor("settings.tabs").map((c) => c.owner),
+    ["b", "a"],
+    "b moved to the front",
+  );
+
+  // A delta applies to the contribution's own priority.
+  reg.setAdjustments("nudger", [
+    { owner: "nudger", slot: "settings.tabs", from: "a", action: "priority", by: -100 },
+  ]);
+  assert.deepEqual(reg.mountsFor("settings.tabs").map((c) => c.owner), ["a", "b"]);
+});
+
+test("replace redirects rendering to the adjusting plugin's component", () => {
+  const reg = new SlotRegistry();
+  reg.openSlot("app", "settings.tabs");
+  reg.claim("llm-ui", "settings.tabs", 0, "Original");
+
+  reg.setAdjustments("curator", [
+    {
+      owner: "curator",
+      slot: "settings.tabs",
+      from: "llm-ui",
+      action: "replace",
+      component: "Better",
+    },
+  ]);
+
+  const m = reg.mountsFor("settings.tabs")[0];
+  assert.equal(m.component, "Better", "renders the substitute");
+  assert.equal(m.renderOwner, "curator", "factory comes from the adjuster");
+  assert.equal(m.owner, "llm-ui", "claim stays attributed to the original");
+});
+
+test("a replace with no component is a no-op, not a breakage", () => {
+  const reg = new SlotRegistry();
+  reg.openSlot("app", "settings.tabs");
+  reg.claim("llm-ui", "settings.tabs", 0, "Original");
+  reg.setAdjustments("curator", [
+    { owner: "curator", slot: "*", action: "replace" },
+  ]);
+  const m = reg.mountsFor("settings.tabs")[0];
+  assert.equal(m.component, "Original");
+  assert.equal(m.renderOwner, undefined);
+});
+
+test("globs target by slot and by owner, including across all slots", () => {
+  const reg = new SlotRegistry();
+  reg.openSlot("app", "settings.tabs");
+  reg.openSlot("app", "dashboard.cards");
+  reg.claim("noisy", "settings.tabs", 0, "A");
+  reg.claim("noisy", "dashboard.cards", 0, "B");
+  reg.claim("quiet", "settings.tabs", 0, "C");
+
+  // Everywhere `noisy` contributes.
+  reg.setAdjustments("curator", [
+    { owner: "curator", slot: "*", from: "noisy", action: "hide" },
+  ]);
+  assert.deepEqual(
+    reg.mounts().map((m) => m.contribution.owner),
+    ["quiet"],
+    "only noisy's two contributions were hidden",
+  );
+
+  // Re-target by slot instead. `settings.*` is a slot glob, so it hides the
+  // two settings.tabs contributions and leaves dashboard.cards alone.
+  reg.setAdjustments("curator", [
+    { owner: "curator", slot: "settings.*", action: "hide" },
+  ]);
+  assert.deepEqual(
+    reg.mounts().map((m) => m.contribution.owner),
+    ["noisy"],
+    "dashboard.cards survives a settings.* adjustment",
+  );
+  assert.deepEqual(reg.mounts().map((m) => m.slot), ["dashboard.cards"]);
+});
+
+test("adjustments are idempotent across re-syncs", () => {
+  const reg = new SlotRegistry();
+  reg.openSlot("app", "settings.tabs");
+  reg.claim("llm-ui", "settings.tabs", 0, "LlmPanel");
+  const adj = [{ owner: "curator", slot: "*", action: "hide" as const }];
+
+  reg.setAdjustments("curator", adj);
+  reg.setAdjustments("curator", adj);
+  reg.setAdjustments("curator", adj);
+
+  assert.equal(reg.listAdjustments().length, 1, "not duplicated");
+  assert.equal(reg.mounts().length, 0);
+});
+
+test("an adjustment to a pending slot applies once that slot appears", () => {
+  const reg = new SlotRegistry();
+  // `llm-ui` opens the slot; `theme` claims into it before it exists.
+  reg.claim("theme", "llm-ui.config", 0, "ThemePanel");
+  reg.setAdjustments("curator", [
+    { owner: "curator", slot: "llm-ui.*", action: "hide" },
+  ]);
+  assert.equal(reg.mounts().length, 0, "pending claim renders nothing anyway");
+
+  reg.openSlot("llm-ui", "llm-ui.config");
+  assert.equal(reg.mounts().length, 0, "still hidden once the slot opens");
+  assert.equal(reg.resolve().length, 1);
+  assert.equal(reg.resolve()[0].hidden, true, "the adjustment reached it");
+});
+
+test("globMatch handles literals, prefixes and full wildcards", () => {
+  assert.equal(globMatch("*", "anything.at.all"), true);
+  assert.equal(globMatch(undefined, "x"), true, "undefined matches all");
+  assert.equal(globMatch("a.b", "a.b"), true);
+  assert.equal(globMatch("a.b", "a.bc"), false, "exact, not prefix");
+  assert.equal(globMatch("a.*", "a.b"), true);
+  assert.equal(globMatch("a.*", "ab"), false);
+  assert.equal(globMatch("*.tabs", "settings.tabs"), true);
+  assert.equal(globMatch("a.c", "a.b"), false, "dots are literal, not regex");
 });

@@ -51,12 +51,71 @@ export interface Contribution {
   priority: number;
   /** Which registered component to mount (opaque to this module). */
   component?: string;
+  /**
+   * Set when a `replace` adjustment redirected this contribution: the plugin
+   * whose component must be looked up instead of `owner`. Kept separate from
+   * `owner` so teardown stays attributed to the original claim.
+   */
+  renderOwner?: string;
+}
+
+/** What an adjustment does to a matched contribution. */
+export type AdjustAction =
+  | "hide"
+  | "unhide"
+  | "replace"
+  | "priority";
+
+/**
+ * One plugin's adjustment to contributions it does not own.
+ *
+ * `slot` and `from` are globs (`*` wildcard, matched against a slot name and a
+ * contribution's owner). Adjustments are applied at **resolution** time, in the
+ * order the adjusting plugins loaded — never by mutating another plugin's DOM.
+ */
+export interface Adjustment {
+  /** The plugin applying it (for teardown and conflict reporting). */
+  owner: string;
+  /** Glob matched against the contribution's slot. `"*"` matches all. */
+  slot: string;
+  /** Glob matched against the contribution's owner. `undefined` matches all. */
+  from?: string;
+  action: AdjustAction;
+  /** For `priority`: the absolute new priority. */
+  to?: number;
+  /** For `priority`: a delta on the contribution's own priority. */
+  by?: number;
+  /** For `replace`: the component name to substitute (registered by `owner`). */
+  component?: string;
 }
 
 /** A resolved render request handed to the UI. */
 export interface Mount {
   slot: string;
   contribution: Contribution;
+}
+
+/**
+ * The result of resolving one contribution through the adjustment pipeline.
+ * `hidden` contributions are dropped from `mounts()`; `replaced` carries the
+ * substituting component so the UI knows where to look for the factory.
+ */
+export interface Resolved {
+  contribution: Contribution;
+  hidden: boolean;
+  /** Set when a `replace` won; the component to render instead. */
+  replacedBy?: { owner: string; component: string };
+}
+
+/** Glob matching: an exact string, or a `*` anywhere matching any run. */
+export function globMatch(pattern: string | undefined, value: string): boolean {
+  if (pattern === undefined) return true;
+  if (pattern === "*") return true;
+  if (!pattern.includes("*")) return pattern === value;
+  const rx = new RegExp(
+    "^" + pattern.split("*").map((p) => p.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")).join(".*") + "$",
+  );
+  return rx.test(value);
 }
 
 /** Raised when two live owners open the same slot name. */
@@ -74,6 +133,10 @@ export class SlotRegistry {
   private openedBy = new Map<string, Set<string>>();
   /** All claims ever made, including pending ones. */
   private contributions = new Map<string, Contribution>();
+  /** Adjustments, insertion-ordered by the plugin that applied them. */
+  private adjustments = new Map<string, Adjustment[]>();
+  /** Global order in which adjusting plugins first applied (load order). */
+  private adjustOrder: string[] = [];
   private nextId = 1;
   /** Bumped on every mutation so the UI can re-derive cheaply. */
   private version = 0;
@@ -149,6 +212,11 @@ export class SlotRegistry {
         this.contributions.delete(id);
       }
     }
+    // Adjustments are owned like everything else: dropping them restores the
+    // adjusted contributions to their declared state (reversibility).
+    if (this.adjustments.delete(owner)) {
+      this.adjustOrder = this.adjustOrder.filter((o) => o !== owner);
+    }
     this.bump();
   }
 
@@ -161,16 +229,82 @@ export class SlotRegistry {
   }
 
   /**
-   * Every claim whose slot currently exists, in render order.
-   * This is the reactive read: slots that vanished simply are not included,
-   * and their contributors reappear automatically once the slot returns.
+   * Resolve every contribution through the adjustment pipeline, in load order
+   * of the adjusting plugins. Later adjustments win, so a plugin loaded last
+   * has the final say — which is the whole point of the feature.
+   */
+  resolve(): Resolved[] {
+    const out: Resolved[] = [];
+    for (const c of this.contributions.values()) {
+      if (!this.slots.has(c.slot)) continue;
+      out.push(this.applyAdjustments(c));
+    }
+    return out;
+  }
+
+  /** Fold every adjustment, in load order, over one contribution. */
+  private applyAdjustments(original: Contribution): Resolved {
+    let c: Contribution = { ...original };
+    let hidden = false;
+    let replacedBy: Resolved["replacedBy"];
+
+    for (const owner of this.adjustOrder) {
+      for (const adj of this.adjustments.get(owner) ?? []) {
+        if (!globMatch(adj.slot, c.slot)) continue;
+        if (!globMatch(adj.from, c.owner)) continue;
+        switch (adj.action) {
+          case "hide":
+            hidden = true;
+            break;
+          case "unhide":
+            hidden = false;
+            break;
+          case "replace":
+            // A `replace` with no component is a no-op rather than a breakage.
+            if (adj.component) replacedBy = { owner: adj.owner, component: adj.component };
+            break;
+          case "priority":
+            if (adj.to !== undefined) c.priority = adj.to;
+            else if (adj.by !== undefined) c.priority += adj.by;
+            break;
+        }
+      }
+    }
+    return { contribution: c, hidden, replacedBy };
+  }
+
+  /** Replace the adjustments applied by `owner` (idempotent re-sync). */
+  setAdjustments(owner: string, list: Adjustment[]): void {
+    if (list.length === 0) {
+      this.adjustments.delete(owner);
+      this.adjustOrder = this.adjustOrder.filter((o) => o !== owner);
+    } else {
+      if (!this.adjustments.has(owner)) this.adjustOrder.push(owner);
+      this.adjustments.set(owner, list);
+    }
+    this.bump();
+  }
+
+  /** Every adjustment currently in effect (for the slot inspector). */
+  listAdjustments(): Adjustment[] {
+    return this.adjustOrder.flatMap((o) => this.adjustments.get(o) ?? []);
+  }
+
+  /**
+   * Every claim whose slot currently exists and survives adjustment, in render
+   * order. This is the reactive read: slots that vanished simply are not
+   * included, and their contributors reappear automatically once the slot
+   * returns. Hidden contributions are filtered out; `replace` rewrites which
+   * component the UI looks up.
    */
   mounts(): Mount[] {
     const out: Mount[] = [];
-    for (const c of this.contributions.values()) {
-      if (this.slots.has(c.slot)) {
-        out.push({ slot: c.slot, contribution: c });
-      }
+    for (const r of this.resolve()) {
+      if (r.hidden) continue;
+      const c = r.replacedBy
+        ? { ...r.contribution, component: r.replacedBy.component, renderOwner: r.replacedBy.owner }
+        : r.contribution;
+      out.push({ slot: c.slot, contribution: c });
     }
     out.sort(
       (a, b) =>

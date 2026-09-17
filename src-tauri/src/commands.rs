@@ -218,6 +218,26 @@ pub struct UiPlugin {
     pub injects_slots: Vec<SlotInjectRow>,
     /// `{ "entry.js": "...", "style.css": "..." }` — the frontend runs these.
     pub assets: std::collections::BTreeMap<String, String>,
+    /// Adjustments this plugin applies to other plugins' contributions.
+    pub adjusts: Vec<UiAdjustRow>,
+}
+
+/// One adjustment, as the frontend receives it.
+#[derive(Serialize)]
+pub struct UiAdjustRow {
+    /// Glob matched against the contribution's slot.
+    pub slot: String,
+    /// Glob matched against the contributing plugin's id.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// `hide` | `unhide` | `replace` | `priority`.
+    pub action: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub by: Option<i32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub component: Option<String>,
 }
 
 /// Where and how a plugin wants to render.
@@ -252,6 +272,24 @@ pub fn ui_contributions(studio: State<'_, Studio>) -> Vec<UiPlugin> {
                 })
                 .collect(),
             assets: ui.assets,
+            adjusts: ui
+                .adjusts
+                .into_iter()
+                .map(|a| UiAdjustRow {
+                    slot: a.slot,
+                    from: a.from,
+                    action: match a.action {
+                        wasm_plugin_host::AdjustAction::Hide => "hide",
+                        wasm_plugin_host::AdjustAction::Unhide => "unhide",
+                        wasm_plugin_host::AdjustAction::Replace => "replace",
+                        wasm_plugin_host::AdjustAction::Priority => "priority",
+                    },
+                    to: a.to,
+                    by: a.by,
+                    // `replace` names a component; nothing else does.
+                    component: a.component,
+                })
+                .collect(),
         })
         .collect()
 }

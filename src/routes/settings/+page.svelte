@@ -20,6 +20,17 @@
     void revision;
     return pluginHost.slots.pending();
   });
+  // Adjustments: what later-loaded plugins are doing to earlier UI. This is
+  // the feature's control panel — without it, a hidden panel is a mystery.
+  let adjustments = $derived.by(() => {
+    void revision;
+    return pluginHost.slots.listAdjustments();
+  });
+  // Contributions that exist but do not render because an adjustment hid them.
+  let suppressed = $derived.by(() => {
+    void revision;
+    return pluginHost.slots.resolve().filter((r) => r.hidden);
+  });
 </script>
 
 <div class="page-head">
@@ -66,7 +77,12 @@
           <td>
             {#if contribs.length}
               <div class="pill-list">
-                {#each contribs as c}<span class="badge">{c.owner}{(c.component) ? `:${c.component}` : ""}</span>{/each}
+                {#each contribs as c}
+                  <span class="badge" class:ok={!!c.renderOwner}>
+                    {c.owner}{(c.component) ? `:${c.component}` : ""}
+                    {#if c.renderOwner}&nbsp;⇄ {c.renderOwner}{/if}
+                  </span>
+                {/each}
               </div>
             {:else}
               <span class="faint">—</span>
@@ -82,6 +98,58 @@
       <div class="pill-list" style="margin-top: 8px;">
         {#each pending as p}
           <span class="badge warn">{p.owner} → {p.slot}</span>
+        {/each}
+      </div>
+    </div>
+  {/if}
+
+  {#if adjustments.length}
+    <div class="empty" style="text-align: left; margin-top: 12px;">
+      <strong>Adjustments in effect</strong>
+      <span class="faint">— a later-loaded plugin reshaping existing UI.
+        Releasing the plugin restores the original.</span>
+      <table class="table" style="margin-top: 8px;">
+        <thead>
+          <tr><th>By</th><th>Target</th><th>Action</th><th>Effect</th></tr>
+        </thead>
+        <tbody>
+          {#each adjustments as a}
+            <tr>
+              <td class="mono">{a.owner}</td>
+              <td class="mono faint">
+                {a.slot}{a.from ? ` · from ${a.from}` : ""}
+              </td>
+              <td><span class="badge warn">{a.action}</span></td>
+              <td class="faint mono" style="font-size: 11px;">
+                {#if a.action === "priority"}
+                  {#if a.to !== undefined}
+                    priority → {a.to}
+                  {:else}
+                    priority {(a.by ?? 0) >= 0 ? "+" : ""}{a.by ?? 0}
+                  {/if}
+                {:else if a.action === "replace"}
+                  renders <b>{a.component}</b>
+                {:else}
+                  {a.action}
+                {/if}
+              </td>
+            </tr>
+          {/each}
+        </tbody>
+      </table>
+    </div>
+  {/if}
+
+  {#if suppressed.length}
+    <div class="empty" style="text-align: left; margin-top: 12px;">
+      <strong>Suppressed</strong>
+      <span class="faint">— declared but not rendering, because an adjustment
+        hides it. The plugin is still loaded.</span>
+      <div class="pill-list" style="margin-top: 8px;">
+        {#each suppressed as r}
+          <span class="badge warn">
+            {r.contribution.owner} → {r.contribution.slot}
+          </span>
         {/each}
       </div>
     </div>

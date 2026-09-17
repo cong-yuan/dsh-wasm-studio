@@ -16,7 +16,8 @@ fn main() -> anyhow::Result<()> {
         .join("wasm-plugin-host/target/wasm32-wasip1/release");
     let a = root.join("ui_llm_panel.wasm");
     let b = root.join("ui_theme_widget.wasm");
-    if !a.exists() || !b.exists() {
+    let c = root.join("ui_curator.wasm");
+    if !a.exists() || !b.exists() || !c.exists() {
         eprintln!("build the demo plugins first");
         std::process::exit(2);
     }
@@ -64,6 +65,9 @@ fn main() -> anyhow::Result<()> {
     }
     handle.block_on(studio.mount_slot("ui-llm-panel", &a.display().to_string(), serde_json::Value::Null))?;
     handle.block_on(studio.mount_slot("ui-theme-widget", &b.display().to_string(), serde_json::Value::Null))?;
+    // Loaded LAST: it only adjusts the two above, proving a later plugin can
+    // reshape UI that already exists.
+    handle.block_on(studio.mount_slot("ui-curator", &c.display().to_string(), serde_json::Value::Null))?;
 
     eprintln!("--- declared plugin windows ---");
     for w in studio.plugin_windows() {
@@ -94,6 +98,21 @@ fn main() -> anyhow::Result<()> {
                     "component": i.component,
                 })).collect::<Vec<_>>(),
                 "assets": ui.assets,
+                "adjusts": ui.adjusts.iter().map(|a| {
+                    let mut m = serde_json::Map::new();
+                    m.insert("slot".into(), serde_json::json!(a.slot));
+                    if let Some(f) = &a.from { m.insert("from".into(), serde_json::json!(f)); }
+                    m.insert("action".into(), serde_json::json!(match a.action {
+                        wasm_plugin_host::AdjustAction::Hide => "hide",
+                        wasm_plugin_host::AdjustAction::Unhide => "unhide",
+                        wasm_plugin_host::AdjustAction::Replace => "replace",
+                        wasm_plugin_host::AdjustAction::Priority => "priority",
+                    }));
+                    if let Some(t) = a.to { m.insert("to".into(), serde_json::json!(t)); }
+                    if let Some(b) = a.by { m.insert("by".into(), serde_json::json!(b)); }
+                    if let Some(k) = &a.component { m.insert("component".into(), serde_json::json!(k)); }
+                    serde_json::Value::Object(m)
+                }).collect::<Vec<_>>(),
             })
         })
         .collect();

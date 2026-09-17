@@ -286,6 +286,20 @@ export class PluginHost {
         );
       }
       this.declClaims.set(p.slot, ids);
+      // --- adjustments (a later plugin reshaping earlier UI) ---
+      // Also idempotent: re-sync replaces this plugin's list wholesale.
+      this.slots.setAdjustments(
+        p.slot,
+        (p.adjusts ?? []).map((a) => ({
+          owner: p.slot,
+          slot: a.slot ?? "*",
+          from: a.from,
+          action: a.action,
+          to: a.to,
+          by: a.by,
+          component: a.component,
+        })),
+      );
       // --- styles ---
       const css = p.assets["style.css"];
       if (css) this.ensureStyle(p.slot, css);
@@ -435,10 +449,17 @@ export class PluginHost {
     }
   }
 
-  /** The component factory for a contribution, if the owner registered one. */
+  /**
+   * The component factory for a contribution.
+   *
+   * When a `replace` adjustment redirected it, the factory belongs to the
+   * *adjusting* plugin (`renderOwner`), not the original claimant — that is
+   * how a later plugin substitutes its own component for an earlier one.
+   */
   factoryFor(c: Contribution): ComponentFactory | undefined {
     if (!c.component) return undefined;
-    return this.handles.get(c.owner)?.factories.get(c.component);
+    const owner = c.renderOwner ?? c.owner;
+    return this.handles.get(owner)?.factories.get(c.component);
   }
 
   /** Look up a component a plugin registered, by owner + name. */
@@ -541,6 +562,7 @@ export class PluginHost {
     const wrapper = this.dom.createElement("div");
     wrapper.dataset.plugin = c.owner;
     wrapper.dataset.slot = c.slot;
+    if (c.renderOwner) wrapper.dataset.renderedBy = c.renderOwner;
     el.appendChild(wrapper);
     const teardown = factory(wrapper, ctx) ?? undefined;
     this.live.set(key, { contribution: c, factory, el: wrapper, teardown });

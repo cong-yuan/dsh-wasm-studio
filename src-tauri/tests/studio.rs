@@ -846,13 +846,81 @@ async fn demo_plugins_expose_a_cross_plugin_ui_graph() {
     assert_eq!(a_decl.injects[0].slot, "settings.tabs");
     assert!(a_decl.assets.contains_key("entry.js"));
 
-    // B injects into the slot A owns — the cross-plugin link.
-    assert_eq!(b_decl.injects.len(), 1);
-    assert_eq!(
-        &b_decl.injects[0].slot, opened,
-        "B must target the slot A opened"
+    // B injects into the slot A owns — the cross-plugin link…
+    let b_targets: Vec<&str> = b_decl.injects.iter().map(|i| i.slot.as_str()).collect();
+    assert!(
+        b_targets.contains(&opened.as_str()),
+        "B must target the slot A opened; got {b_targets:?}"
     );
-    assert_eq!(b_decl.injects[0].component.as_deref(), Some("ThemeWidget"));
+    let cross = b_decl
+        .injects
+        .iter()
+        .find(|i| &i.slot == opened)
+        .expect("the cross-plugin claim");
+    assert_eq!(cross.component.as_deref(), Some("ThemeWidget"));
+    // …and also into the built-in tab strip, at a lower priority number than
+    // A's, so ui-curator's priority adjustment is observable end to end.
+    let strip = b_decl
+        .injects
+        .iter()
+        .find(|i| i.slot == "settings.tabs")
+        .expect("B also contributes to the built-in strip");
+    let a_strip = a_decl
+        .injects
+        .iter()
+        .find(|i| i.slot == "settings.tabs")
+        .expect("A contributes to the built-in strip");
+    assert!(
+        strip.priority < a_strip.priority,
+        "B declares an earlier priority than A, so an adjustment is needed to flip them"
+    );
+}
+
+#[tokio::test]
+async fn a_later_plugin_can_declare_adjustments_to_existing_ui() {
+    // `ui-curator` ships no UI of its own; it only reshapes what the other two
+    // already contribute. This is the capability the project exists for, so it
+    // must survive the whole WASM -> ABI -> command path intact.
+    let c = demo_plugin("ui_curator.wasm");
+    if !c.exists() {
+        return;
+    }
+    let dir = tmpdir("adjusts");
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    studio
+        .mount_slot("ui-curator", &c.display().to_string(), json!(null))
+        .await
+        .unwrap();
+
+    let decls = studio.host().ui_decls();
+    let (_, curator) = decls
+        .iter()
+        .find(|(s, _)| s == "ui-curator")
+        .expect("ui-curator declares UI (its adjustments)");
+    assert!(
+        curator.injects.is_empty() && curator.provides.is_empty(),
+        "the curator only adjusts — it claims nothing of its own"
+    );
+    assert_eq!(curator.adjusts.len(), 2, "two adjustments declared");
+
+    // An ordering adjustment against another plugin's contribution.
+    let ord = curator
+        .adjusts
+        .iter()
+        .find(|a| a.action == wasm_plugin_host::AdjustAction::Priority)
+        .expect("a priority adjustment");
+    assert_eq!(ord.slot, "settings.tabs");
+    assert_eq!(ord.from.as_deref(), Some("ui-llm-panel"));
+    assert_eq!(ord.to, Some(-100));
+
+    // A substitution that names the curator's own component.
+    let rep = curator
+        .adjusts
+        .iter()
+        .find(|a| a.action == wasm_plugin_host::AdjustAction::Replace)
+        .expect("a replace adjustment");
+    assert_eq!(rep.from.as_deref(), Some("ui-theme-widget"));
+    assert_eq!(rep.component.as_deref(), Some("CuratedPanel"));
 }
 
 #[tokio::test]

@@ -231,6 +231,18 @@ export interface UiPlugin {
   provides_slots: string[];
   injects_slots: SlotInjectRow[];
   assets: Record<string, string>;
+  /** Adjustments this plugin applies to other plugins' contributions. */
+  adjusts?: UiAdjustRow[];
+}
+
+/** One adjustment as the backend reports it. */
+export interface UiAdjustRow {
+  slot?: string;
+  from?: string;
+  action: "hide" | "unhide" | "replace" | "priority";
+  to?: number;
+  by?: number;
+  component?: string;
 }
 
 /** Every loaded plugin's UI declaration. */

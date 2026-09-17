@@ -67,13 +67,32 @@ check(
 const contribs = host.contributionsFor("ui-llm-panel.config");
 check("exactly one contributor to that slot", contribs.length === 1, `got ${contribs.length}`);
 check("the contributor is ui-theme-widget", contribs[0]?.owner === "ui-theme-widget");
-check("with the ThemeWidget component", contribs[0]?.component === "ThemeWidget");
 
-// Both plugins' components must be registered from their real entry.js.
+// ---- Adjustments: a later plugin reshaping existing UI -------------------
+//
+// ui-curator loaded LAST and declares no UI of its own. These checks prove that
+// loading order — not plugin authorship — decides the final UI.
+
+// replace: the contribution is still attributed to ui-theme-widget, but now
+// renders ui-curator's component.
 check(
-  "ui-theme-widget registered ThemeWidget",
-  !!host.factoryFor(contribs[0]),
+  "ui-curator replaced ui-theme-widget's component",
+  contribs[0]?.component === "CuratedPanel",
+  `got ${contribs[0]?.component}`,
 );
+check(
+  "the substitute is attributed to ui-curator",
+  contribs[0]?.renderOwner === "ui-curator",
+  `got ${contribs[0]?.renderOwner}`,
+);
+check("the claim still belongs to ui-theme-widget", contribs[0]?.owner === "ui-theme-widget");
+
+// The factory must resolve to the ADJUSTER's registered component, not the
+// original owner's — that is what makes `replace` work.
+check("factory resolves to the curator's component", !!host.factoryFor(contribs[0]));
+
+// priority: ui-llm-panel was pulled ahead of ui-theme-widget? No — it is the
+// settings.tabs slot that was reordered, checked below.
 
 const panel = host.slots
   .listSlots()
@@ -84,6 +103,14 @@ const panelContribs = host.contributionsFor("settings.tabs");
 check(
   "ui-llm-panel contributes into settings.tabs",
   panelContribs.some((c) => c.owner === "ui-llm-panel" && c.component === "LlmPanel"),
+);
+// priority: the curator gave ui-llm-panel priority -100, so it must sort first
+// even though it was not the lowest-priority contributor to declare.
+const llmIdx = panelContribs.findIndex((c) => c.owner === "ui-llm-panel");
+check(
+  "ui-curator's priority adjustment put ui-llm-panel first",
+  llmIdx === 0,
+  `index ${llmIdx} of ${panelContribs.length}`,
 );
 
 // Every declared contribution should be renderable — this is the diagnostic the
@@ -96,8 +123,12 @@ const parent = new El("div");
 const dispose = host.mount(contribs[0], parent);
 check("mounting appended a wrapper", parent.children.length === 1);
 check(
-  "the plugin's innerHTML was written",
-  parent.children[0].innerHTML.includes("ui-theme-widget"),
+  "the substitute component actually rendered",
+  parent.children[0].innerHTML.includes("curated by ui-curator"),
+);
+check(
+  "the wrapper records who rendered it",
+  parent.children[0].dataset.renderedBy === "ui-curator",
 );
 dispose();
 
