@@ -737,3 +737,55 @@ test("a changed module is reloaded on the next entry.js change", async () => {
   host.mount(host.contributionsFor("settings.tabs")[0], second as unknown as HTMLElement);
   assert.equal(second.children[0].textContent, "two", "the new module body was used");
 });
+
+test("a plugin's style.css replaces the app's theme tokens", async () => {
+  // The app is fully token-driven (`:root { --bg-canvas: … }`) and its styles
+  // are build-time <link>s, while a plugin's CSS is appended to <head> at
+  // runtime. Same specificity, later in document order, so the plugin wins.
+  //
+  // This test proves the *mechanism* — the stylesheet reaches the head, once,
+  // updated in place on re-sync. (Actual cascade precedence is the browser's
+  // job; what we can get wrong here is injection order and duplication.)
+  const head = new FakeEl("head");
+  const dom: DomAdapter = {
+    createElement: (t) => new FakeEl(t) as unknown as HTMLElement,
+    head: () => head as unknown as HTMLElement,
+  };
+  const src = sourceOf([
+    {
+      slot: "skin",
+      provides_slots: [],
+      injects_slots: [],
+      assets: { "style.css": `:root { --bg-canvas: #000; --accent: #7c3aed; }` },
+    },
+  ]);
+  const host = new PluginHost(dom, src.get);
+  await host.sync();
+
+  const styles = head.children.filter((c) => c.tag === "style");
+  assert.equal(styles.length, 1, "the plugin's stylesheet is in <head>");
+  assert.match(styles[0].textContent, /--bg-canvas:\s*#000/);
+  assert.match(styles[0].textContent, /--accent:\s*#7c3aed/);
+  assert.equal(styles[0].dataset.pluginStyle, "skin", "attributed for teardown");
+
+  // Re-syncing updates the SAME element — otherwise head would grow without
+  // bound and a reload could leave a stale theme winning by position.
+  src.set([
+    {
+      slot: "skin",
+      provides_slots: [],
+      injects_slots: [],
+      assets: { "style.css": `:root { --bg-canvas: #111; }` },
+    },
+  ]);
+  await host.sync();
+  const after = head.children.filter((c) => c.tag === "style");
+  assert.equal(after.length, 1, "still one element, not two");
+  assert.match(after[0].textContent, /--bg-canvas:\s*#111/);
+  assert.doesNotMatch(after[0].textContent, /#000/, "the old value is gone");
+
+  // Unloading removes it, restoring the built-in theme.
+  src.set([]);
+  await host.sync();
+  assert.equal(head.children.filter((c) => c.tag === "style").length, 0);
+});

@@ -345,6 +345,14 @@ export class PluginHost {
   private declClaims = new Map<string, string[]>();
   /** Refreshers for plugin-opened slot containers (re-run on every change). */
   private slotRefreshers = new Set<() => void>();
+  /**
+   * Every plugin slot seen in the last sync, whether or not it produced a
+   * handle. Release must be driven by this, not by `handles`: a plugin that
+   * ships only `style.css` (or only `provides`/`adjusts`) never builds a
+   * handle, so keying cleanup off `handles` would strand its stylesheet in
+   * `<head>` — where it would keep overriding the app's theme after unload.
+   */
+  private seen = new Set<string>();
 
   private readonly source: ContributionsSource;
 
@@ -450,10 +458,12 @@ export class PluginHost {
       if (css) this.ensureStyle(p.slot, css);
     }
 
-    // Release plugins that are gone.
-    for (const owner of [...this.handles.keys()]) {
+    // Release plugins that are gone. Driven by `seen`, not `handles` — see the
+    // field comment: a CSS-only plugin has no handle but still owns a style.
+    for (const owner of [...this.seen]) {
       if (!seen.has(owner)) this.release(owner);
     }
+    this.seen = seen;
 
     // A plugin that *opens* a slot must show its children; refresh every such
     // container now that slots/claims may have changed.
@@ -529,6 +539,13 @@ export class PluginHost {
 
   /** Remove everything a plugin registered (slot, claims, components, style). */
   release(owner: string): void {
+    // Idempotent: a caller may release explicitly and then a later sync finds
+    // it gone. Without this the style lookup would be a no-op anyway, but the
+    // notify() churn would not.
+    if (!this.seen.has(owner) && !this.handles.has(owner) && !this.styles.has(owner)) {
+      return;
+    }
+    this.seen.delete(owner);
     // Tear down any live DOM first.
     for (const [key, m] of [...this.live]) {
       if (m.contribution.owner === owner) {
