@@ -220,6 +220,23 @@ pub struct UiPlugin {
     pub assets: std::collections::BTreeMap<String, String>,
     /// Adjustments this plugin applies to other plugins' contributions.
     pub adjusts: Vec<UiAdjustRow>,
+    /// Pages this plugin contributes, each optionally with a nav entry.
+    pub routes: Vec<UiRouteRow>,
+}
+
+/// A contributed page, as the frontend receives it.
+#[derive(Serialize)]
+pub struct UiRouteRow {
+    /// Path under the app root, e.g. `usage` or `tools/usage`.
+    pub path: String,
+    /// Which registered component renders it.
+    pub component: String,
+    /// Nav label, when the plugin asked for an entry.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub icon: Option<String>,
+    pub nav: bool,
 }
 
 /// One adjustment, as the frontend receives it.
@@ -288,6 +305,17 @@ pub fn ui_contributions(studio: State<'_, Studio>) -> Vec<UiPlugin> {
                     by: a.by,
                     // `replace` names a component; nothing else does.
                     component: a.component,
+                })
+                .collect(),
+            routes: ui
+                .routes
+                .into_iter()
+                .map(|r| UiRouteRow {
+                    path: r.path,
+                    component: r.component,
+                    title: r.title,
+                    icon: r.icon,
+                    nav: r.nav,
                 })
                 .collect(),
         })

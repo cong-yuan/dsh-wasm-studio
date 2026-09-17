@@ -10,6 +10,7 @@
 
 import { readFileSync } from "node:fs";
 import { PluginHost } from "./plugin-host.ts";
+import { isBuiltinRoute } from "./slots.ts";
 
 // Read the payload from stdin (or a file given as argv[2]).
 const input = process.argv[2]
@@ -170,6 +171,40 @@ if (multi) {
     missing = String(e.message ?? e);
   }
   void missing; // exercised more directly in plugin-host.test.ts
+}
+
+// ---- Contributed routes -------------------------------------------------
+//
+// ui-multifile declares a page (`multifile`) with a sidebar entry. Route and
+// nav entry come from one declaration, so resolving either proves the same
+// record arrived intact.
+const routes = host.slots.listRoutes();
+check("a plugin route arrived", routes.some((r) => r.path === "multifile"));
+const multi20 = routes.find((r) => r.path === "multifile");
+check("it names the component to render", multi20?.component === "MultiFilePage");
+check("it carries a nav label", multi20?.title === "Multi-file demo");
+check(
+  "it appears in the sidebar",
+  host.slots.navRoutes().some((r) => r.path === "multifile"),
+);
+check("lookup by path resolves it", !!host.slots.routeFor("/multifile/"));
+check(
+  "a built-in path is recognisable, so plugins cannot shadow it",
+  isBuiltinRoute("chat") === true && isBuiltinRoute("multifile") === false,
+);
+
+// Render the page: the component must actually mount and produce DOM.
+if (multi20) {
+  const page = new El("div");
+  const disposePage = host.mountComponent(
+    multi20.owner,
+    multi20.component,
+    `route:${multi20.owner}:${multi20.path}`,
+    page,
+  );
+  check("the contributed page rendered", page.children.length === 1);
+  disposePage();
+  check("and can be unmounted again", page.children.length === 0);
 }
 
 // Every declared contribution should be renderable — this is the diagnostic the

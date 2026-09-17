@@ -3,6 +3,7 @@
   import { page } from "$app/state";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import Slot from "$lib/Slot.svelte";
+  import { pluginHost } from "$lib/plugin-runtime";
   import {
     refreshAll,
     wireEvents,
@@ -27,7 +28,10 @@
     }
   });
 
-  const nav = [
+  // The app's own pages. Plugins add more via `ui.routes`, and those come
+  // through the same list so ordering and the active state behave identically —
+  // a contributed page is a page, not a special case.
+  const builtinNav = [
     { href: "/", label: "Overview", icon: "▦", key: "overview" },
     { href: "/chat", label: "Chat", icon: "◇", key: "chat" },
     { href: "/plugins", label: "Plugins", icon: "◈", key: "plugins" },
@@ -37,6 +41,23 @@
     { href: "/settings", label: "Settings", icon: "⚙", key: "settings" },
     { href: "/capabilities", label: "Capabilities", icon: "✦", key: "caps" },
   ];
+
+  // Plugin-contributed nav entries, kept live. A route declared with
+  // `nav: false` contributes a page with no sidebar entry, which is legitimate
+  // (a detail view reached from another page).
+  let navRevision = $state(0);
+  pluginHost.subscribe(() => (navRevision += 1));
+  const pluginNav = $derived.by(() => {
+    void navRevision;
+    return pluginHost.slots.navRoutes().map((r) => ({
+      href: `/${r.path}`,
+      label: r.title ?? r.path,
+      icon: r.icon ?? "◆",
+      key: `plugin:${r.path}`,
+      owner: r.owner,
+    }));
+  });
+  const nav = $derived([...builtinNav, ...pluginNav]);
 
   // Refresh once on mount, then keep the sidebar counters live.
   onMount(() => {

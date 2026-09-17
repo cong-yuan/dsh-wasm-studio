@@ -23,6 +23,28 @@
  * rules can be unit-tested directly.
  */
 
+/**
+ * The app's own page paths. A plugin may not contribute these: SvelteKit
+ * resolves static routes before any catch-all, so a contributed `chat` would
+ * never render — but its nav entry would still appear and point at the
+ * *built-in* page, which is worse than a visible error.
+ */
+export const BUILTIN_ROUTES = [
+  "",
+  "capabilities",
+  "chat",
+  "logs",
+  "plugins",
+  "services",
+  "settings",
+  "tools",
+] as const;
+
+/** Whether a path is one of the app's own pages. */
+export function isBuiltinRoute(path: string): boolean {
+  return (BUILTIN_ROUTES as readonly string[]).includes(normalizePath(path));
+}
+
 /** The five built-in mount points the app opens for plugins. */
 export const BUILTIN_SLOTS = [
   "sidebar.items",
@@ -147,6 +169,35 @@ export interface Resolved {
   replacedBy?: { owner: string; component: string };
 }
 
+/**
+ * A page contributed by a plugin, plus its optional nav entry.
+ *
+ * Route and nav entry are **one record** on purpose: they are two views of the
+ * same fact, and declaring them separately invites drift (a nav link with no
+ * page, or a page nothing links to).
+ */
+export interface PluginRoute {
+  /** Path under the app root, no leading slash. */
+  path: string;
+  /** The plugin slot that contributed it. */
+  owner: string;
+  /** Which registered component renders the page. */
+  component: string;
+  /** Nav label; present when the plugin asked for an entry. */
+  title?: string;
+  icon?: string;
+  /** Whether a sidebar entry should be shown. */
+  nav: boolean;
+}
+
+/** Raised when a contributed route collides with one already registered. */
+export class RouteConflictError extends Error {
+  constructor(path: string, a: string, b: string) {
+    super(`route "${path}" is contributed by both "${a}" and "${b}"`);
+    this.name = "RouteConflictError";
+  }
+}
+
 /** Two or more plugins adjusting the same contribution the same way. */
 export interface AdjustmentConflict {
   /** `owner:slot:component` of the contested contribution. */
@@ -186,6 +237,8 @@ export class SlotRegistry {
   private contributions = new Map<string, Contribution>();
   /** Adjustments, insertion-ordered by the plugin that applied them. */
   private adjustments = new Map<string, Adjustment[]>();
+  /** Plugin-contributed routes, keyed by normalized path. */
+  private routes = new Map<string, PluginRoute>();
   /** Global order in which adjusting plugins first applied (load order). */
   private adjustOrder: string[] = [];
   private nextId = 1;
@@ -268,6 +321,11 @@ export class SlotRegistry {
     if (this.adjustments.delete(owner)) {
       this.adjustOrder = this.adjustOrder.filter((o) => o !== owner);
     }
+    // Contributed routes go too: an unloaded plugin's page must stop resolving,
+    // or a stale nav entry would point at a component nothing registers.
+    for (const [path, r] of [...this.routes]) {
+      if (r.owner === owner) this.routes.delete(path);
+    }
     this.bump();
   }
 
@@ -334,6 +392,68 @@ export class SlotRegistry {
       this.adjustments.set(owner, list);
     }
     this.bump();
+  }
+
+  /**
+   * Register the routes a plugin contributes. Replaces that plugin's previous
+   * set, so a re-sync is idempotent.
+   *
+   * A route path may not be claimed by two live plugins: the app would have no
+   * way to choose, and silently letting the later one win would make a page
+   * vanish depending on load order. Throws {@link RouteConflictError} — the
+   * caller reports it, matching how slot-name conflicts are handled.
+   */
+  setRoutes(owner: string, routes: PluginRoute[]): void {
+    // Normalize HERE, not at the call sites: the registry's invariant is that
+    // its keys are canonical, and if callers had to remember that, `usage` and
+    // `/usage` could both be registered and `routeFor` would only ever find one
+    // of them.
+    //
+    // Two paths that normalize to the same thing are also a conflict *within*
+    // one plugin's own list, which is just as broken as two plugins colliding.
+    const normalized = new Map<string, PluginRoute>();
+    for (const r of routes) {
+      const path = normalizePath(r.path);
+      const dup = normalized.get(path);
+      if (dup) {
+        throw new RouteConflictError(path, owner, owner);
+      }
+      normalized.set(path, { ...r, path });
+    }
+    for (const [path, r] of normalized) {
+      const existing = this.routes.get(path);
+      if (existing && existing.owner !== owner) {
+        throw new RouteConflictError(path, existing.owner, owner);
+      }
+    }
+    // Clear this owner's previous contributions first, so a route the plugin
+    // no longer declares does not linger.
+    for (const [path, r] of [...this.routes]) {
+      if (r.owner === owner) this.routes.delete(path);
+    }
+    for (const [path, r] of normalized) this.routes.set(path, r);
+    this.bump();
+  }
+
+  /** Every contributed route, in a stable order (by path). */
+  listRoutes(): PluginRoute[] {
+    return [...this.routes.values()].sort((a, b) => a.path.localeCompare(b.path));
+  }
+
+  /**
+   * The routes that should appear in the sidebar, in nav order.
+   *
+   * Built-in pages are not here — they are the app's own and always present.
+   * Only `nav: true` contributions, and only those with a label: an entry with
+   * nothing to display is not an entry.
+   */
+  navRoutes(): PluginRoute[] {
+    return this.listRoutes().filter((r) => r.nav && !!r.title);
+  }
+
+  /** Look up one contributed route by its path (no leading slash). */
+  routeFor(path: string): PluginRoute | undefined {
+    return this.routes.get(normalizePath(path));
   }
 
   /** Every adjustment currently in effect (for the slot inspector). */
@@ -441,4 +561,16 @@ export class SlotRegistry {
       (c) => !this.slots.has(c.slot),
     );
   }
+}
+
+
+/**
+ * Canonicalize a contributed route path.
+ *
+ * Accepts `usage`, `/usage`, `usage/` and `//usage` and yields `usage`, so a
+ * plugin cannot accidentally (or deliberately) register what looks like a
+ * distinct route that resolves to the same place.
+ */
+export function normalizePath(path: string): string {
+  return path.replace(/^\/+|\/+$/g, "").replace(/\/+/g, "/");
 }

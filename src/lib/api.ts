@@ -233,6 +233,21 @@ export interface UiPlugin {
   assets: Record<string, string>;
   /** Adjustments this plugin applies to other plugins' contributions. */
   adjusts?: UiAdjustRow[];
+  /** Pages this plugin contributes, each optionally with a nav entry. */
+  routes?: UiRouteRow[];
+}
+
+/** A contributed page, as the backend reports it. */
+export interface UiRouteRow {
+  /** Path under the app root, e.g. `usage` (no leading slash). */
+  path: string;
+  /** Which registered component renders it. */
+  component: string;
+  /** Nav label, when the plugin asked for an entry. */
+  title?: string;
+  icon?: string;
+  /** Whether to show a sidebar entry (defaults to true backend-side). */
+  nav: boolean;
 }
 
 /** One adjustment as the backend reports it. */

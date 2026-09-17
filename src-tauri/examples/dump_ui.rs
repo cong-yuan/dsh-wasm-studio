@@ -101,6 +101,13 @@ fn main() -> anyhow::Result<()> {
                     "component": i.component,
                 })).collect::<Vec<_>>(),
                 "assets": ui.assets,
+                "routes": ui.routes.iter().map(|r| serde_json::json!({
+                    "path": r.path,
+                    "component": r.component,
+                    "title": r.title,
+                    "icon": r.icon,
+                    "nav": r.nav,
+                })).collect::<Vec<_>>(),
                 "adjusts": ui.adjusts.iter().map(|a| {
                     let mut m = serde_json::Map::new();
                     m.insert("slot".into(), serde_json::json!(a.slot));

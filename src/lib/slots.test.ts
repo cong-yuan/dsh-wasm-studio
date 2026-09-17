@@ -11,6 +11,8 @@ import assert from "node:assert/strict";
 import {
   BUILTIN_SLOTS,
   globMatch,
+  isBuiltinRoute,
+  normalizePath,
   SlotConflictError,
   SlotRegistry,
 } from "./slots.ts";
@@ -546,4 +548,116 @@ test("a conflict disappears when the losing plugin is released", () => {
 
   reg.release("b");
   assert.deepEqual(reg.adjustmentConflicts(), [], "no longer contested");
+});
+
+// --- Contributed routes ----------------------------------------------------
+//
+// A contributed page and its nav entry are one record, so they cannot drift.
+// These pin the rules a plugin author depends on.
+
+test("a plugin can contribute a route with a nav entry", () => {
+  const reg = new SlotRegistry();
+  reg.setRoutes("usage", [
+    { path: "usage", owner: "usage", component: "UsagePage", title: "Usage", icon: "◷", nav: true },
+  ]);
+  const r = reg.routeFor("usage");
+  assert.ok(r);
+  assert.equal(r.component, "UsagePage");
+  assert.deepEqual(
+    reg.navRoutes().map((n) => n.path),
+    ["usage"],
+  );
+});
+
+test("nav: false contributes a page with no sidebar entry", () => {
+  const reg = new SlotRegistry();
+  reg.setRoutes("p", [
+    { path: "detail", owner: "p", component: "Detail", title: "Detail", nav: false },
+  ]);
+  assert.ok(reg.routeFor("detail"), "the page resolves");
+  assert.deepEqual(reg.navRoutes(), [], "but nothing is added to the sidebar");
+});
+
+test("a nav entry without a label is not an entry", () => {
+  const reg = new SlotRegistry();
+  reg.setRoutes("p", [{ path: "x", owner: "p", component: "C", nav: true }]);
+  assert.deepEqual(reg.navRoutes(), [], "nothing to display, so nothing is shown");
+});
+
+test("route paths normalize so lookalikes cannot collide", () => {
+  const reg = new SlotRegistry();
+  reg.setRoutes("p", [{ path: "/usage/", owner: "p", component: "C", nav: false }]);
+  for (const variant of ["usage", "/usage", "usage/", "//usage"]) {
+    assert.ok(reg.routeFor(variant), `"${variant}" must resolve to the same route`);
+  }
+});
+
+test("one plugin declaring two lookalike paths is an error, not silent shadowing", () => {
+  const reg = new SlotRegistry();
+  // `usage` and `/usage/` are the same route; accepting both would mean one of
+  // them is unreachable and `routeFor` could only ever return one.
+  assert.throws(
+    () =>
+      reg.setRoutes("p", [
+        { path: "usage", owner: "p", component: "A", nav: true },
+        { path: "/usage/", owner: "p", component: "B", nav: true },
+      ]),
+    /route "usage" is contributed by both "p" and "p"/,
+  );
+});
+
+test("two plugins contributing the same path is an error, not load-order luck", () => {
+  const reg = new SlotRegistry();
+  reg.setRoutes("a", [{ path: "usage", owner: "a", component: "A", nav: true }]);
+  assert.throws(
+    () => reg.setRoutes("b", [{ path: "usage", owner: "b", component: "B", nav: true }]),
+    /route "usage" is contributed by both "a" and "b"/,
+  );
+});
+
+test("re-registering the same owner's routes is idempotent and replaces them", () => {
+  const reg = new SlotRegistry();
+  reg.setRoutes("p", [{ path: "a", owner: "p", component: "C1", nav: true }]);
+  reg.setRoutes("p", [
+    { path: "a", owner: "p", component: "C2", nav: true },
+    { path: "b", owner: "p", component: "C3", nav: true },
+  ]);
+  assert.equal(reg.routeFor("a")?.component, "C2", "the component was replaced");
+  assert.ok(reg.routeFor("b"));
+  assert.equal(reg.listRoutes().length, 2, "no accumulation across re-syncs");
+});
+
+test("a plugin that stops declaring a route loses it", () => {
+  const reg = new SlotRegistry();
+  reg.setRoutes("p", [
+    { path: "a", owner: "p", component: "C1", nav: true },
+    { path: "b", owner: "p", component: "C2", nav: true },
+  ]);
+  reg.setRoutes("p", [{ path: "a", owner: "p", component: "C1", nav: true }]);
+  assert.ok(reg.routeFor("a"));
+  assert.equal(reg.routeFor("b"), undefined, "the dropped route is gone");
+});
+
+test("unloading a plugin removes its routes and nav entries", () => {
+  const reg = new SlotRegistry();
+  reg.setRoutes("p", [{ path: "a", owner: "p", component: "C", title: "A", nav: true }]);
+  assert.equal(reg.navRoutes().length, 1);
+  reg.release("p");
+  assert.equal(reg.routeFor("a"), undefined);
+  assert.deepEqual(reg.navRoutes(), [], "and the nav entry goes with it");
+});
+
+test("built-in pages are recognised, so a plugin cannot silently shadow one", () => {
+  assert.equal(isBuiltinRoute("chat"), true);
+  assert.equal(isBuiltinRoute("/settings/"), true, "normalized before comparison");
+  assert.equal(isBuiltinRoute(""), true, "the overview page");
+  assert.equal(isBuiltinRoute("usage"), false, "a plugin path is free");
+});
+
+test("normalizePath collapses leading, trailing and doubled slashes", () => {
+  assert.equal(normalizePath("usage"), "usage");
+  assert.equal(normalizePath("/usage"), "usage");
+  assert.equal(normalizePath("usage/"), "usage");
+  assert.equal(normalizePath("//usage"), "usage");
+  assert.equal(normalizePath("tools//usage/"), "tools/usage");
 });

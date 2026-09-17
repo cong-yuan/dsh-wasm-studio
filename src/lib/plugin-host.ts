@@ -30,6 +30,8 @@
  */
 
 import {
+  isBuiltinRoute,
+  RouteConflictError,
   SlotConflictError,
   SlotRegistry,
   type Contribution,
@@ -364,6 +366,15 @@ export class PluginHost {
     this.source = source;
   }
 
+  /**
+   * Whether at least one `sync()` has completed.
+   *
+   * Distinguishes "plugins have not reported yet" from "no plugin contributes
+   * this" — without it, a page visited during boot would show a not-found that
+   * is really just "too early".
+   */
+  synced = false;
+
   /** Subscribe to change notifications (for a Svelte `$state` bridge). */
   subscribe(fn: () => void): () => void {
     this.listeners.add(fn);
@@ -439,6 +450,40 @@ export class PluginHost {
         );
       }
       this.declClaims.set(p.slot, ids);
+      // --- contributed routes ---
+      // Conflicts are reported, not thrown: one plugin must not be able to stop
+      // the others from loading. The losing plugin keeps no route, and the
+      // conflict is visible in `routeConflicts()`.
+      try {
+        const routes = (p.routes ?? []).filter((r) => {
+          if (isBuiltinRoute(r.path)) {
+            // Not a conflict between plugins — the app owns this path. Refuse
+            // it loudly: silently accepting would let a plugin think it had
+            // replaced a built-in page when it had not.
+            console.error(
+              `[studio] plugin "${p.slot}" tried to contribute route "${r.path}", ` +
+                `which is a built-in page; ignored`,
+            );
+            return false;
+          }
+          return true;
+        });
+        this.slots.setRoutes(
+          p.slot,
+          routes.map((r) => ({
+            path: r.path,
+            owner: p.slot,
+            component: r.component,
+            title: r.title,
+            icon: r.icon,
+            nav: r.nav,
+          })),
+        );
+      } catch (e) {
+        if (e instanceof RouteConflictError) {
+          console.error(`[studio] ${e.message}`);
+        } else throw e;
+      }
       // --- adjustments (a later plugin reshaping earlier UI) ---
       // Also idempotent: re-sync replaces this plugin's list wholesale.
       this.slots.setAdjustments(
@@ -468,6 +513,7 @@ export class PluginHost {
     // A plugin that *opens* a slot must show its children; refresh every such
     // container now that slots/claims may have changed.
     this.refreshPluginSlots();
+    this.synced = true;
     this.notify();
   }
 

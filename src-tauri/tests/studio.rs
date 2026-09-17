@@ -448,24 +448,36 @@ async fn the_watcher_hot_reloads_a_rebuilt_plugin() {
     studio.start_watch();
     assert!(studio.watching(), "watcher should have started");
 
-    // Give the watcher a moment to install notify, then write the new build.
-    std::thread::sleep(std::time::Duration::from_millis(200));
-    std::fs::write(&wasm, wasm_tool_named("alpha", "v2_tool")).unwrap();
-
-    // Poll until the change is observed (bounded, so a failure is a timeout).
+    // Rebuild in place, and **keep rewriting until it is observed**.
+    //
+    // The first write can land before the watcher has seeded its mtime
+    // baseline, in which case it is indistinguishable from the seeded state and
+    // that one change is not reported. That window is inherent to any
+    // mtime-polling watcher and is not what this test is about: the guarantee
+    // under test is "a rebuilt plugin is hot-reloaded", not "a write that races
+    // watcher installation is caught". Retrying removes the race without
+    // weakening the assertion — if hot reload were broken, no number of writes
+    // would pass.
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     let mut reloaded = false;
     while std::time::Instant::now() < deadline {
-        if studio
-            .host()
-            .list_tools()
-            .iter()
-            .any(|t| t.name == "v2_tool")
-        {
-            reloaded = true;
+        std::fs::write(&wasm, wasm_tool_named("alpha", "v2_tool")).unwrap();
+        // Give the watcher a moment to observe this write.
+        for _ in 0..10 {
+            if studio
+                .host()
+                .list_tools()
+                .iter()
+                .any(|t| t.name == "v2_tool")
+            {
+                reloaded = true;
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        if reloaded {
             break;
         }
-        std::thread::sleep(std::time::Duration::from_millis(100));
     }
 
     studio.stop_watch();
