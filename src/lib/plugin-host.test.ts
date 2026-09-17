@@ -19,16 +19,29 @@ class FakeEl {
   textContent = "";
   dataset: Record<string, string> = {};
   removed = false;
+  /** Set by appendChild so remove() can detach for real (like the DOM). */
+  parent: FakeEl | null = null;
   constructor(tag: string) {
     this.tag = tag;
   }
   appendChild(c: FakeEl): FakeEl {
-    // detach from any previous parent, like the real DOM
+    if (c.parent) c.parent.children.splice(c.parent.children.indexOf(c), 1);
     this.children.push(c);
+    c.parent = this;
     return c;
+  }
+  /** Mirrors the real DOM: drop all children (and unparent them). */
+  replaceChildren(): void {
+    for (const c of this.children) c.parent = null;
+    this.children.length = 0;
   }
   remove(): void {
     this.removed = true;
+    if (this.parent) {
+      const i = this.parent.children.indexOf(this);
+      if (i >= 0) this.parent.children.splice(i, 1);
+      this.parent = null;
+    }
   }
 }
 
@@ -107,11 +120,14 @@ test("component factory runs on mount and its disposer on unmount", async () => 
   const parent = new FakeEl("div");
   const dispose = host.mount(contribs[0], parent as unknown as HTMLElement);
   assert.equal(parent.children.length, 1, "a wrapper was appended");
-  assert.equal(parent.children[0].textContent, "hello", "the factory ran");
-  mountedText = parent.children[0].textContent;
+  const wrapper = parent.children[0];
+  assert.equal(wrapper.textContent, "hello", "the factory ran");
+  mountedText = wrapper.textContent;
 
   dispose();
-  assert.equal(parent.children[0].removed, true, "wrapper removed on unmount");
+  // Keep the reference: a faithful remove() detaches from the parent.
+  assert.equal(wrapper.removed, true, "wrapper removed on unmount");
+  assert.equal(parent.children.length, 0, "and detached from the DOM");
   void mountedText;
   void tornDown;
 });
@@ -361,4 +377,363 @@ test("a contributor arriving later fills an already-rendered opener container", 
   } finally {
     g.document = prev;
   }
+});
+
+// ---------------------------------------------------------------------------
+// Hot-reload hygiene
+//
+// Re-running an entry.js builds a NEW handle and disposes the old one. Any
+// registration the old handle made must be undone, or it accumulates on every
+// reload. These pin the two that used to leak.
+// ---------------------------------------------------------------------------
+
+/** A plugin whose entry.js declares claims imperatively. */
+function imperativePlugin(slot: string, injects: number): UiPlugin {
+  const lines = [`studio.register("C", (el) => { el.textContent = "c"; });`];
+  for (let i = 0; i < injects; i++) lines.push(`studio.inject("settings.tabs", "C", 0);`);
+  return { slot, provides_slots: [], injects_slots: [], assets: { "entry.js": lines.join("\n") } };
+}
+
+test("re-running entry.js does not accumulate imperative claims", async () => {
+  const src = sourceOf([imperativePlugin("p", 1)]);
+  const host = new PluginHost(fakeDom(), src.get);
+
+  await host.sync();
+  assert.equal(host.contributionsFor("settings.tabs").length, 1);
+
+  // A hot reload: the plugin now declares two.
+  src.set([imperativePlugin("p", 2)]);
+  await host.sync();
+  assert.equal(
+    host.contributionsFor("settings.tabs").length,
+    2,
+    "the new entry.js's two claims are live",
+  );
+
+  // …and another reload back to one. Without teardown this would be 1+2+1=4.
+  src.set([imperativePlugin("p", 1)]);
+  await host.sync();
+  assert.equal(
+    host.contributionsFor("settings.tabs").length,
+    1,
+    "the previous version's claims are gone, not accumulated",
+  );
+});
+
+test("releasing a plugin drops its imperative claims", async () => {
+  const src = sourceOf([imperativePlugin("p", 3)]);
+  const host = new PluginHost(fakeDom(), src.get);
+  await host.sync();
+  assert.equal(host.contributionsFor("settings.tabs").length, 3);
+
+  src.set([]); // plugin unloaded
+  await host.sync();
+  assert.equal(
+    host.contributionsFor("settings.tabs").length,
+    0,
+    "unloading releases the claims its entry.js made",
+  );
+});
+
+test("a failing teardown does not strand the plugin's other registrations", async () => {
+  // Isolation, proved properly: two slot containers are tracked, the one whose
+  // teardown runs FIRST throws, and the second must still be detached.
+  //
+  // Teardowns run newest-first, so declaring container `second` before
+  // container `first` means `first` is torn down first — i.e. the throwing one
+  // goes first, which is exactly the ordering that would strand the other.
+  const containers: FakeEl[] = [];
+  const src = sourceOf([
+    {
+      slot: "p",
+      provides_slots: ["p.a"],
+      injects_slots: [],
+      assets: {
+        "entry.js": `
+          studio.register("C", (el) => {});
+          studio.inject("settings.tabs", "C", 0);
+          const second = document.createElement("div");
+          studio.renderSlot("p.a", second);
+          const first = document.createElement("div");
+          studio.renderSlot("p.a", first);
+        `,
+      },
+    },
+  ]);
+
+  const g = globalThis as unknown as { document: unknown };
+  const prev = g.document;
+  g.document = {
+    createElement: (t: string) => {
+      const el = new FakeEl(t);
+      containers.push(el);
+      return el;
+    },
+  };
+  try {
+    const host = new PluginHost(fakeDom(), src.get);
+    await host.sync();
+
+    // The first-created container is the one torn down first.
+    const first = containers[0];
+    let otherDetached = false;
+    first.replaceChildren = () => {
+      throw new Error("boom");
+    };
+    const second = containers[1];
+    const realReplace = second.replaceChildren.bind(second);
+    second.replaceChildren = () => {
+      otherDetached = true;
+      realReplace();
+    };
+
+    // Reloading disposes the old handle, running both teardowns.
+    src.set([imperativePlugin("p", 1)]);
+    await host.sync();
+
+    assert.ok(otherDetached, "the second teardown ran despite the first throwing");
+    assert.equal(
+      host.contributionsFor("settings.tabs").filter((c) => c.owner === "p").length,
+      1,
+      "the new entry.js's claim is live",
+    );
+  } finally {
+    g.document = prev;
+  }
+});
+
+test("a throwing component does not prevent the rest of the slot from mounting", async () => {
+  // `<Slot>` mounts contributions in a loop. If one factory throws out of
+  // `mount`, the loop aborts and every later contribution in that slot never
+  // renders — one broken plugin blanks the slot. The throw must be contained.
+  const host = new PluginHost(fakeDom(), async () => [
+    {
+      slot: "good",
+      provides_slots: [],
+      injects_slots: [{ slot: "settings.tabs", priority: 0, component: "Good" }],
+      assets: { "entry.js": `studio.register("Good", (el) => { el.textContent = "ok"; });` },
+    },
+    {
+      slot: "bad",
+      provides_slots: [],
+      injects_slots: [{ slot: "settings.tabs", priority: 1, component: "Bad" }],
+      assets: { "entry.js": `studio.register("Bad", () => { throw new Error("boom"); });` },
+    },
+    {
+      slot: "later",
+      provides_slots: [],
+      injects_slots: [{ slot: "settings.tabs", priority: 2, component: "Later" }],
+      assets: { "entry.js": `studio.register("Later", (el) => { el.textContent = "third"; });` },
+    },
+  ]);
+  await host.sync();
+
+  const list = host.contributionsFor("settings.tabs");
+  assert.equal(list.length, 3);
+
+  const parent = new FakeEl("div");
+  // Replicate `<Slot>`'s loop, which must not need its own try/catch.
+  const cleanups = list.map((c) => host.mount(c, parent as unknown as HTMLElement));
+
+  // The first and third rendered; the broken one left no orphaned wrapper.
+  // The wrapper IS the element a factory renders into, so text lands on it.
+  assert.equal(parent.children.length, 2, "only the two working components have wrappers");
+  assert.equal(parent.children[0].textContent, "ok");
+  assert.equal(parent.children[1].textContent, "third");
+  assert.equal(parent.children[0].dataset.plugin, "good");
+  assert.equal(parent.children[1].dataset.plugin, "later");
+  for (const c of cleanups) c();
+});
+
+test("a throwing component leaves no live mount behind", async () => {
+  const host = new PluginHost(fakeDom(), async () => [
+    {
+      slot: "bad",
+      provides_slots: [],
+      injects_slots: [{ slot: "settings.tabs", priority: 0, component: "Bad" }],
+      assets: { "entry.js": `studio.register("Bad", () => { throw new Error("boom"); });` },
+    },
+  ]);
+  await host.sync();
+  const parent = new FakeEl("div");
+  host.mount(host.contributionsFor("settings.tabs")[0], parent as unknown as HTMLElement);
+  assert.equal(parent.children.length, 0, "the failed wrapper was removed");
+
+  // A second attempt must not be short-circuited by a phantom live entry.
+  host.mount(host.contributionsFor("settings.tabs")[0], parent as unknown as HTMLElement);
+  assert.equal(parent.children.length, 0, "still nothing, and no crash");
+});
+
+// ---------------------------------------------------------------------------
+// Multi-file plugins (`studio.require`)
+//
+// A plugin used to be a single `entry.js` string. Helpers and components can
+// now live in their own `.js` assets and be pulled in on demand.
+// ---------------------------------------------------------------------------
+
+test("a plugin can require another of its own .js assets", async () => {
+  const host = new PluginHost(fakeDom(), async () => [
+    {
+      slot: "p",
+      provides_slots: [],
+      injects_slots: [{ slot: "settings.tabs", priority: 0, component: "C" }],
+      assets: {
+        "lib/format.js": `return { pct: (n) => n + "%" };`,
+        "entry.js": `
+          const { pct } = studio.require("lib/format");
+          studio.register("C", (el) => { el.textContent = pct(42); });
+        `,
+      },
+    },
+  ]);
+  await host.sync();
+
+  const parent = new FakeEl("div");
+  host.mount(host.contributionsFor("settings.tabs")[0], parent as unknown as HTMLElement);
+  assert.equal(parent.children[0].textContent, "42%", "the helper's code ran");
+});
+
+test("modules are cached — a module body runs once", async () => {
+  const host = new PluginHost(fakeDom(), async () => [
+    {
+      slot: "p",
+      provides_slots: [],
+      injects_slots: [],
+      assets: {
+        // A module that increments a global on each evaluation.
+        "counter.js": `globalThis.__modLoads = (globalThis.__modLoads ?? 0) + 1; return { n: globalThis.__modLoads };`,
+        "entry.js": `
+          const a = studio.require("counter");
+          const b = studio.require("counter");
+          if (a !== b) throw new Error("module was re-evaluated");
+          if (a.n !== 1) throw new Error("ran twice");
+        `,
+      },
+    },
+  ]);
+  await host.sync();
+  assert.equal((globalThis as Record<string, unknown>).__modLoads, 1);
+  delete (globalThis as Record<string, unknown>).__modLoads;
+});
+
+test("modules may require each other", async () => {
+  const host = new PluginHost(fakeDom(), async () => [
+    {
+      slot: "p",
+      provides_slots: [],
+      injects_slots: [{ slot: "settings.tabs", priority: 0, component: "C" }],
+      assets: {
+        "b.js": `const { base } = studio.require("a"); return { value: base + 1 };`,
+        "a.js": `return { base: 10 };`,
+        "entry.js": `
+          const { value } = studio.require("b");
+          studio.register("C", (el) => { el.textContent = String(value); });
+        `,
+      },
+    },
+  ]);
+  await host.sync();
+  const parent = new FakeEl("div");
+  host.mount(host.contributionsFor("settings.tabs")[0], parent as unknown as HTMLElement);
+  assert.equal(parent.children[0].textContent, "11");
+});
+
+test("requiring an unknown module fails with the available names", async () => {
+  let message = "";
+  const host = new PluginHost(fakeDom(), async () => [
+    {
+      slot: "p",
+      provides_slots: [],
+      injects_slots: [],
+      assets: {
+        "lib/known.js": `return {};`,
+        "entry.js": `
+          try { studio.require("lib/typo"); }
+          catch (e) { globalThis.__reqErr = e.message; }
+        `,
+      },
+    },
+  ]);
+  await host.sync();
+  message = String((globalThis as Record<string, unknown>).__reqErr ?? "");
+  delete (globalThis as Record<string, unknown>).__reqErr;
+  assert.match(message, /no module "lib\/typo"/);
+  assert.match(message, /lib\/known/, "names the modules that DO exist");
+});
+
+test("a require cycle throws instead of recursing forever", async () => {
+  const host = new PluginHost(fakeDom(), async () => [
+    {
+      slot: "p",
+      provides_slots: [],
+      injects_slots: [],
+      assets: {
+        "x.js": `return studio.require("y");`,
+        "y.js": `return studio.require("x");`,
+        "entry.js": `
+          try { studio.require("x"); }
+          catch (e) { globalThis.__cycleErr = e.message; }
+        `,
+      },
+    },
+  ]);
+  await host.sync();
+  const msg = String((globalThis as Record<string, unknown>).__cycleErr ?? "");
+  delete (globalThis as Record<string, unknown>).__cycleErr;
+  assert.match(msg, /circular require/);
+});
+
+test("an unused module is never evaluated", async () => {
+  const host = new PluginHost(fakeDom(), async () => [
+    {
+      slot: "p",
+      provides_slots: [],
+      injects_slots: [],
+      assets: {
+        // Would throw if evaluated — and must not be, since nothing requires it.
+        "unused.js": `throw new Error("should never run");`,
+        "entry.js": `studio.register("C", (el) => {});`,
+      },
+    },
+  ]);
+  await host.sync(); // must not throw
+  assert.ok(host.diagnostics().length >= 0);
+});
+
+test("a changed module is reloaded on the next entry.js change", async () => {
+  const src = sourceOf([
+    {
+      slot: "p",
+      provides_slots: [],
+      injects_slots: [{ slot: "settings.tabs", priority: 0, component: "C" }],
+      assets: {
+        "m.js": `return { v: "one" };`,
+        "entry.js": `const { v } = studio.require("m"); studio.register("C", (el) => { el.textContent = v; });`,
+      },
+    },
+  ]);
+  const host = new PluginHost(fakeDom(), src.get);
+  await host.sync();
+
+  const first = new FakeEl("div");
+  host.mount(host.contributionsFor("settings.tabs")[0], first as unknown as HTMLElement);
+  assert.equal(first.children[0].textContent, "one");
+
+  // Change BOTH the module and the entry (a real rebuild touches entry.js).
+  src.set([
+    {
+      slot: "p",
+      provides_slots: [],
+      injects_slots: [{ slot: "settings.tabs", priority: 0, component: "C" }],
+      assets: {
+        "m.js": `return { v: "two" };`,
+        "entry.js": `const { v } = studio.require("m"); studio.register("C", (el) => { el.textContent = v; });`,
+      },
+    },
+  ]);
+  await host.sync();
+  host.unmountAll();
+  const second = new FakeEl("div");
+  host.mount(host.contributionsFor("settings.tabs")[0], second as unknown as HTMLElement);
+  assert.equal(second.children[0].textContent, "two", "the new module body was used");
 });

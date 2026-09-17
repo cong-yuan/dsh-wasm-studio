@@ -85,6 +85,24 @@ export interface StudioApi {
   register(name: string, factory: ComponentFactory): void;
   /** Register several at once: `{ Name: factory, … }`. */
   components(map: Record<string, ComponentFactory>): void;
+  /**
+   * Load one of this plugin's **other** `.js` assets as a module, returning
+   * whatever that file `return`s.
+   *
+   * This is what lets a plugin be more than one file: a shared helper or a
+   * component can live in its own asset instead of being concatenated into a
+   * single `entry.js` string.
+   *
+   * ```js
+   * // assets: { "lib/format.js": "return { pct: (n) => n + '%' };",
+   * //           "entry.js": "const { pct } = studio.require('lib/format'); …" }
+   * ```
+   *
+   * Modules are loaded **lazily** on first `require` (so an unused one never
+   * runs), cached per plugin, and may require each other. A cycle throws rather
+   * than hanging.
+   */
+  require(name: string): unknown;
   /** Open a slot for others to fill. Usually declared in the WASM `ui` block. */
   provideSlot(name: string, description?: string): void;
   /** Claim a place inside a slot. Usually declared in the WASM `ui` block. */
@@ -152,16 +170,109 @@ class PluginHandle {
   readonly factories = new Map<string, ComponentFactory>();
   /** Claim ids this plugin created through the JS API (not the WASM block). */
   readonly jsClaims: string[] = [];
+  /** Source of this plugin's non-entry `.js` assets, by module name. */
+  readonly moduleSources = new Map<string, string>();
+  /** Loaded module exports, by module name. Cleared with the handle. */
+  private readonly modules = new Map<string, unknown>();
+  /** The source each module was evaluated from, so a change invalidates it. */
+  private readonly moduleBodies = new Map<string, string>();
+  /** Guards against a require cycle (which would otherwise recurse forever). */
+  private readonly loading = new Set<string>();
+  /** The `studio` object, needed so a module can itself call `require`. */
+  private api: StudioApi | null = null;
   disposed = false;
 
   private readonly owner: string;
   private readonly reg: SlotRegistry;
   private readonly onChanged: () => void;
+  /**
+   * Teardowns to run when this handle is replaced or released.
+   *
+   * Hot-reloading a plugin re-runs its `entry.js`, which builds a **new**
+   * handle and disposes the old one. Anything the old handle registered must
+   * be undone here or it accumulates on every reload — claims made through
+   * `studio.inject` used to leak exactly that way, and slot containers kept
+   * their refreshers alive.
+   */
+  private readonly teardowns: Array<{ label: string; run: () => void }> = [];
 
   constructor(owner: string, reg: SlotRegistry, onChanged: () => void) {
     this.owner = owner;
     this.reg = reg;
     this.onChanged = onChanged;
+  }
+
+  /** Register a teardown, labelled so a failure names its source. */
+  track(label: string, run: () => void): void {
+    this.teardowns.push({ label, run });
+  }
+
+  /** The API handed to modules (set once the handle's own `api` exists). */
+  bindApi(api: StudioApi): void {
+    this.api = api;
+  }
+
+  /**
+   * Replace the module table, **invalidating any module whose body changed**.
+   *
+   * A rebuild can touch a helper without touching `entry.js`. The entry.js
+   * source is what gates re-execution, so without this the old helper would
+   * stay cached and the edit would appear to do nothing — a confusing class of
+   * "I changed the code and nothing happened".
+   */
+  setModuleSources(next: Map<string, string>): void {
+    this.moduleSources.clear();
+    for (const [k, v] of next) {
+      this.moduleSources.set(k, v);
+      if (this.moduleBodies.get(k) !== v) {
+        this.modules.delete(k);
+        this.moduleBodies.delete(k);
+      }
+    }
+    // Drop modules the plugin no longer ships.
+    for (const k of [...this.moduleBodies.keys()]) {
+      if (!next.has(k)) {
+        this.modules.delete(k);
+        this.moduleBodies.delete(k);
+      }
+    }
+  }
+
+  /**
+   * Load a module asset on demand. Modules may require each other, so this is
+   * lazy rather than a fixed order — which also means an unused module costs
+   * nothing and cannot break the plugin.
+   */
+  require(name: string): unknown {
+    // Asset keys carry the extension (`lib/format.js`); callers usually omit it
+    // (`require("lib/format")`). Accept both, but remember the resolved key so
+    // the cache is keyed consistently.
+    const resolved = this.moduleSources.has(name) ? name : `${name}.js`;
+    if (this.modules.has(resolved)) return this.modules.get(resolved);
+    const src = this.moduleSources.get(resolved);
+    if (src === undefined) {
+      const available = [...this.moduleSources.keys()].sort().join(", ");
+      throw new Error(
+        `no module "${name}" in plugin "${this.owner}"` +
+          (available ? ` (available: ${available})` : " (the plugin ships no other .js assets)"),
+      );
+    }
+    name = resolved;
+    if (this.loading.has(name)) {
+      throw new Error(`circular require of module "${name}" in plugin "${this.owner}"`);
+    }
+    this.loading.add(name);
+    try {
+      // Same shape as entry.js: a module is a function body that may `return`
+      // its exports.
+      const fn = new Function("studio", src);
+      const exports = fn(this.api);
+      this.modules.set(name, exports);
+      this.moduleBodies.set(name, src);
+      return exports;
+    } finally {
+      this.loading.delete(name);
+    }
   }
 
   register(name: string, factory: ComponentFactory): void {
@@ -186,14 +297,30 @@ class PluginHandle {
   }
 
   inject(slot: string, component: string, priority = 0): void {
-    this.jsClaims.push(this.reg.claim(this.owner, slot, priority, component));
+    const id = this.reg.claim(this.owner, slot, priority, component);
+    this.jsClaims.push(id);
+    // Recorded here as well as in `jsClaims` so a teardown re-reports it once.
+    this.track(`claim ${id} (${slot})`, () => this.reg.unclaim(id));
     this.onChanged();
   }
 
   dispose(): void {
+    if (this.disposed) return;
     this.disposed = true;
+    // Run teardowns newest-first, and keep going if one throws: a single bad
+    // teardown must not strand the rest (they are independent registrations).
+    for (const { label, run } of this.teardowns.splice(0).reverse()) {
+      try {
+        run();
+      } catch (e) {
+        console.error(`[studio] teardown of ${this.owner} (${label}) threw:`, e);
+      }
+    }
+    this.jsClaims.length = 0;
     this.factories.clear();
     this.slotTargets.length = 0;
+    this.modules.clear();
+    this.moduleBodies.clear();
   }
 }
 
@@ -205,7 +332,13 @@ export class PluginHost {
   /** Currently mounted DOM, keyed by contribution identity. */
   private live = new Map<string, LiveMount>();
   private listeners = new Set<() => void>();
-  /** The last asset sources we executed, so we don't re-run unchanged ones. */
+  /**
+   * A signature of the assets we last executed, so we don't re-run unchanged
+   * ones. Covers `entry.js` **and** its modules: a helper can change without
+   * `entry.js` changing, and the plugin's registrations close over whatever the
+   * modules returned — so a module edit must re-run the entry too, or the edit
+   * would silently do nothing.
+   */
   private executed = new Map<string, string>();
   /** Claim ids created from each plugin's *declarative* `injects`, so a re-sync
    *  replaces them instead of accumulating duplicates. */
@@ -266,10 +399,22 @@ export class PluginHost {
         }
       }
       // --- entry.js (imperative, may register components) ---
+      //
+      // Any other `.js` asset is a **module** the entry.js (or another module)
+      // can pull in with `studio.require(name)`. Re-running an entry.js builds
+      // a fresh handle, so the module table is rebuilt with it — a changed
+      // helper is picked up, and stale modules cannot survive a reload.
       const js = p.assets["entry.js"];
-      if (js && this.executed.get(p.slot) !== js) {
-        this.executed.set(p.slot, js);
-        this.runEntry(p, js);
+      const moduleSources = new Map<string, string>();
+      for (const [name, src] of Object.entries(p.assets)) {
+        if (name.endsWith(".js") && name !== "entry.js") moduleSources.set(name, src);
+      }
+      if (js) {
+        const signature = assetSignature(js, moduleSources);
+        if (this.executed.get(p.slot) !== signature) {
+          this.executed.set(p.slot, signature);
+          this.runEntry(p, js, moduleSources);
+        }
       }
       // --- declarative claims, after entry.js so its components exist ---
       //
@@ -317,15 +462,21 @@ export class PluginHost {
   }
 
   /** Execute one plugin's entry.js with its own `studio` handle. */
-  private runEntry(p: UiPlugin, source: string): void {
+  private runEntry(
+    p: UiPlugin,
+    source: string,
+    moduleSources: Map<string, string> = new Map(),
+  ): void {
     // Re-running an entry.js replaces the old handle entirely.
     this.handles.get(p.slot)?.dispose();
     const handle = new PluginHandle(p.slot, this.slots, () => this.notify());
+    for (const [k, v] of moduleSources) handle.moduleSources.set(k, v);
     this.handles.set(p.slot, handle);
 
     const api: StudioApi = {
       register: (n, f) => handle.register(n, f),
       components: (m) => handle.registerMany(m),
+      require: (n) => handle.require(n),
       provideSlot: (n, d) => handle.provideSlot(n, d),
       inject: (s, c, pr) => handle.inject(s, c, pr),
       renderSlot: (name, el) => this.renderSlotInto(handle, name, el),
@@ -346,6 +497,8 @@ export class PluginHost {
           ?.label ?? "main",
       dispose: () => handle.dispose(),
     };
+    // Modules receive the same api, so `studio.require` works inside them too.
+    handle.bindApi(api);
     this.currentApi = api;
     try {
       // C2: arbitrary JS. Run it as a function so a top-level `return` is legal
@@ -405,12 +558,17 @@ export class PluginHost {
     refresh();
     // Remember how to refresh, so a later change re-renders this container.
     this.slotRefreshers.add(refresh);
-    return () => {
+    // Returned to the plugin, which may call it when its DOM goes away. Also
+    // registered on the handle, so a **hot reload** detaches the refresher even
+    // if the plugin never called its disposer (it was replaced, not torn down).
+    const detach = () => {
       this.slotRefreshers.delete(refresh);
       const i = handle.slotTargets.indexOf(target);
       if (i >= 0) handle.slotTargets.splice(i, 1);
       el.replaceChildren();
     };
+    handle.track(`slot container ${slot}`, detach);
+    return detach;
   }
 
   /** Re-render every plugin-opened slot container (called after a change). */
@@ -487,7 +645,17 @@ export class PluginHost {
     wrapper.dataset.plugin = owner;
     wrapper.dataset.component = name;
     el.appendChild(wrapper);
-    const teardown = factory(wrapper, { slot: `window:${name}`, owner, component: name }) ?? undefined;
+    // Same containment as `mount`: a window component is plugin JS too, and a
+    // throw must not leave an orphaned wrapper behind.
+    let teardown: (() => void) | undefined;
+    try {
+      teardown =
+        factory(wrapper, { slot: `window:${name}`, owner, component: name }) ?? undefined;
+    } catch (e) {
+      console.error(`[studio] window component \"${name}\" from \"${owner}\" threw:`, e);
+      wrapper.remove();
+      return () => {};
+    }
     this.live.set(key, {
       contribution: { owner, slot: `window:${name}`, priority: 0, component: name },
       factory,
@@ -564,7 +732,24 @@ export class PluginHost {
     wrapper.dataset.slot = c.slot;
     if (c.renderOwner) wrapper.dataset.renderedBy = c.renderOwner;
     el.appendChild(wrapper);
-    const teardown = factory(wrapper, ctx) ?? undefined;
+
+    // A plugin component is arbitrary JS and may throw. Contain it:
+    //  * the error must not escape — a `<Slot>` mounts contributions in a loop,
+    //    and one throwing factory would otherwise abort the loop and leave
+    //    every later contribution in that slot unrendered;
+    //  * the wrapper must not be orphaned — remove it and report no live mount,
+    //    so the slot renders the rest and the failure is visible as a gap.
+    let teardown: (() => void) | undefined;
+    try {
+      teardown = factory(wrapper, ctx) ?? undefined;
+    } catch (e) {
+      console.error(
+        `[studio] component "${ctx.component}" from "${c.owner}" threw while mounting:`,
+        e,
+      );
+      wrapper.remove();
+      return () => {};
+    }
     this.live.set(key, { contribution: c, factory, el: wrapper, teardown });
 
     return () => this.unmount(key);
@@ -594,4 +779,15 @@ export class PluginHost {
 function pluginLabel(slot: string, name: string): string {
   const safe = (s: string) => s.replace(/[^a-zA-Z0-9_-]/g, "-");
   return `plugin-${safe(slot)}-${safe(name)}`;
+}
+
+
+/**
+ * A cheap signature over a plugin's executable assets: `entry.js` plus every
+ * module it ships. Any change re-runs the entry, because the registrations it
+ * makes close over whatever those modules returned.
+ */
+function assetSignature(entry: string, modules: Map<string, string>): string {
+  const names = [...modules.keys()].sort();
+  return [entry, ...names.map((n) => `${n}\u0000${modules.get(n)}`)].join("\u0001");
 }

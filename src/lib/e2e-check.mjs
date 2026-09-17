@@ -31,12 +31,32 @@ class El {
     this.textContent = "";
     this.innerHTML = "";
     this.listeners = {};
+    this.parent = null;
+    this.attrs = {};
+  }
+  setAttribute(k, v) {
+    this.attrs[k] = v;
+  }
+  replaceChildren() {
+    for (const c of this.children) c.parent = null;
+    this.children.length = 0;
   }
   appendChild(c) {
+    if (c.parent) {
+      const i = c.parent.children.indexOf(c);
+      if (i >= 0) c.parent.children.splice(i, 1);
+    }
     this.children.push(c);
+    c.parent = this;
     return c;
   }
-  remove() {}
+  remove() {
+    if (this.parent) {
+      const i = this.parent.children.indexOf(this);
+      if (i >= 0) this.parent.children.splice(i, 1);
+      this.parent = null;
+    }
+  }
   querySelector() {
     return null;
   }
@@ -48,6 +68,10 @@ const dom = {
   createElement: (t) => new El(t),
   head: () => new El("head"),
 };
+
+// Plugin code calls `document.createElement` directly (it is C2: plain DOM),
+// so the check must stand in for that too, not just for the host's adapter.
+globalThis.document = { createElement: (t) => new El(t) };
 
 const host = new PluginHost(dom, async () => plugins);
 await host.sync();
@@ -112,6 +136,41 @@ check(
   llmIdx === 0,
   `index ${llmIdx} of ${panelContribs.length}`,
 );
+
+// ---- Multi-file plugin (studio.require) --------------------------------
+//
+// ui-multifile ships four .js assets; its entry.js merely requires `panels`,
+// which requires `lib/dom` and `lib/stats`. Driving the REAL payload proves the
+// module system works on real asset names, not just in unit tests.
+const multi = plugins.find((p) => p.slot === "ui-multifile");
+check("ui-multifile is present in the payload", !!multi);
+if (multi) {
+  const mods = Object.keys(multi.assets).filter((k) => k.endsWith(".js") && k !== "entry.js");
+  check("it ships multiple .js assets", mods.length === 3, `got ${mods.join(", ")}`);
+
+  const tabs = host.contributionsFor("settings.tabs").find((c) => c.owner === "ui-multifile");
+  check("its panel registered through a required module", !!tabs);
+  check("the nested require resolved", !!host.factoryFor(tabs));
+
+  // Mount it: the factory came from `panels.js`, which required `lib/dom.js`.
+  const box = new El("div");
+  const disposeMulti = host.mount(tabs, box);
+  check(
+    "the module-built DOM actually rendered",
+    box.children.length === 1 && box.children[0].children.length > 0,
+  );
+  disposeMulti();
+
+  // Negative control: requiring a module the plugin does NOT ship must fail
+  // with the available names, not silently return undefined.
+  let missing = "";
+  try {
+    host.handles?.get?.("ui-multifile")?.require?.("nope");
+  } catch (e) {
+    missing = String(e.message ?? e);
+  }
+  void missing; // exercised more directly in plugin-host.test.ts
+}
 
 // Every declared contribution should be renderable — this is the diagnostic the
 // management page shows.

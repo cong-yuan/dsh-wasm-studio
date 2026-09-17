@@ -17,7 +17,8 @@ fn main() -> anyhow::Result<()> {
     let a = root.join("ui_llm_panel.wasm");
     let b = root.join("ui_theme_widget.wasm");
     let c = root.join("ui_curator.wasm");
-    if !a.exists() || !b.exists() || !c.exists() {
+    let d = root.join("ui_multifile.wasm");
+    if !a.exists() || !b.exists() || !c.exists() || !d.exists() {
         eprintln!("build the demo plugins first");
         std::process::exit(2);
     }
@@ -68,6 +69,8 @@ fn main() -> anyhow::Result<()> {
     // Loaded LAST: it only adjusts the two above, proving a later plugin can
     // reshape UI that already exists.
     handle.block_on(studio.mount_slot("ui-curator", &c.display().to_string(), serde_json::Value::Null))?;
+    // A multi-file plugin: its UI is split across four `.js` assets.
+    handle.block_on(studio.mount_slot("ui-multifile", &d.display().to_string(), serde_json::Value::Null))?;
 
     eprintln!("--- declared plugin windows ---");
     for w in studio.plugin_windows() {
