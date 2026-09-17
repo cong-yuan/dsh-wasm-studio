@@ -1440,3 +1440,4 @@ async fn a_slot_that_cannot_settle_still_loads() {
     assert!(!active, "an unsatisfied inject leaves the plugin inactive");
     assert_eq!(tool_count, 0);
 }
+

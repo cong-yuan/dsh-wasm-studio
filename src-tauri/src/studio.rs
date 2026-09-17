@@ -185,7 +185,7 @@ impl Studio {
         let bridge_plugin: Arc<dyn cordis::plugin::Plugin> =
             Arc::new(FlowBridgePlugin::new(host.clone()));
         let bridge = ctx.plugin(bridge_plugin, None);
-        join_bounded(&bridge, BRIDGE_SETTLE_TIMEOUT, "flow bridge").await?;
+        join_bounded(&bridge, SETTLE_TIMEOUT, "flow bridge").await?;
 
         let studio = Studio {
             shared: Arc::new(Shared {
@@ -323,7 +323,7 @@ impl Studio {
         ));
         let fiber = self.shared.ctx.plugin(plugin, None);
         // Surface only a *failed* startup; PENDING convergence is fine.
-        join_bounded(&fiber, SLOT_SETTLE_TIMEOUT, &format!("slot `{slot}`")).await?;
+        join_bounded(&fiber, SETTLE_TIMEOUT, &format!("slot `{slot}`")).await?;
         self.shared
             .mounted
             .lock()
@@ -1386,45 +1386,67 @@ fn in_runtime<R>(f: impl FnOnce() -> R) -> R {
     }
 }
 
-/// How long the flow bridge may take to reach a steady state.
-const BRIDGE_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-/// How long a slot's fiber may take. Longer: a slot legitimately waits on a
-/// service another plugin may not have provided yet.
-const SLOT_SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How long a fiber may take to reach a steady state before we stop waiting.
+///
+/// Generous: this is a safety net, not a latency budget.
+const SETTLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// How often to re-check while waiting.
+const SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(20);
 
-/// Time budget for a fiber to reach a steady state.
+/// Wait for a fiber to settle, without trusting the settle notification.
 ///
-/// cordis's `Fiber::join` is unbounded and has a **lost-wakeup race**: it reads
-/// the driver's busy flag, then calls `borrow_and_update()` (which consumes the
-/// settle notification) and *then* awaits `changed()` — so if the driver settled
-/// in that window, the await waits for a bump that has already happened and
-/// never arrives. Observed as an intermittent hang in a fresh process (~1 in 10
-/// with a multi-thread runtime; it needs a thread switch inside the window, so a
-/// current-thread runtime never hits it).
+/// **Why not `Fiber::join()`.** We hit an intermittent hang (roughly 1 in 10
+/// fresh processes) where boot stopped after `[bundle] joining manifest` and
+/// never advanced. `join` waits on a `watch` channel that is bumped at each
+/// transition, and it reads the busy flag *before* registering its snapshot —
+/// a window in which a transition can be missed. We could **not** reproduce that
+/// as a minimal case (2000 iterations of a plugin settling while joined: zero
+/// timeouts), so the race is a *suspicion*, not an established root cause.
 ///
-/// `join_with_timeout` is the crate's own answer to this class of problem, so we
-/// use it everywhere rather than gamble on the race. A timeout is **not** an
-/// error: a fiber that is merely still converging (waiting on a service that is
-/// not up yet) is a legitimate state, and the studio is designed to work with
-/// `pending` slots. Only a real startup failure is propagated.
+/// So this helper deliberately does not depend on that diagnosis. `state()` is a
+/// lock-free read of an atomic mirror that the fiber republishes at every
+/// transition, and we simply poll it. Polling cannot miss a transition the way
+/// a notification can: correctness rests on the current state, not on having
+/// observed every change.
+///
+/// A timeout is **not** a failure. A fiber that is still `Pending` because a
+/// service is not up yet is a legitimate state the studio already supports, so
+/// we log and continue. Only a genuinely `Failed` fiber is an error.
 async fn join_bounded(
     fiber: &cordis::fiber::FiberHandle,
     timeout: std::time::Duration,
     what: &str,
 ) -> Result<()> {
-    match fiber.join_with_timeout(timeout).await {
-        Ok(()) => Ok(()),
-        Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("timed out") {
-                // Still converging — the fiber keeps working in the background,
-                // and a later event (a provider appearing) will settle it.
-                eprintln!("[studio] {what} did not settle within {timeout:?}; continuing");
-                Ok(())
-            } else {
-                Err(anyhow::anyhow!("{what} fiber failed to start: {msg}"))
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        match fiber.state() {
+            // Both settled states are fine to proceed with:
+            //   Active  — effects are live;
+            //   Pending — waiting on a service, a supported state.
+            //
+            // `Pending` must return at once, not fall through to the wait: an
+            // unsatisfied inject stays Pending for as long as its provider is
+            // absent, so waiting would burn the whole budget on every such
+            // mount. (Measured: 10.03s per mount before this branch existed.)
+            cordis::fiber::FiberState::Active | cordis::fiber::FiberState::Pending => {
+                return Ok(())
             }
+            cordis::fiber::FiberState::Failed => {
+                return Err(anyhow::anyhow!("{what} fiber failed to start"));
+            }
+            // Loading / Unloading / Disposed: keep waiting.
+            cordis::fiber::FiberState::Loading
+            | cordis::fiber::FiberState::Unloading
+            | cordis::fiber::FiberState::Disposed => {}
         }
+        if tokio::time::Instant::now() >= deadline {
+            eprintln!(
+                "[studio] {what} did not settle within {timeout:?} (state {:?}); continuing",
+                fiber.state()
+            );
+            return Ok(());
+        }
+        tokio::time::sleep(SETTLE_POLL).await;
     }
 }
 
