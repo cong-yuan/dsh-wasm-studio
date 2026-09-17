@@ -86,6 +86,9 @@ struct Shared {
     app: Mutex<Option<tauri::AppHandle>>,
     /// Windows currently open on behalf of plugins: label -> owning slot.
     open_windows: Mutex<std::collections::HashMap<String, String>>,
+    /// Params to hand a window when it opens or is next focused: label -> JSON.
+    /// Cleared once delivered.
+    pending_params: Mutex<std::collections::HashMap<String, serde_json::Value>>,
     /// slot -> its cordis fiber (the slot's own plugin instance).
     mounted: Mutex<Vec<(String, FiberHandle)>>,
     /// The single shared flow-bridge fiber.
@@ -193,6 +196,7 @@ impl Studio {
                 host,
                 app: Mutex::new(None),
                 open_windows: Mutex::new(std::collections::HashMap::new()),
+                pending_params: Mutex::new(std::collections::HashMap::new()),
                 mounted: Mutex::new(Vec::new()),
                 bridge: Mutex::new(Some(bridge)),
                 plugins_dir,
@@ -970,6 +974,11 @@ impl Studio {
                         wasm_plugin_host::WindowOpen::Manual => "manual",
                     }
                     .to_string(),
+                    content: match w.content {
+                        wasm_plugin_host::WindowContent::Html => "html",
+                        wasm_plugin_host::WindowContent::App => "app",
+                    }
+                    .to_string(),
                 });
             }
         }
@@ -981,12 +990,76 @@ impl Studio {
         self.plugin_windows().into_iter().find(|w| w.label == label)
     }
 
+    /// Open a plugin window **with params**, and focus it if it already exists.
+    ///
+    /// This is the window-to-window communication primitive: the opener passes
+    /// JSON, and the target window receives it as `window.__STUDIO_WINDOW__.params`
+    /// (app windows) at document start, or via the `studio://window-params`
+    /// event if it was already open.
+    pub fn open_plugin_window_with(
+        &self,
+        label: &str,
+        params: Option<serde_json::Value>,
+    ) -> Result<()> {
+        if let Some(p) = params {
+            self.shared
+                .pending_params
+                .lock()
+                .unwrap()
+                .insert(label.to_string(), p);
+        }
+        self.open_plugin_window(label)
+    }
+
+    /// Send params to an **already-open** window (no-op if it is not open).
+    ///
+    /// A dashboard window can push updates to a detail window without
+    /// reopening it.
+    pub fn send_window_params(&self, label: &str, params: serde_json::Value) -> Result<()> {
+        use tauri::{Emitter, Manager};
+        let app = self
+            .shared
+            .app
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("no app handle (headless mode)"))?;
+        let win = app
+            .get_webview_window(label)
+            .ok_or_else(|| anyhow::anyhow!("window `{label}` is not open"))?;
+        win.emit("studio://window-params", params)
+            .map_err(|e| anyhow::anyhow!("emitting to `{label}`: {e}"))?;
+        Ok(())
+    }
+
+    /// Close a window by label (so a plugin can dismiss its own windows).
+    pub fn close_plugin_window(&self, label: &str) -> Result<()> {
+        use tauri::Manager;
+        let app = self
+            .shared
+            .app
+            .lock()
+            .unwrap()
+            .clone()
+            .ok_or_else(|| anyhow::anyhow!("no app handle (headless mode)"))?;
+        if let Some(win) = app.get_webview_window(label) {
+            win.close()
+                .map_err(|e| anyhow::anyhow!("closing `{label}`: {e}"))?;
+        }
+        self.shared.open_windows.lock().unwrap().remove(label);
+        Ok(())
+    }
+
     /// Open (or focus) a plugin's declared window.
     ///
-    /// The window loads the app itself; the frontend sees its own label, asks
-    /// [`Studio::plugin_window_by_label`], and renders that component full-window.
+    /// Two content modes:
+    /// * `app` — loads the app; the window reads its own label and renders the
+    ///   declared component full-window (the plugin's UI code is unchanged).
+    /// * `html` — a self-contained page the plugin supplies. The host loads a
+    ///   blank document and injects the plugin's `html` via an initialization
+    ///   script, so the window is entirely the plugin's, with no app shell.
     pub fn open_plugin_window(&self, label: &str) -> Result<()> {
-        use tauri::{Manager, WebviewUrl, WebviewWindowBuilder};
+        use tauri::{Manager, WebviewWindowBuilder};
 
         let spec = self
             .plugin_window_by_label(label)
@@ -1003,16 +1076,38 @@ impl Studio {
         // Already open? Just focus it — do not create a second one.
         if let Some(existing) = app.get_webview_window(label) {
             let _ = existing.set_focus();
+            if let Some(params) = self.take_pending_params(label) {
+                let _ = existing.emit("studio://window-params", params);
+            }
             return Ok(());
         }
 
-        let url = WebviewUrl::App(format!("index.html?plugin-window={label}").into());
-        let win = WebviewWindowBuilder::new(&app, label, url)
+        let mut builder = WebviewWindowBuilder::new(&app, label, self.window_url(&spec))
             .title(&spec.title)
-            .inner_size(spec.width, spec.height)
+            .inner_size(spec.width, spec.height);
+
+        // An `html` window gets its page injected at document start. The script
+        // replaces the (blank) document with the plugin's own markup.
+        if spec.content == "html" {
+            if let Some(h) = self.window_html(label) {
+                builder = builder.initialization_script(html_window_bootstrap(&h, label));
+            }
+        } else {
+            // `app` windows receive their pending params as an init script too,
+            // so they are available before the plugin's component mounts.
+            if let Some(params) = self.peek_pending_params(label) {
+                builder = builder
+                    .initialization_script(app_window_bootstrap(label, &params.to_string()));
+            }
+        }
+
+        let win = builder
             .build()
             .with_context(|| format!("building plugin window `{label}`"))?;
         let _ = win.set_focus();
+
+        // Params were injected at document start; forget the pending copy.
+        self.take_pending_params(label);
 
         self.shared
             .open_windows
@@ -1020,6 +1115,48 @@ impl Studio {
             .unwrap()
             .insert(label.to_string(), spec.slot.clone());
         Ok(())
+    }
+
+    /// The URL a window loads. `app` windows load the SPA with their label in
+    /// the query string (so a window can identify itself); `html` windows load
+    /// a blank document that the init script replaces.
+    fn window_url(&self, spec: &PluginWindow) -> tauri::WebviewUrl {
+        match spec.content.as_str() {
+            "html" => tauri::WebviewUrl::App("plugin-window-shell.html".into()),
+            _ => tauri::WebviewUrl::App(
+                format!("index.html?plugin-window={}", spec.label).into(),
+            ),
+        }
+    }
+
+    /// The plugin-supplied HTML for an `html` window, if declared.
+    pub fn window_html(&self, label: &str) -> Option<String> {
+        for (slot, ui) in self.shared.host.ui_decls() {
+            for w in ui.windows {
+                if Self::window_label(&slot, &w.name) == label {
+                    return w.html;
+                }
+            }
+        }
+        None
+    }
+
+    /// Queue params for a window, to be delivered when it opens (or focused).
+    pub fn queue_window_params(&self, label: &str, params: serde_json::Value) {
+        self.shared
+            .pending_params
+            .lock()
+            .unwrap()
+            .insert(label.to_string(), params);
+    }
+
+    /// Params queued for a window that has not opened yet.
+    pub fn peek_pending_params(&self, label: &str) -> Option<serde_json::Value> {
+        self.shared.pending_params.lock().unwrap().get(label).cloned()
+    }
+
+    pub fn take_pending_params(&self, label: &str) -> Option<serde_json::Value> {
+        self.shared.pending_params.lock().unwrap().remove(label)
     }
 
     /// Close every window owned by `slot` (called when it stops).
@@ -1499,4 +1636,41 @@ pub struct PluginWindow {
     pub height: f64,
     /// `auto` (host opens it when the plugin activates) or `manual`.
     pub open: String,
+    /// `app` (render a registered component) or `html` (a self-contained page).
+    pub content: String,
+}
+
+
+/// The bootstrap script for an `html` window: replace the document with the
+/// plugin's markup at document-start, so nothing of the shell ever paints.
+///
+/// A `<base>`-less replacement is Deliberately blunt — the plugin owns the page.
+pub fn html_window_bootstrap(html: &str, label: &str) -> String {
+    // JSON-encode so quotes/newlines in the HTML cannot break out of the string.
+    let payload = serde_json::to_string(html).unwrap_or_else(|_| "\"\"".to_string());
+    let label_json = serde_json::to_string(label).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        "((html, label) => {{
+           const write = () => {{
+             document.open();
+             document.write('<!doctype html><html><head><meta charset=\"utf-8\"></head><body>' + html + '</body></html>');
+             document.close();
+             window.__STUDIO_WINDOW__ = {{ label }};
+           }};
+           if (document.readyState === 'loading') {{
+             document.addEventListener('DOMContentLoaded', write, {{ once: true }});
+             // document.write must happen before parsing ends; do it now.
+             write();
+           }} else {{ write(); }}
+         }})({payload}, {label_json});"
+    )
+}
+
+/// The bootstrap for an `app` window: make the window's params available to the
+/// plugin's component before it mounts.
+pub fn app_window_bootstrap(label: &str, params_json: &str) -> String {
+    let label_json = serde_json::to_string(label).unwrap_or_else(|_| "\"\"".to_string());
+    format!(
+        "window.__STUDIO_WINDOW__ = {{ label: {label_json}, params: {params_json} }};"
+    )
 }

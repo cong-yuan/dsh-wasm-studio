@@ -1202,3 +1202,100 @@ async fn window_labels_are_sanitised_for_tauri() {
         "plugin-my-plugin-a-b-c"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Scheme C: self-contained HTML windows, and window params
+// ---------------------------------------------------------------------------
+
+/// A plugin declaring an `html`-content window.
+fn html_window_decl() -> &'static str {
+    r#"{"name":"p","abi":1,"tools":[],"ui":{
+        "windows":[{
+            "name":"page","component":"unused","title":"Standalone",
+            "content":"html",
+            "html":"<h1 id=hi>standalone page</h1><script>document.title='set-by-plugin'</script>"
+        }]}}"#
+}
+
+#[tokio::test]
+async fn a_plugin_can_declare_a_self_contained_html_window() {
+    let dir = tmpdir("win-html");
+    let wasm = dir.join("p.wasm");
+    std::fs::write(&wasm, wasm_ui_plugin("p", html_window_decl())).unwrap();
+
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    studio.mount_slot("p", &wasm.display().to_string(), json!(null)).await.unwrap();
+
+    let w = &studio.plugin_windows()[0];
+    assert_eq!(w.content, "html", "content mode is surfaced to the UI");
+    // The html itself is reachable for the injection step.
+    let html = studio.window_html("plugin-p-page").expect("html present");
+    assert!(html.contains("standalone page"));
+}
+
+#[tokio::test]
+async fn an_app_window_reports_content_app_and_has_no_html() {
+    let dir = tmpdir("win-app-content");
+    let decl = r#"{"name":"p","abi":1,"tools":[],"ui":{
+        "windows":[{"name":"panel","component":"Panel"}]}}"#;
+    let wasm = dir.join("p.wasm");
+    std::fs::write(&wasm, wasm_ui_plugin("p", decl)).unwrap();
+
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    studio.mount_slot("p", &wasm.display().to_string(), json!(null)).await.unwrap();
+
+    let w = &studio.plugin_windows()[0];
+    assert_eq!(w.content, "app", "default content mode is app");
+    assert!(studio.window_html("plugin-p-panel").is_none(), "no html for app windows");
+}
+
+#[test]
+fn the_html_window_bootstrap_escapes_its_payload() {
+    // The injected script must survive HTML containing quotes, backslashes and
+    // newlines. A naive `"{}"` interpolation would break out of the JS string
+    // literal; JSON encoding is what makes this safe, so the test asserts the
+    // *exact* JSON-encoded payload appears.
+    let nasty = "<div title=\"a\\\"b\">line1\nline2 \\ backslash</div>";
+    let script = dsh_wasm_studio_lib::studio::html_window_bootstrap(nasty, "plugin-x-y");
+
+    // The payload must appear exactly as serde_json encodes it.
+    let encoded = serde_json::to_string(nasty).unwrap();
+    assert!(
+        script.contains(&encoded),
+        "the HTML must be JSON-encoded, not raw.\nexpected to find: {encoded}\nin: {script}"
+    );
+    // A raw newline inside the literal would be a syntax error.
+    let start = script.find(&encoded).unwrap();
+    let payload = &script[start..start + encoded.len()];
+    assert!(!payload.contains('\n'), "no raw newline may appear in the literal");
+    assert!(script.contains("document.write"), "writes the document");
+    assert!(script.contains("plugin-x-y"), "carries the label");
+}
+
+#[test]
+fn the_app_window_bootstrap_carries_label_and_params() {
+    let script = dsh_wasm_studio_lib::studio::app_window_bootstrap("plugin-p-panel", r#"{"id":42}"#);
+    assert!(script.contains("plugin-p-panel"));
+    assert!(script.contains("42"));
+    assert!(script.contains("__STUDIO_WINDOW__"));
+}
+
+#[tokio::test]
+async fn params_are_queued_until_the_window_opens() {
+    let dir = tmpdir("win-params");
+    let decl = r#"{"name":"p","abi":1,"tools":[],"ui":{
+        "windows":[{"name":"panel","component":"Panel"}]}}"#;
+    let wasm = dir.join("p.wasm");
+    std::fs::write(&wasm, wasm_ui_plugin("p", decl)).unwrap();
+
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    studio.mount_slot("p", &wasm.display().to_string(), json!(null)).await.unwrap();
+
+    // Queue params, then read them back (headless has no window to open).
+    studio.queue_window_params("plugin-p-panel", json!({ "sel": "x" }));
+    let got = studio.peek_pending_params("plugin-p-panel");
+    assert_eq!(got, Some(json!({ "sel": "x" })));
+    // Taking delivers and clears exactly once.
+    assert_eq!(studio.take_pending_params("plugin-p-panel"), Some(json!({ "sel": "x" })));
+    assert_eq!(studio.take_pending_params("plugin-p-panel"), None);
+}

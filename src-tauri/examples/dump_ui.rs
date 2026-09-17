@@ -68,9 +68,15 @@ fn main() -> anyhow::Result<()> {
     eprintln!("--- declared plugin windows ---");
     for w in studio.plugin_windows() {
         eprintln!(
-            "  label={:<32} slot={:<14} component={:<12} open={}",
-            w.label, w.slot, w.component, w.open
+            "  label={:<34} content={:<5} component={:<12} open={}",
+            w.label, w.content, w.component, w.open
         );
+        if w.content == "html" {
+            match studio.window_html(&w.label) {
+                Some(h) => eprintln!("      html: {} bytes", h.len()),
+                None => eprintln!("      html: MISSING"),
+            }
+        }
     }
 
     // Mirror `commands::ui_contributions` exactly.

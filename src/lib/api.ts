@@ -187,6 +187,8 @@ export interface PluginWindow {
   height: number;
   /** `auto` (host opens on activate) or `manual`. */
   open: string;
+  /** `app` (render the declared component) or `html` (a standalone page). */
+  content: "app" | "html";
 }
 
 /** Every window the running plugins declare. */
@@ -199,6 +201,18 @@ export const pluginWindowFor = (label: string) =>
 /** Open (or focus) a plugin window by label. */
 export const openPluginWindow = (label: string) =>
   invoke<void>("open_plugin_window", { label });
+
+/** Open a plugin window, passing JSON the window reads on startup. */
+export const openPluginWindowWith = (label: string, params?: unknown) =>
+  invoke<void>("open_plugin_window_with", { label, params: params ?? null });
+
+/** Push params to an already-open window (delivered as studio://window-params). */
+export const sendWindowParams = (label: string, params: unknown) =>
+  invoke<void>("send_window_params", { label, params });
+
+/** Close a plugin window. */
+export const closePluginWindow = (label: string) =>
+  invoke<void>("close_plugin_window", { label });
 
 // ---------------------------------------------------------------------------
 // Frontend UI contributions

@@ -30,6 +30,12 @@
         error = `no plugin declares a window labelled “${label}”`;
         return;
       }
+      // An `html` window is injected by the backend before this page would
+      // ever render; reaching here means the injection was skipped.
+      if (spec.content === "html") {
+        error = `“${label}” is a standalone HTML window — it should have been injected`;
+        return;
+      }
       // The plugin's entry.js must have run before its component exists.
       await pluginHost.sync();
       ready = true;

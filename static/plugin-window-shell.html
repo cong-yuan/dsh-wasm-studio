@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <!--
+      A blank shell for "html"-content plugin windows.
+
+      The plugin's own markup arrives via an initialization script that runs
+      before this document parses, so in practice this file is replaced before
+      anything paints. It exists so WebviewUrl::App has a valid target; if the
+      injection is somehow skipped, the notice below explains why.
+    -->
+    <title>Plugin window</title>
+    <style>
+      html, body { margin: 0; height: 100%; background: #0f0f0f; color: #ededed;
+        font-family: system-ui, -apple-system, sans-serif; }
+      .fallback { padding: 24px; color: #8f8f8f; font-size: 13px; }
+    </style>
+  </head>
+  <body>
+    <div class="fallback">
+      This window is filled by a plugin. If you can read this, the plugin's
+      content was not injected.
+    </div>
+  </body>
+</html>

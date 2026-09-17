@@ -331,7 +331,7 @@
   {:else}
     <table>
       <thead>
-        <tr><th>Window</th><th>Plugin</th><th>Component</th><th>Opens</th><th></th></tr>
+        <tr><th>Window</th><th>Plugin</th><th>Renders</th><th>Opens</th><th></th></tr>
       </thead>
       <tbody>
         {#each windows as w}
@@ -341,7 +341,14 @@
               <div class="mono faint" style="font-size: 10px;">{w.label}</div>
             </td>
             <td class="mono">{w.slot}</td>
-            <td class="mono faint">{w.component}</td>
+            <td>
+              {#if w.content === "html"}
+                <span class="badge">standalone html</span>
+              {:else}
+                <span class="badge">component</span>
+                <span class="mono faint" style="font-size: 11px;">{w.component}</span>
+              {/if}
+            </td>
             <td>
               {#if w.open === "auto"}
                 <span class="badge ok">auto</span>
@@ -360,7 +367,7 @@
                   }
                 }}
               >
-                open window
+                open
               </button>
             </td>
           </tr>

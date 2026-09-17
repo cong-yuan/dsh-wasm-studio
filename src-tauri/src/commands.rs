@@ -295,6 +295,32 @@ pub fn open_plugin_window(studio: State<'_, Studio>, label: String) -> Result<()
     studio.open_plugin_window(&label).map_err(err)
 }
 
+/// Open a plugin window, passing JSON params the window can read on startup.
+#[tauri::command]
+pub fn open_plugin_window_with(
+    studio: State<'_, Studio>,
+    label: String,
+    params: Option<Value>,
+) -> Result<(), String> {
+    studio.open_plugin_window_with(&label, params).map_err(err)
+}
+
+/// Push params to an already-open window (`studio://window-params` event).
+#[tauri::command]
+pub fn send_window_params(
+    studio: State<'_, Studio>,
+    label: String,
+    params: Value,
+) -> Result<(), String> {
+    studio.send_window_params(&label, params).map_err(err)
+}
+
+/// Close a plugin window by label.
+#[tauri::command]
+pub fn close_plugin_window(studio: State<'_, Studio>, label: String) -> Result<(), String> {
+    studio.close_plugin_window(&label).map_err(err)
+}
+
 // ---------------------------------------------------------------------------
 // Tools
 // ---------------------------------------------------------------------------

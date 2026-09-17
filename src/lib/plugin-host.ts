@@ -97,6 +97,22 @@ export interface StudioApi {
    * Returns a disposer; call it when that part of the DOM goes away.
    */
   renderSlot(slot: string, el: HTMLElement): () => void;
+  /**
+   * Open one of this plugin's declared windows, optionally passing params that
+   * the window reads on startup (`studio.windowParams()`).
+   *
+   * `name` is the plugin-local name from the `windows` declaration.
+   */
+  openWindow(name: string, params?: unknown): Promise<void>;
+  /** Close one of this plugin's windows (no-op if it is not open). */
+  closeWindow(name: string): Promise<void>;
+  /**
+   * The params this window was opened with, or `null` when it is the main
+   * window. Read once at component mount.
+   */
+  windowParams(): unknown;
+  /** The current window's label (`"main"` in the main window). */
+  windowLabel(): string;
   /** Unregister everything this plugin registered (called on unload). */
   dispose(): void;
 }
@@ -299,6 +315,21 @@ export class PluginHost {
       provideSlot: (n, d) => handle.provideSlot(n, d),
       inject: (s, c, pr) => handle.inject(s, c, pr),
       renderSlot: (name, el) => this.renderSlotInto(handle, name, el),
+      // A plugin names its windows locally; the host owns the namespacing.
+      openWindow: async (name, params) => {
+        const { openPluginWindowWith } = await import("./api.ts");
+        await openPluginWindowWith(pluginLabel(p.slot, name), params ?? null);
+      },
+      closeWindow: async (name) => {
+        const { closePluginWindow } = await import("./api.ts");
+        await closePluginWindow(pluginLabel(p.slot, name));
+      },
+      windowParams: () =>
+        (globalThis as { __STUDIO_WINDOW__?: { params?: unknown } }).__STUDIO_WINDOW__
+          ?.params ?? null,
+      windowLabel: () =>
+        (globalThis as { __STUDIO_WINDOW__?: { label?: string } }).__STUDIO_WINDOW__
+          ?.label ?? "main",
       dispose: () => handle.dispose(),
     };
     this.currentApi = api;
@@ -534,4 +565,11 @@ export class PluginHost {
   unmountAll(): void {
     for (const key of [...this.live.keys()]) this.unmount(key);
   }
+}
+
+/// Mirror of the Rust `Studio::window_label` sanitiser, so a plugin can open a
+/// window by its *local* name and get the same label the backend derived.
+function pluginLabel(slot: string, name: string): string {
+  const safe = (s: string) => s.replace(/[^a-zA-Z0-9_-]/g, "-");
+  return `plugin-${safe(slot)}-${safe(name)}`;
 }
