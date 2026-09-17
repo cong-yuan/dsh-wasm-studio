@@ -1,0 +1,309 @@
+/* ============================================================================
+ * qoder-theme.css — design tokens reconstructed from Qoder CN 0.2.5
+ *
+ * Values were resolved out of the shipped stylesheet (a Tailwind v4 build) by
+ * walking its theme variable graph down to literal colours. Names are given in
+ * the semantic convention Qoder itself uses, so utilities read like a sentence:
+ *
+ *     bg-bg-container   text-text-tertiary   border-border-quaternary
+ *
+ * Usage — markup just reads the variable:
+ *
+ *     .panel { background: var(--qs-bg-container);
+ *              color: var(--qs-text-secondary);
+ *              border: 1px solid var(--qs-border-tertiary); }
+ *
+ * Usage — Tailwind v4: uncomment the @theme bridge at the bottom and these
+ * become real utilities, identical in spelling to Qoder's own.
+ *
+ * Theme switching: the dark block keys off [data-theme~="dark"]. Qoder's rule
+ * is that every dark theme name ends in "-dark", which lets one selector cover
+ * them all — worth keeping if you add palettes.
+ * ========================================================================== */
+
+:root {
+  color-scheme: light;
+
+  /* --- Surface --- */
+  --qs-bg-base:#fff;        /* dark: #0e0e0e */
+  --qs-bg-container:#fff;   /* dark: #111110 */
+  --qs-bg-elevated:#f9f9f9;  /* dark: #22221f */
+  --qs-bg-highlight:#080807;  /* dark: #fff */
+  --qs-bg-layout:#fdfdfd;   /* dark: #111110 */
+  --qs-bg-spotlight:#fafafa;  /* dark: #22221f */
+
+  /* --- Text --- */
+  --qs-text:#141414;           /* dark: #eeeeeb */
+  --qs-text-on-primary:#fdfdfd;  /* dark: #080807 */
+  --qs-text-quaternary:#aaa9a8;  /* dark: #585853 */
+  --qs-text-secondary:#636261;  /* dark: #b4b4ac */
+  --qs-text-tertiary:#838280;  /* dark: #7b7b74 */
+
+  /* --- Border --- */
+  --qs-border:#bcbbba;           /* dark: #3b3a35 */
+  --qs-border-quaternary:#eee;   /* dark: #20201e */
+  --qs-border-secondary:#ddd;    /* dark: #31312d */
+  --qs-border-tertiary:#e6e6e6;  /* dark: #292926 */
+
+  /* --- Fill --- */
+  --qs-fill:#dfdfdf;               /* dark: #31312d */
+  --qs-fill-quaternary:#fcfcfc;    /* dark: #22221f */
+  --qs-fill-secondary:#efefef;     /* dark: #292926 */
+  --qs-fill-tertiary:#f6f6f6;      /* dark: #22221f */
+  --qs-fill-tertiary-glass:#7c7c7c14;
+
+  /* --- Semantic --- */
+  --qs-diff-insert:#aec8ba;         /* dark: #73cd94 */
+  --qs-error:#ec5b56;               /* dark: #ff4d4f */
+  --qs-info:#3b81e9;                /* dark: #0b83f1 */
+  --qs-info-hover:#76baf9;          /* dark: #5ebcff */
+  --qs-link:#4d9868;                /* dark: #8ee5a1 */
+  --qs-primary:#4b6f5a;             /* dark: #5cb870 */
+  --qs-primary-active:#3a5747;      /* dark: #73cd94 */
+  --qs-primary-bg:#f2f4f2;          /* dark: #14261c */
+  --qs-primary-bg-hover:#e8ecea;    /* dark: #1a2e21 */
+  --qs-primary-border:#d5dbd8;      /* dark: #335942 */
+  --qs-primary-border-hover:#bcc6c0;  /* dark: #407354 */
+  --qs-primary-hover:#436651;       /* dark: #9be6b3 */
+  --qs-primary-text:#4b6f5a;        /* dark: #8ee5a1 */
+  --qs-primary-text-active:#344c3e;  /* dark: #9be6b3 */
+  --qs-success:#579b6e;             /* dark: #73cd94 */
+  --qs-success-hover:#65af7e;       /* dark: #8ee5a1 */
+  --qs-warning:#efb041;             /* dark: #faad14 */
+
+  /* --- Tinted backgrounds --- */
+  --qs-blue-bg:#e1edfd;         /* dark: #132a40 */
+  --qs-button-raised-bg:#fff;   /* dark: #292926 */
+  --qs-error-bg:#fdf2f0;        /* dark: #4a1a1b */
+  --qs-info-bg:#e9f6fe;         /* dark: #1a2838 */
+  --qs-lavender-bg:#ebe4fd;     /* dark: #2a2140 */
+  --qs-mauve-bg:#f1f2f3;        /* dark: #2a2830 */
+  --qs-orange-bg:#fcf0e0;       /* dark: #3b2415 */
+  --qs-pink-bg:#f5e4f2;         /* dark: #3a1d2c */
+  --qs-purple-bg:#ebe9fd;       /* dark: #201d3d */
+  --qs-sage-bg:#f0f3f2;         /* dark: #1c2e25 */
+  --qs-slate-bg:#e3e8ef;        /* dark: #263141 */
+  --qs-success-bg:#ebf7f0;      /* dark: #14261c */
+  --qs-teal-bg:#e3f6f1;         /* dark: #12322e */
+  --qs-warning-bg:#fefbe8;      /* dark: #4a4019 */
+  --qs-yellow-bg:#fdf3d3;       /* dark: #4a4030 */
+
+  /* --- Palette --- */
+  --qs-blue:#3f8ef7;                /* dark: #4ba8ff */
+  --qs-error-border:#f7cec9;        /* dark: #663338 */
+  --qs-info-border:#bae2fc;         /* dark: #2a4050 */
+  --qs-info-border-hover:#98cffb;   /* dark: #354a5c */
+  --qs-lavender:#b49ef9;            /* dark: #c9b5ff */
+  --qs-mauve:#8e8c98;               /* dark: #b3b0bd */
+  --qs-orange:#ea873f;              /* dark: #fa8125 */
+  --qs-pink:#da5597;                /* dark: #f472b6 */
+  --qs-purple:#605ce5;              /* dark: #9b96ff */
+  --qs-sage:#7cb196;                /* dark: #8fc9ae */
+  --qs-slate:#20293a;               /* dark: #cbd5e1 */
+  --qs-success-border:#b3ddc2;      /* dark: #335942 */
+  --qs-success-border-hover:#90cea6;  /* dark: #407354 */
+  --qs-t-text-secondary:#636261;    /* dark: #b4b4ac */
+  --qs-teal:#55b5a6;                /* dark: #4dd4c4 */
+  --qs-warning-bg-hover:#fdf1be;    /* dark: #4a401f */
+  --qs-warning-border:#fbe6c3;      /* dark: #664d19 */
+  --qs-yellow:#f2c647;              /* dark: #fac414 */
+
+  /* --- Radius --- */
+  --qs-radius-xs: 2px;    /* 0.125rem */
+  --qs-radius-sm: 4px;    /* 0.25rem  */
+  --qs-radius-md: 6px;    /* 0.375rem */
+  --qs-radius-lg: 8px;    /* 0.5rem   */
+  --qs-radius-xl: 12px;   /* 0.75rem  */
+  --qs-radius-2xl: 16px;  /* 1rem     */
+
+  /* --- Typography (px, resolved from the type scale) --- */
+  --qs-font-sans: ui-sans-serif, system-ui, sans-serif, "Apple Color Emoji", "Segoe UI Emoji";
+  --qs-font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+  --qs-text-xs: 12px;    --qs-text-xs-lh: 16px;
+  --qs-text-sm: 14px;    --qs-text-sm-lh: 20px;
+  --qs-text-base: 16px;  --qs-text-base-lh: 24px;
+  --qs-text-lg: 18px;    --qs-text-lg-lh: 28px;
+  --qs-text-xl: 20px;    --qs-text-xl-lh: 28px;
+  --qs-text-2xl: 24px;   --qs-text-2xl-lh: 32px;
+  --qs-weight-normal: 400;
+  --qs-weight-medium: 500;
+  --qs-weight-semibold: 600;
+  --qs-weight-bold: 700;
+
+  /* --- Motion --- */
+  --qs-ease-out: cubic-bezier(0, 0, 0.2, 1);
+  --qs-ease-in-out: cubic-bezier(0.4, 0, 0.2, 1);
+  --qs-ease-spring: cubic-bezier(0.16, 1, 0.3, 1);
+  --qs-duration-fast: 120ms;
+  --qs-duration: 150ms;
+  --qs-duration-slow: 200ms;
+}
+
+/* Qoder's flagship dark palette.
+ * Selector: any theme whose name ENDS IN "dark" — the convention that keeps
+ * this block authored once instead of per palette. */
+[data-theme~="dark"] {
+  color-scheme: dark;
+
+  /* --- Surface --- */
+  --qs-bg-base: #0e0e0e;
+  --qs-bg-container: #111110;
+  --qs-bg-elevated: #22221f;
+  --qs-bg-highlight: #fff;
+  --qs-bg-layout: #111110;
+  --qs-bg-spotlight: #22221f;
+
+  /* --- Text --- */
+  --qs-text: #eeeeeb;
+  --qs-text-on-primary: #080807;
+  --qs-text-quaternary: #585853;
+  --qs-text-secondary: #b4b4ac;
+  --qs-text-tertiary: #7b7b74;
+
+  /* --- Border --- */
+  --qs-border: #3b3a35;
+  --qs-border-quaternary: #20201e;
+  --qs-border-secondary: #31312d;
+  --qs-border-tertiary: #292926;
+
+  /* --- Fill --- */
+  --qs-fill: #31312d;
+  --qs-fill-quaternary: #22221f;
+  --qs-fill-secondary: #292926;
+  --qs-fill-tertiary: #22221f;
+
+  /* --- Semantic --- */
+  --qs-diff-insert: #73cd94;
+  --qs-error: #ff4d4f;
+  --qs-info: #0b83f1;
+  --qs-info-hover: #5ebcff;
+  --qs-link: #8ee5a1;
+  --qs-primary: #5cb870;
+  --qs-primary-active: #73cd94;
+  --qs-primary-bg: #14261c;
+  --qs-primary-bg-hover: #1a2e21;
+  --qs-primary-border: #335942;
+  --qs-primary-border-hover: #407354;
+  --qs-primary-hover: #9be6b3;
+  --qs-primary-text: #8ee5a1;
+  --qs-primary-text-active: #9be6b3;
+  --qs-success: #73cd94;
+  --qs-success-hover: #8ee5a1;
+  --qs-warning: #faad14;
+
+  /* --- Tinted backgrounds --- */
+  --qs-blue-bg: #132a40;
+  --qs-button-raised-bg: #292926;
+  --qs-error-bg: #4a1a1b;
+  --qs-info-bg: #1a2838;
+  --qs-lavender-bg: #2a2140;
+  --qs-mauve-bg: #2a2830;
+  --qs-orange-bg: #3b2415;
+  --qs-pink-bg: #3a1d2c;
+  --qs-purple-bg: #201d3d;
+  --qs-sage-bg: #1c2e25;
+  --qs-slate-bg: #263141;
+  --qs-success-bg: #14261c;
+  --qs-teal-bg: #12322e;
+  --qs-warning-bg: #4a4019;
+  --qs-yellow-bg: #4a4030;
+
+  /* --- Palette --- */
+  --qs-blue: #4ba8ff;
+  --qs-error-border: #663338;
+  --qs-info-border: #2a4050;
+  --qs-info-border-hover: #354a5c;
+  --qs-lavender: #c9b5ff;
+  --qs-mauve: #b3b0bd;
+  --qs-orange: #fa8125;
+  --qs-pink: #f472b6;
+  --qs-purple: #9b96ff;
+  --qs-sage: #8fc9ae;
+  --qs-slate: #cbd5e1;
+  --qs-success-border: #335942;
+  --qs-success-border-hover: #407354;
+  --qs-t-text-secondary: #b4b4ac;
+  --qs-teal: #4dd4c4;
+  --qs-warning-bg-hover: #4a401f;
+  --qs-warning-border: #664d19;
+  --qs-yellow: #fac414;
+}
+
+/* ---------------------------------------------------------------------------
+ * Tailwind v4 bridge — uncomment to get Qoder-identical utility names:
+ *     bg-bg-container  text-text-tertiary  border-border-quaternary  ...
+ * ------------------------------------------------------------------------- */
+/*
+@theme inline {
+  --color-bg-base: var(--qs-bg-base);
+  --color-bg-container: var(--qs-bg-container);
+  --color-bg-elevated: var(--qs-bg-elevated);
+  --color-bg-highlight: var(--qs-bg-highlight);
+  --color-bg-layout: var(--qs-bg-layout);
+  --color-bg-spotlight: var(--qs-bg-spotlight);
+  --color-blue: var(--qs-blue);
+  --color-blue-bg: var(--qs-blue-bg);
+  --color-border: var(--qs-border);
+  --color-border-quaternary: var(--qs-border-quaternary);
+  --color-border-secondary: var(--qs-border-secondary);
+  --color-border-tertiary: var(--qs-border-tertiary);
+  --color-button-raised-bg: var(--qs-button-raised-bg);
+  --color-diff-insert: var(--qs-diff-insert);
+  --color-error: var(--qs-error);
+  --color-error-bg: var(--qs-error-bg);
+  --color-error-border: var(--qs-error-border);
+  --color-fill: var(--qs-fill);
+  --color-fill-quaternary: var(--qs-fill-quaternary);
+  --color-fill-secondary: var(--qs-fill-secondary);
+  --color-fill-tertiary: var(--qs-fill-tertiary);
+  --color-fill-tertiary-glass: var(--qs-fill-tertiary-glass);
+  --color-info: var(--qs-info);
+  --color-info-bg: var(--qs-info-bg);
+  --color-info-border: var(--qs-info-border);
+  --color-info-border-hover: var(--qs-info-border-hover);
+  --color-info-hover: var(--qs-info-hover);
+  --color-lavender: var(--qs-lavender);
+  --color-lavender-bg: var(--qs-lavender-bg);
+  --color-link: var(--qs-link);
+  --color-mauve: var(--qs-mauve);
+  --color-mauve-bg: var(--qs-mauve-bg);
+  --color-orange: var(--qs-orange);
+  --color-orange-bg: var(--qs-orange-bg);
+  --color-pink: var(--qs-pink);
+  --color-pink-bg: var(--qs-pink-bg);
+  --color-primary: var(--qs-primary);
+  --color-primary-active: var(--qs-primary-active);
+  --color-primary-bg: var(--qs-primary-bg);
+  --color-primary-bg-hover: var(--qs-primary-bg-hover);
+  --color-primary-border: var(--qs-primary-border);
+  --color-primary-border-hover: var(--qs-primary-border-hover);
+  --color-primary-hover: var(--qs-primary-hover);
+  --color-primary-text: var(--qs-primary-text);
+  --color-primary-text-active: var(--qs-primary-text-active);
+  --color-purple: var(--qs-purple);
+  --color-purple-bg: var(--qs-purple-bg);
+  --color-sage: var(--qs-sage);
+  --color-sage-bg: var(--qs-sage-bg);
+  --color-slate: var(--qs-slate);
+  --color-slate-bg: var(--qs-slate-bg);
+  --color-success: var(--qs-success);
+  --color-success-bg: var(--qs-success-bg);
+  --color-success-border: var(--qs-success-border);
+  --color-success-border-hover: var(--qs-success-border-hover);
+  --color-success-hover: var(--qs-success-hover);
+  --color-t-text-secondary: var(--qs-t-text-secondary);
+  --color-teal: var(--qs-teal);
+  --color-teal-bg: var(--qs-teal-bg);
+  --color-text: var(--qs-text);
+  --color-text-on-primary: var(--qs-text-on-primary);
+  --color-text-quaternary: var(--qs-text-quaternary);
+  --color-text-secondary: var(--qs-text-secondary);
+  --color-text-tertiary: var(--qs-text-tertiary);
+  --color-warning: var(--qs-warning);
+  --color-warning-bg: var(--qs-warning-bg);
+  --color-warning-bg-hover: var(--qs-warning-bg-hover);
+  --color-warning-border: var(--qs-warning-border);
+  --color-yellow: var(--qs-yellow);
+  --color-yellow-bg: var(--qs-yellow-bg);
+}
+*/
