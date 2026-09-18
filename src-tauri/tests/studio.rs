@@ -1576,7 +1576,7 @@ fn an_app_windows_url_targets_the_plugin_window_route() {
 
 #[tokio::test]
 async fn a_shells_slots_are_visible_to_later_plugins() {
-    // The `dsh-web-shell` design rests on this: the shell declares its slots, and
+    // The `hana-shell` design rests on this: the shell declares its slots, and
     // a plugin written later contributes to them without knowing anything about
     // the shell. If `provides` did not reach the frontend, every such
     // contribution would silently vanish — a feature-shaped hole with no error.
@@ -1584,8 +1584,8 @@ async fn a_shells_slots_are_visible_to_later_plugins() {
     let shell = r#"{"name":"shell","abi":1,"tools":[],"ui":{
         "assets":{"entry.js":"studio.register('S', () => {});"},
         "provides":[
-          {"name":"dsh-web.sidebar.items","description":"the sidebar list"},
-          {"name":"dsh-web.details.items","description":"right column body"}
+          {"name":"hana.sidebar.sessions","description":"the session list"},
+          {"name":"hana.rail.items","description":"right column body"}
         ],
         "windows":[{"name":"main","component":"S","open":"startup"}]}}"#;
     let wasm = dir.join("shell.wasm");
@@ -1600,7 +1600,7 @@ async fn a_shells_slots_are_visible_to_later_plugins() {
         .flat_map(|(_, ui)| ui.provides.iter().map(|p| p.name.clone()))
         .collect();
     assert!(
-        provided.contains(&"dsh-web.sidebar.items".to_string()),
+        provided.contains(&"hana.sidebar.sessions".to_string()),
         "the shell's slots must be declared, got {provided:?}"
     );
     assert_eq!(provided.len(), 2, "both slots, no more: {provided:?}");
@@ -1614,7 +1614,7 @@ async fn a_later_plugin_may_fill_a_slot_it_did_not_open() {
     let dir = tmpdir("shell-inject-later");
     let addon = r#"{"name":"addon","abi":1,"tools":[],"ui":{
         "assets":{"entry.js":"studio.register('A', () => {});"},
-        "injects":[{"slot":"dsh-web.sidebar.items","component":"A","priority":10}]}}"#;
+        "injects":[{"slot":"hana.sidebar.sessions","component":"A","priority":10}]}}"#;
     let wasm = dir.join("addon.wasm");
     std::fs::write(&wasm, wasm_ui_plugin("addon", addon)).unwrap();
 
@@ -1629,7 +1629,7 @@ async fn a_later_plugin_may_fill_a_slot_it_did_not_open() {
         .collect();
     assert_eq!(
         injects,
-        vec!["dsh-web.sidebar.items".to_string()],
+        vec!["hana.sidebar.sessions".to_string()],
         "the contribution must survive even though its slot is not open yet"
     );
 }
@@ -1641,15 +1641,15 @@ async fn the_shell_slots_a_panel_mounts_are_the_ones_it_declares() {
     // declared but never mounted is a contribution that goes nowhere — an
     // invisible failure, which is exactly why it needs a test.
     //
-    // The check is on the *shipped manifest*: load the real `dsh-web-shell.wasm`
-    // if it has been built, and assert every declared slot is a `dsh-web.` name.
+    // The check is on the *shipped manifest*: load the real `hana-shell.wasm`
+    // if it has been built, and assert every declared slot is a `hana.` name.
     // (Skipped when the plugin has not been built yet, so a fresh clone still
     // passes — the plugin is a demo, not a dependency.)
     let built = std::path::Path::new(
-        "/Users/yuan/wasm-plugin-host/target/wasm32-wasip1/release/dsh_web_shell.wasm",
+        "/Users/yuan/wasm-plugin-host/target/wasm32-wasip1/release/hana_shell.wasm",
     );
     if !built.exists() {
-        eprintln!("skipping: dsh-web-shell wasm not built");
+        eprintln!("skipping: hana-shell wasm not built");
         return;
     }
     let dir = tmpdir("shell-manifest");
@@ -1660,10 +1660,8 @@ async fn the_shell_slots_a_panel_mounts_are_the_ones_it_declares() {
         .unwrap();
 
     let decls = studio.host().ui_decls();
-    let provided: Vec<String> = decls
-        .iter()
-        .flat_map(|(_, ui)| ui.provides.iter().map(|p| p.name.clone()))
-        .collect();
+    let (_, ui) = &decls[0];
+    let provided: Vec<String> = ui.provides.iter().map(|p| p.name.clone()).collect();
 
     assert!(
         provided.len() >= 10,
@@ -1672,22 +1670,70 @@ async fn the_shell_slots_a_panel_mounts_are_the_ones_it_declares() {
     );
     for name in &provided {
         assert!(
-            name.starts_with("dsh-web."),
+            name.starts_with("hana."),
             "slot names stay in the shell's namespace: {name}"
         );
     }
     // The regions a plugin is most likely to want must be present, since the
     // names are the shell's public contract.
     for required in [
-        "dsh-web.sidebar.items",
-        "dsh-web.sidebar.footer",
-        "dsh-web.conversation.input.dock",
-        "dsh-web.details.items",
-        "dsh-web.shell.overlay",
+        "hana.titlebar.right",
+        "hana.sidebar.sessions",
+        "hana.sidebar.footer",
+        "hana.conversation.input.dock",
+        "hana.rail.items",
+        "hana.shell.overlay",
     ] {
         assert!(
             provided.iter().any(|p| p == required),
             "`{required}` is part of the contract but was not declared"
+        );
+    }
+
+    // **The declared list and the mounted list must be the same set.** A slot
+    // that is declared but never mounted is a contribution that goes nowhere —
+    // no error, no log, just a plugin that appears to do nothing. This is the
+    // failure the test is named for, so it checks the JS, not just the manifest:
+    // every `S.mount('hana.…')` in the shipped assets must correspond to a
+    // declared slot, and vice versa.
+    //
+    // (Found by exactly this check: `hana.rail.header` was declared in the Rust
+    // manifest but the rail panel never mounted it. Reading only the manifest
+    // would have missed it.)
+    let js: String = ui
+        .assets
+        .iter()
+        .filter(|(k, _)| k.ends_with(".js"))
+        .map(|(_, v)| v.as_str())
+        .collect::<Vec<_>>()
+        .join("\n");
+
+    let mut mounted: Vec<String> = Vec::new();
+    for marker in ["S.mount('", "studio.renderSlot('"] {
+        let mut rest = js.as_str();
+        while let Some(i) = rest.find(marker) {
+            rest = &rest[i + marker.len()..];
+            if let Some(end) = rest.find('\'') {
+                let name = &rest[..end];
+                if name.starts_with("hana.") && !mounted.iter().any(|m| m == name) {
+                    mounted.push(name.to_string());
+                }
+            }
+        }
+    }
+
+    for name in &provided {
+        assert!(
+            mounted.iter().any(|m| m == name),
+            "`{name}` is declared in the manifest but no panel mounts it — a \
+             contribution to it would silently go nowhere. mounted: {mounted:?}"
+        );
+    }
+    for name in &mounted {
+        assert!(
+            provided.iter().any(|p| p == name),
+            "`{name}` is mounted by a panel but not declared — a later plugin \
+             cannot target a slot the host does not know about. declared: {provided:?}"
         );
     }
 }
@@ -1700,10 +1746,10 @@ async fn the_shell_ships_every_module_its_entry_requires() {
     // nothing. `require` only sees assets that were declared, so a file that
     // exists but is not declared is invisible in a way nothing else catches.
     let built = std::path::Path::new(
-        "/Users/yuan/wasm-plugin-host/target/wasm32-wasip1/release/dsh_web_shell.wasm",
+        "/Users/yuan/wasm-plugin-host/target/wasm32-wasip1/release/hana_shell.wasm",
     );
     if !built.exists() {
-        eprintln!("skipping: dsh-web-shell wasm not built");
+        eprintln!("skipping: hana-shell wasm not built");
         return;
     }
     let dir = tmpdir("shell-assets");
