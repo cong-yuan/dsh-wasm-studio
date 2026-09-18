@@ -1767,7 +1767,7 @@ async fn the_shell_ships_every_module_its_entry_requires() {
 
     // Every module `entry.js` reaches for must be present, transitively: the
     // panels require siblings too.
-    for required in ["lib/tokens.js", "lib/motion.js", "lib/dom.js", "lib/slots.js"] {
+    for required in ["lib/tokens.js", "lib/motion.js", "lib/dom.js", "lib/slots.js", "lib/resize.js"] {
         assert!(
             assets.iter().any(|a| a == required),
             "`{required}` is required by the shell but not among its assets: {assets:?}"
