@@ -57,7 +57,11 @@
       return;
     }
     dispose?.();
-    dispose = pluginHost.mountComponent(s.slot, s.component, `__window__${s.label}`, el);
+    // `fill` because a window component owns the window: its `height: 100%`
+    // needs to resolve against something with a real height.
+    dispose = pluginHost.mountComponent(s.slot, s.component, `__window__${s.label}`, el, {
+      fill: true,
+    });
     return () => {
       dispose?.();
       dispose = null;
@@ -65,40 +69,39 @@
   });
 </script>
 
-<div class="plugin-window">
-  {#if error}
-    <div class="notice err" style="margin: 24px;">{error}</div>
-  {:else if !spec}
-    <div class="empty" style="margin: 24px;">loading plugin window…</div>
-  {:else}
-    <header class="win-head">
-      <span class="mono faint" style="font-size: 11px;">
-        {spec.slot} → {spec.component}
-      </span>
-      <span class="spacer"></span>
-    </header>
-    <div class="win-body" bind:this={container}></div>
-  {/if}
-</div>
+<!--
+  A plugin window is the plugin's own surface. The host contributes NOTHING
+  here — no header, no padding, no background — because a plugin that declares
+  a window is drawing the whole thing itself (see `lib/slots.js` in the shell).
+
+  This used to wrap the plugin in a `win-head` bar naming `slot → component`
+  plus 16px of padding on a `--bg-canvas` background. The result was a black
+  frame around every plugin window and a strip of host chrome above it. Both
+  were host rendering choices the plugin could not override, and both are gone.
+
+  If you need to know what a window renders, its title says it, and the Plugins
+  page lists every window with its owner. A strip of debug chrome is not worth
+  a visible defect in every window.
+-->
+{#if error}
+  <div class="notice err">{error}</div>
+{:else if !spec}
+  <div class="empty">loading plugin window…</div>
+{:else}
+  <div class="win-body" bind:this={container}></div>
+{/if}
 
 <style>
-  .plugin-window {
-    display: flex;
-    flex-direction: column;
-    height: 100vh;
-    background: var(--bg-canvas);
-    color: var(--text);
-  }
-  .win-head {
-    display: flex;
-    align-items: center;
-    padding: 8px 14px;
-    border-bottom: 1px solid var(--border);
-    background: var(--bg-panel);
-  }
+  /* The plugin owns the window: fill it, add nothing, and let the plugin's own
+     stylesheet decide the background. `100%` rather than `100vh` so the chain
+     from the layout is what sets the size — a second `100vh` here would be a
+     different number to debug if a scrollbar appears. */
   .win-body {
-    flex: 1;
+    height: 100%;
     overflow: auto;
-    padding: 16px;
+  }
+  .notice,
+  .empty {
+    margin: 24px;
   }
 </style>

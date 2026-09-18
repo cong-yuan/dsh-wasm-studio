@@ -18,6 +18,8 @@ class FakeEl {
   children: FakeEl[] = [];
   textContent = "";
   dataset: Record<string, string> = {};
+  /** Enough of `style` for the host's own use (it sets `height`). */
+  style: Record<string, string> = {};
   removed = false;
   /** Set by appendChild so remove() can detach for real (like the DOM). */
   parent: FakeEl | null = null;
@@ -932,4 +934,49 @@ test("a route conflict is reported and does not stop the other plugin loading", 
   } finally {
     console.error = orig;
   }
+});
+
+// ---------------------------------------------------------------------------
+// A window component must be able to fill its window
+// ---------------------------------------------------------------------------
+
+test("a window mount gives its wrapper a height, a route mount does not", async () => {
+  // A component's own `height: 100%` resolves against the wrapper the host
+  // inserts. That wrapper is a plain div, so without an explicit height it is
+  // `auto` — and a window component asking to fill its window fills only its
+  // content. It looks fine until the content is short, which is exactly the
+  // kind of defect that survives a visual check.
+  //
+  // The same wrapper is used for route components, where `100%` is wrong
+  // (it would pin a scrolling page to the viewport), so it is opt-in.
+  const parent = new FakeEl("div");
+  const host = new PluginHost(fakeDom(), async () => [
+    {
+      slot: "s",
+      provides_slots: [],
+      injects_slots: [],
+      assets: {
+        "entry.js": "studio.register('W', (el) => { el.textContent = 'w'; });",
+      },
+    },
+  ]);
+  await host.sync();
+
+  const routeParent = new FakeEl("div");
+  host.mountComponent("s", "W", "route-1", routeParent as unknown as HTMLElement);
+  const routeWrapper = routeParent.children[0] as unknown as { style: Record<string, string> };
+  assert.notEqual(
+    routeWrapper.style.height,
+    "100%",
+    "a route component must not be pinned to the viewport height",
+  );
+
+  const winParent = new FakeEl("div");
+  host.mountComponent("s", "W", "win-1", winParent as unknown as HTMLElement, { fill: true });
+  const winWrapper = winParent.children[0] as unknown as { style: Record<string, string> };
+  assert.equal(
+    winWrapper.style.height,
+    "100%",
+    "a window component must be able to fill the window",
+  );
 });

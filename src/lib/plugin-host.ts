@@ -698,6 +698,7 @@ export class PluginHost {
     name: string,
     key: string,
     el: HTMLElement,
+    opts?: { fill?: boolean },
   ): () => void {
     const factory = this.factoryForComponent(owner, name);
     if (!factory) return () => {};
@@ -707,6 +708,15 @@ export class PluginHost {
     const wrapper = this.dom.createElement("div");
     wrapper.dataset.plugin = owner;
     wrapper.dataset.component = name;
+    // This wrapper only exists to tag the mount, and it must not constrain the
+    // component — but `height: 100%` in a component's own stylesheet resolves
+    // against *this* div, whose height would otherwise be `auto`. A window
+    // component asking to fill its window would then fill only its content.
+    //
+    // Opt-in, not automatic: a **route** component is placed in a scrolling
+    // page where `100%` is wrong (it would pin the content to the viewport).
+    // The caller knows which it is.
+    if (opts?.fill) wrapper.style.height = "100%";
     el.appendChild(wrapper);
     // Same containment as `mount`: a window component is plugin JS too, and a
     // throw must not leave an orphaned wrapper behind.
