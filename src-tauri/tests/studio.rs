@@ -1569,3 +1569,125 @@ fn an_app_windows_url_targets_the_plugin_window_route() {
         "the window still needs its label: {path}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The shell's slot surface: a plugin opens slots, another plugin fills them
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_shells_slots_are_visible_to_later_plugins() {
+    // The `dsh-web-shell` design rests on this: the shell declares its slots, and
+    // a plugin written later contributes to them without knowing anything about
+    // the shell. If `provides` did not reach the frontend, every such
+    // contribution would silently vanish — a feature-shaped hole with no error.
+    let dir = tmpdir("shell-slots");
+    let shell = r#"{"name":"shell","abi":1,"tools":[],"ui":{
+        "assets":{"entry.js":"studio.register('S', () => {});"},
+        "provides":[
+          {"name":"dsh-web.sidebar.items","description":"the sidebar list"},
+          {"name":"dsh-web.details.items","description":"right column body"}
+        ],
+        "windows":[{"name":"main","component":"S","open":"startup"}]}}"#;
+    let wasm = dir.join("shell.wasm");
+    std::fs::write(&wasm, wasm_ui_plugin("shell", shell)).unwrap();
+
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    studio.mount_slot("shell", &wasm.display().to_string(), json!(null)).await.unwrap();
+
+    let decls = studio.host().ui_decls();
+    let provided: Vec<String> = decls
+        .iter()
+        .flat_map(|(_, ui)| ui.provides.iter().map(|p| p.name.clone()))
+        .collect();
+    assert!(
+        provided.contains(&"dsh-web.sidebar.items".to_string()),
+        "the shell's slots must be declared, got {provided:?}"
+    );
+    assert_eq!(provided.len(), 2, "both slots, no more: {provided:?}");
+}
+
+#[tokio::test]
+async fn a_later_plugin_may_fill_a_slot_it_did_not_open() {
+    // Order-independence is the property that makes the slot system usable: a
+    // plugin may be loaded before the shell that opens the slot it wants, so the
+    // contribution has to be *remembered* rather than dropped.
+    let dir = tmpdir("shell-inject-later");
+    let addon = r#"{"name":"addon","abi":1,"tools":[],"ui":{
+        "assets":{"entry.js":"studio.register('A', () => {});"},
+        "injects":[{"slot":"dsh-web.sidebar.items","component":"A","priority":10}]}}"#;
+    let wasm = dir.join("addon.wasm");
+    std::fs::write(&wasm, wasm_ui_plugin("addon", addon)).unwrap();
+
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    // Mount the *contributor* first — the slot it targets does not exist yet.
+    studio.mount_slot("addon", &wasm.display().to_string(), json!(null)).await.unwrap();
+
+    let decls = studio.host().ui_decls();
+    let injects: Vec<String> = decls
+        .iter()
+        .flat_map(|(_, ui)| ui.injects.iter().map(|i| i.slot.clone()))
+        .collect();
+    assert_eq!(
+        injects,
+        vec!["dsh-web.sidebar.items".to_string()],
+        "the contribution must survive even though its slot is not open yet"
+    );
+}
+
+#[tokio::test]
+async fn the_shell_slots_a_panel_mounts_are_the_ones_it_declares() {
+    // The shell declares its slots in Rust (`provides`) AND mounts them in JS
+    // (`studio.renderSlot`). Those two lists can drift, and a slot that is
+    // declared but never mounted is a contribution that goes nowhere — an
+    // invisible failure, which is exactly why it needs a test.
+    //
+    // The check is on the *shipped manifest*: load the real `dsh-web-shell.wasm`
+    // if it has been built, and assert every declared slot is a `dsh-web.` name.
+    // (Skipped when the plugin has not been built yet, so a fresh clone still
+    // passes — the plugin is a demo, not a dependency.)
+    let built = std::path::Path::new(
+        "/Users/yuan/wasm-plugin-host/target/wasm32-wasip1/release/dsh_web_shell.wasm",
+    );
+    if !built.exists() {
+        eprintln!("skipping: dsh-web-shell wasm not built");
+        return;
+    }
+    let dir = tmpdir("shell-manifest");
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    studio
+        .mount_slot("shell", &built.display().to_string(), json!(null))
+        .await
+        .unwrap();
+
+    let decls = studio.host().ui_decls();
+    let provided: Vec<String> = decls
+        .iter()
+        .flat_map(|(_, ui)| ui.provides.iter().map(|p| p.name.clone()))
+        .collect();
+
+    assert!(
+        provided.len() >= 10,
+        "the shell must open a slot per layout region, found {}: {provided:?}",
+        provided.len()
+    );
+    for name in &provided {
+        assert!(
+            name.starts_with("dsh-web."),
+            "slot names stay in the shell's namespace: {name}"
+        );
+    }
+    // The regions a plugin is most likely to want must be present, since the
+    // names are the shell's public contract.
+    for required in [
+        "dsh-web.sidebar.items",
+        "dsh-web.sidebar.footer",
+        "dsh-web.conversation.input.dock",
+        "dsh-web.details.items",
+        "dsh-web.shell.overlay",
+    ] {
+        assert!(
+            provided.iter().any(|p| p == required),
+            "`{required}` is part of the contract but was not declared"
+        );
+    }
+}
