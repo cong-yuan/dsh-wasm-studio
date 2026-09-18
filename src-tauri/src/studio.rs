@@ -1140,10 +1140,22 @@ impl Studio {
     fn window_url(&self, spec: &PluginWindow) -> tauri::WebviewUrl {
         match spec.content.as_str() {
             "html" => tauri::WebviewUrl::App("plugin-window-shell.html".into()),
-            _ => tauri::WebviewUrl::App(
-                format!("index.html?plugin-window={}", spec.label).into(),
-            ),
+            _ => tauri::WebviewUrl::App(Self::app_window_path(&spec.label).into()),
         }
+    }
+
+    /// The route an `app` window loads, as a path the SPA router can resolve.
+    ///
+    /// Split out (and public) because it is a **contract with the frontend**,
+    /// not an implementation detail: the SPA routes on *pathname*, so this must
+    /// name the route that renders a plugin component full-window. It used to
+    /// be `index.html?plugin-window=<label>`, which silently did not work —
+    /// `/index.html` matches the `[...plugin]` catch-all, so the plugin-window
+    /// route never mounted and the window came up **blank**, while every
+    /// headless test passed because they exercised the backend lookup, never
+    /// the URL. Keeping it a plain function is what makes that testable.
+    pub fn app_window_path(label: &str) -> String {
+        format!("plugin-window?label={label}")
     }
 
     /// The plugin-supplied HTML for an `html` window, if declared.

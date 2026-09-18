@@ -1545,3 +1545,27 @@ async fn a_plugin_that_only_uses_auto_does_not_claim_the_startup_window() {
         "an `auto` window is not a startup window"
     );
 }
+
+#[test]
+fn an_app_windows_url_targets_the_plugin_window_route() {
+    // Regression: the URL used to be `index.html?plugin-window=<label>`. The SPA
+    // routes on *pathname*, so that matched the `[...plugin]` catch-all; the
+    // plugin-window route never mounted, `plugin_window_for` was never called,
+    // and the window came up **blank** — while every headless test passed, since
+    // they checked the backend lookup and never the URL.
+    let path = Studio::app_window_path("plugin-p-board");
+
+    let route = path.split('?').next().unwrap();
+    assert_eq!(
+        route, "plugin-window",
+        "the pathname must be the route that renders plugin components"
+    );
+    assert!(
+        !route.ends_with(".html"),
+        "a file URL would be resolved by the static handler, not the router"
+    );
+    assert!(
+        path.contains("label=plugin-p-board"),
+        "the window still needs its label: {path}"
+    );
+}
