@@ -1691,3 +1691,45 @@ async fn the_shell_slots_a_panel_mounts_are_the_ones_it_declares() {
         );
     }
 }
+
+#[tokio::test]
+async fn the_shell_ships_every_module_its_entry_requires() {
+    // Regression: `lib/motion.js` existed on disk but was missing from the
+    // plugin's `assets`, so the host never received it and
+    // `studio.require('lib/motion')` threw at load — the whole shell rendered
+    // nothing. `require` only sees assets that were declared, so a file that
+    // exists but is not declared is invisible in a way nothing else catches.
+    let built = std::path::Path::new(
+        "/Users/yuan/wasm-plugin-host/target/wasm32-wasip1/release/dsh_web_shell.wasm",
+    );
+    if !built.exists() {
+        eprintln!("skipping: dsh-web-shell wasm not built");
+        return;
+    }
+    let dir = tmpdir("shell-assets");
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    studio
+        .mount_slot("shell", &built.display().to_string(), json!(null))
+        .await
+        .unwrap();
+
+    let decls = studio.host().ui_decls();
+    let assets: Vec<String> = decls
+        .iter()
+        .flat_map(|(_, ui)| ui.assets.keys().cloned())
+        .collect();
+
+    // Every module `entry.js` reaches for must be present, transitively: the
+    // panels require siblings too.
+    for required in ["lib/tokens.js", "lib/motion.js", "lib/dom.js", "lib/slots.js"] {
+        assert!(
+            assets.iter().any(|a| a == required),
+            "`{required}` is required by the shell but not among its assets: {assets:?}"
+        );
+    }
+    assert!(
+        assets.iter().any(|a| a == "style.css"),
+        "the stylesheet carries the whole look and must ship: {assets:?}"
+    );
+    assert!(assets.iter().any(|a| a == "entry.js"), "entry.js must ship");
+}
