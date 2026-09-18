@@ -185,7 +185,7 @@ export interface PluginWindow {
   title: string;
   width: number;
   height: number;
-  /** `auto` (host opens on activate) or `manual`. */
+  /** `startup` (owns the launch view), `auto` (opens on activate), or `manual`. */
   open: string;
   /** `app` (render the declared component) or `html` (a standalone page). */
   content: "app" | "html";

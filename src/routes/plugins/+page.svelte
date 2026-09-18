@@ -350,7 +350,9 @@
               {/if}
             </td>
             <td>
-              {#if w.open === "auto"}
+              {#if w.open === "startup"}
+                <span class="badge ok">startup</span>
+              {:else if w.open === "auto"}
                 <span class="badge ok">auto</span>
               {:else}
                 <span class="badge">manual</span>

@@ -89,6 +89,12 @@ struct Shared {
     /// Params to hand a window when it opens or is next focused: label -> JSON.
     /// Cleared once delivered.
     pending_params: Mutex<std::collections::HashMap<String, serde_json::Value>>,
+    /// Windows a plugin asked to open, that could not be opened **yet** because
+    /// no app handle existed. Boot autoloads plugins before the Tauri handle is
+    /// installed, so `open: "auto"` windows are requested while there is still
+    /// nothing to open them with. Keeping the *intent* — not just the effect —
+    /// lets the startup path replay it once the handle exists.
+    wanted_windows: Mutex<Vec<String>>,
     /// slot -> its cordis fiber (the slot's own plugin instance).
     mounted: Mutex<Vec<(String, FiberHandle)>>,
     /// The single shared flow-bridge fiber.
@@ -112,6 +118,13 @@ pub struct Studio {
 }
 
 type FiberHandle = cordis::FiberHandle;
+
+/// The label Tauri gives the app's own window (see `tauri.conf.json`).
+///
+/// It is created **hidden** so a plugin owning the launch view never lets the
+/// default page flash first; [`Studio::apply_startup_windows`] is what puts a
+/// window on screen.
+const MAIN_LABEL: &str = "main";
 
 impl Studio {
     /// Build a studio with an explicit log hook and app-data directory.
@@ -194,6 +207,7 @@ impl Studio {
                 app: Mutex::new(None),
                 open_windows: Mutex::new(std::collections::HashMap::new()),
                 pending_params: Mutex::new(std::collections::HashMap::new()),
+                wanted_windows: Mutex::new(Vec::new()),
                 mounted: Mutex::new(Vec::new()),
                 bridge: Mutex::new(Some(bridge)),
                 plugins_dir,
@@ -238,6 +252,13 @@ impl Studio {
 
         // Remember the handle so plugin windows can be created/closed later.
         *studio.shared.app.lock().unwrap() = Some(app.clone());
+
+        // Now that a handle exists, decide what the user actually sees: a
+        // plugin's startup window if one claims it, otherwise the app window.
+        // This must come after the handle is installed — plugin windows cannot
+        // be created without it, and autoload (inside `with_hook`) has already
+        // queued the `auto` windows that were requested before that point.
+        studio.apply_startup_windows(app);
 
         // Start the filesystem watcher (best-effort; the app works without it).
         studio.start_watch();
@@ -967,6 +988,7 @@ impl Studio {
                     open: match w.open {
                         wasm_plugin_host::WindowOpen::Auto => "auto",
                         wasm_plugin_host::WindowOpen::Manual => "manual",
+                        wasm_plugin_host::WindowOpen::Startup => "startup",
                     }
                     .to_string(),
                     content: match w.content {
@@ -1183,11 +1205,119 @@ impl Studio {
     fn open_auto_windows(&self, slot: &str) {
         for w in self.plugin_windows() {
             if w.slot == slot && w.open == "auto" {
-                if let Err(e) = self.open_plugin_window(&w.label) {
-                    eprintln!("[studio] auto-open window `{}` failed: {e}", w.label);
-                }
+                self.request_window(&w.label);
             }
         }
+    }
+
+    /// Record that `label` should be open, and open it if we already can.
+    ///
+    /// During boot we cannot: the app handle is installed *after* plugins
+    /// autoload. Recording intent and replaying it later (see
+    /// [`apply_startup_windows`](Self::apply_startup_windows)) is what makes an
+    /// `auto` window actually appear at launch instead of failing silently.
+    fn request_window(&self, label: &str) {
+        {
+            let mut wanted = self.shared.wanted_windows.lock().unwrap();
+            if !wanted.iter().any(|l| l == label) {
+                wanted.push(label.to_string());
+            }
+        }
+        self.drain_wanted_windows();
+    }
+
+    /// Open every requested-but-not-yet-serviced window, now that a handle may
+    /// exist. A no-op without an app handle, so the intent survives until boot
+    /// can replay it (this is also what makes the request observable in tests).
+    fn drain_wanted_windows(&self) {
+        if self.shared.app.lock().unwrap().is_none() {
+            return;
+        }
+        let labels: Vec<String> = std::mem::take(&mut *self.shared.wanted_windows.lock().unwrap());
+        for label in labels {
+            if let Err(e) = self.open_plugin_window(&label) {
+                eprintln!("[studio] opening requested window `{label}` failed: {e}");
+            }
+        }
+    }
+
+    /// Windows plugins asked to open at mount time that have not been opened
+    /// yet. Non-empty after a headless mount; drained once a real app handle
+    /// exists. Exposed so the startup path can be tested without a window.
+    pub fn windows_wanted_at_mount(&self) -> Vec<String> {
+        self.shared.wanted_windows.lock().unwrap().clone()
+    }
+
+    /// The window the app should open **at launch, instead of its own default
+    /// view**, if a plugin claims it.
+    ///
+    /// `Ok(None)` means no plugin asks for it — show the app's normal window.
+    /// Two claimants is an error rather than a coin flip (see
+    /// `WindowOpen::Startup`): "which window starts" has exactly one answer.
+    pub fn startup_window(&self) -> Result<Option<PluginWindow>> {
+        let mut found: Vec<PluginWindow> = self
+            .plugin_windows()
+            .into_iter()
+            .filter(|w| w.open == "startup")
+            .collect();
+        match found.len() {
+            0 => Ok(None),
+            1 => Ok(Some(found.remove(0))),
+            n => Err(anyhow::anyhow!(
+                "{n} plugins declare a startup window ({}); only one may own the \
+                 launch view — the winner would otherwise depend on load order",
+                found
+                    .iter()
+                    .map(|w| w.label.clone())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            )),
+        }
+    }
+
+    /// Decide which window the user actually sees at launch.
+    ///
+    /// Called once from [`Studio::boot`], after the app handle exists — the
+    /// point where window requests that were queued during autoload can finally
+    /// become windows. The app's own window starts hidden (see
+    /// `tauri.conf.json`), so a plugin that claims the launch view never lets
+    /// the default page flash first.
+    ///
+    /// **It always ends with a window on screen.** A startup window that fails
+    /// to open falls back to the app's own window rather than leaving the user
+    /// with nothing.
+    pub fn apply_startup_windows(&self, app: &tauri::AppHandle) {
+        use tauri::Manager;
+
+        let mut main_hidden = false;
+        match self.startup_window() {
+            Ok(Some(sw)) => match self.open_plugin_window(&sw.label) {
+                Ok(()) => {
+                    if let Some(main) = app.get_webview_window(MAIN_LABEL) {
+                        let _ = main.hide();
+                        main_hidden = true;
+                    }
+                }
+                Err(e) => eprintln!(
+                    "[studio] startup window `{}` failed to open ({e}); \
+                     falling back to the app window",
+                    sw.label
+                ),
+            },
+            Ok(None) => {}
+            Err(e) => eprintln!("[studio] {e}"),
+        }
+
+        // No plugin claimed the launch view, or the claim could not be honoured:
+        // the app's own window is the view.
+        if !main_hidden {
+            if let Some(main) = app.get_webview_window(MAIN_LABEL) {
+                let _ = main.show();
+            }
+        }
+
+        // `auto` windows a plugin asked for at mount time are still queued.
+        self.drain_wanted_windows();
     }
 
     // -----------------------------------------------------------------------

@@ -17,18 +17,79 @@ pub mod studio;
 use studio::Studio;
 use tauri::Manager;
 
+/// Is *any* window currently on screen?
+///
+/// The app's own window starts hidden so a plugin owning the launch view does
+/// not let the default page flash first. `Studio::boot` guarantees it shows
+/// exactly one window, so this is a backstop for the catastrophic case only:
+/// if boot somehow left nothing visible, a user would have no way to interact
+/// with the app at all. A window we cannot query counts as not visible.
+fn any_window_is_visible(app: &tauri::AppHandle) -> bool {
+    use tauri::Manager;
+    app.webview_windows()
+        .values()
+        .any(|w| w.is_visible().unwrap_or(false))
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
         .plugin(tauri_plugin_dialog::init())
         .setup(|app| {
+            use tauri::Manager;
+
             // Boot the harness + WASM host once, and keep it as managed state.
             let handle = app.handle().clone();
-            let studio = Studio::boot(&handle)
-                .map_err(|e| format!("studio failed to boot: {e}"))?;
+            let studio = match Studio::boot(&handle) {
+                Ok(s) => s,
+                Err(e) => {
+                    // The app window starts hidden (a plugin may own the launch
+                    // view), and setup errors panic — so show the window and a
+                    // readable reason before that happens, rather than exiting
+                    // with no window ever having appeared.
+                    if let Some(main) = handle.get_webview_window("main") {
+                        let _ = main.set_title(&format!("WASM Studio — boot failed: {e}"));
+                        let _ = main.show();
+                    }
+                    return Err(format!("studio failed to boot: {e}").into());
+                }
+            };
+
+            // Last line of defence for the hidden `main` window: if boot left
+            // nothing visible (a plugin window failed to open, say), show the
+            // app window. A user must never be left with no window at all.
+            if !any_window_is_visible(&handle) {
+                if let Some(main) = handle.get_webview_window("main") {
+                    let _ = main.show();
+                }
+            }
+
             app.manage(studio);
             Ok(())
+        })
+        .on_window_event(|window, event| {
+            // If the window owning the launch view is closed, the hidden app
+            // window becomes the only thing left — and it is hidden. Reveal it,
+            // so closing a plugin window returns the user to the app instead of
+            // leaving a process with nothing on screen.
+            //
+            // The closed window must not *be* main: the user closing the app
+            // window means close it, not re-open it. Without this guard the
+            // handler sees "nothing visible" (main is on its way out) and calls
+            // `show()` on the very window being destroyed — harmless today, but
+            // wrong, and it logged a fallback that never happened.
+            if let tauri::WindowEvent::Destroyed = event {
+                let app = window.app_handle();
+                let label = window.label().to_string();
+                if label != "main" && !any_window_is_visible(app) {
+                    if let Some(main) = app.get_webview_window("main") {
+                        let _ = main.show();
+                        let _ = main.set_focus();
+                    }
+                    eprintln!("[studio] window `{label}` was the last one; showing the app window");
+                }
+            }
         })
         .invoke_handler(tauri::generate_handler![
             commands::studio_status,

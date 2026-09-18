@@ -1441,3 +1441,107 @@ async fn a_slot_that_cannot_settle_still_loads() {
     assert_eq!(tool_count, 0);
 }
 
+
+// ---------------------------------------------------------------------------
+// Startup window: which window the app opens *instead of* its default view
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_plugin_can_declare_the_startup_window() {
+    let dir = tmpdir("startup-decl");
+    let decl = r#"{"name":"p","abi":1,"tools":[],"ui":{
+        "assets":{"entry.js":"studio.register('Board', () => {});"},
+        "windows":[
+          {"name":"board","component":"Board","open":"startup"},
+          {"name":"side","component":"Board","open":"manual"}
+        ]}}"#;
+    let wasm = dir.join("p.wasm");
+    std::fs::write(&wasm, wasm_ui_plugin("p", decl)).unwrap();
+
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    studio.mount_slot("p", &wasm.display().to_string(), json!(null)).await.unwrap();
+
+    let sw = studio
+        .startup_window()
+        .expect("one startup window is not a conflict")
+        .expect("a startup window is declared");
+    assert_eq!(sw.name, "board");
+    assert_eq!(sw.label, "plugin-p-board");
+    assert_eq!(sw.open, "startup");
+}
+
+#[tokio::test]
+async fn auto_windows_are_attempted_at_mount_time() {
+    // Regression: `boot` installed the app handle *after* `with_hook` had
+    // already autoloaded plugins (and thus tried to open their `open:"auto"`
+    // windows). The handle was still None, so every auto window silently
+    // failed with "no app handle". Headless, we cannot create a window — but we
+    // CAN assert the attempt was made, which is what was missing.
+    let dir = tmpdir("auto-attempt");
+    let decl = r#"{"name":"p","abi":1,"tools":[],"ui":{
+        "assets":{"entry.js":"studio.register('X', () => {});"},
+        "windows":[{"name":"dash","component":"X","open":"auto"}]}}"#;
+    let wasm = dir.join("p.wasm");
+    std::fs::write(&wasm, wasm_ui_plugin("p", decl)).unwrap();
+
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    studio.mount_slot("p", &wasm.display().to_string(), json!(null)).await.unwrap();
+
+    // Headless there is no window to open, but the request must have been
+    // recorded — that is the record the startup path replays once a real app
+    // handle exists.
+    let wants = studio.windows_wanted_at_mount();
+    assert_eq!(
+        wants,
+        vec!["plugin-p-dash".to_string()],
+        "an auto window must be recorded at mount time, even headless"
+    );
+}
+
+#[tokio::test]
+async fn two_plugins_cannot_both_own_the_startup_window() {
+    // "Which window starts" has exactly one answer. Silently picking one (by
+    // load order) would leave the other plugin's author with a result they
+    // cannot explain — the same reason a duplicate slot name is an error.
+    let dir = tmpdir("startup-conflict");
+    let decl = |name: &str| {
+        format!(
+            r#"{{"name":"{name}","abi":1,"tools":[],"ui":{{
+                "assets":{{"entry.js":"studio.register('W', () => {{}});"}},
+                "windows":[{{"name":"main-w","component":"W","open":"startup"}}]}}}}"#
+        )
+    };
+    let a = dir.join("a.wasm");
+    let b = dir.join("b.wasm");
+    std::fs::write(&a, wasm_ui_plugin("a", &decl("a"))).unwrap();
+    std::fs::write(&b, wasm_ui_plugin("b", &decl("b"))).unwrap();
+
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    studio.mount_slot("a", &a.display().to_string(), json!(null)).await.unwrap();
+    studio.mount_slot("b", &b.display().to_string(), json!(null)).await.unwrap();
+
+    let err = studio.startup_window().unwrap_err().to_string();
+    assert!(err.contains("startup window"), "unexpected error: {err}");
+    assert!(err.contains("plugin-a-main-w") && err.contains("plugin-b-main-w"),
+        "the error must name both claimants so it is actionable, got: {err}");
+}
+
+#[tokio::test]
+async fn a_plugin_that_only_uses_auto_does_not_claim_the_startup_window() {
+    // The two are different: `auto` opens whenever the plugin activates, and
+    // must never be mistaken for "own the launch view".
+    let dir = tmpdir("auto-not-startup");
+    let decl = r#"{"name":"p","abi":1,"tools":[],"ui":{
+        "assets":{"entry.js":"studio.register('X', () => {});"},
+        "windows":[{"name":"dash","component":"X","open":"auto"}]}}"#;
+    let wasm = dir.join("p.wasm");
+    std::fs::write(&wasm, wasm_ui_plugin("p", decl)).unwrap();
+
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    studio.mount_slot("p", &wasm.display().to_string(), json!(null)).await.unwrap();
+
+    assert!(
+        studio.startup_window().unwrap().is_none(),
+        "an `auto` window is not a startup window"
+    );
+}
