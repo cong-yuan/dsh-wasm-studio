@@ -35,6 +35,21 @@ A `.wasm` file **is a plugin**, and it is a first-class dsh participant:
 Dependencies may be satisfied by another WASM slot's `provides` **or** by a dsh
 service (`WasmHost::declare_dsh_service`).
 
+## A plugin can own the launch view
+
+A plugin may declare a window with `"open": "startup"`, and the app then opens
+**that** window at launch instead of its own page. The app's own window is
+created hidden, so the default page never flashes first; if boot leaves nothing
+visible (the startup window failed to open) the app window is revealed rather
+than leaving a headless process.
+
+Exactly one plugin may claim it — two claimants is an **error**, not a
+coin-flip, because "which window starts" must have one answer.
+
+This is how the **HanaAgent shell** ships: `plugins/hana-shell` in the
+`wasm-plugin-host` repo declares `open: "startup"` and takes the window. It is a
+WASM plugin like any other — there is no special case in this app for it.
+
 ## Layout
 
 ```
@@ -42,14 +57,38 @@ src/                  SvelteKit frontend
   lib/api.ts          typed wrappers over every Tauri command
   lib/state.svelte.ts shared rune-based state
   lib/theme.css       design tokens (dark, Supabase-flavoured)
+                      — a shell plugin may repaint these; see below
+  lib/slots.ts        the frontend slot registry (order-independent)
+  lib/plugin-host.ts  runs plugin JS, mounts components into slots
   routes/             one page per panel + a sidebar layout
+  routes/plugin-window/  what a plugin-owned window renders
 src-tauri/            Rust backend
   src/studio.rs       Studio: owns the cordis Context + WasmHost,
-                      persistence, and the auto-reload watcher
+                      persistence, the auto-reload watcher, and the
+                      startup-window decision
   src/commands.rs     the #[tauri::command] surface
   src/lib.rs          boot + wire the command handler
   tests/studio.rs     headless integration tests (no window)
 ```
+
+### Slots and the shell
+
+The app opens five built-in slots (`sidebar.items`, `settings.tabs`,
+`dashboard.cards`, `agent.actions`, `plugin.detail`) and a plugin may open its
+own. The built-in UI is a fallback: when a shell plugin owns the launch view,
+the user sees the shell.
+
+The shell plugin's own slot surface is 17 regions of HanaAgent's chrome
+(titlebar, sidebar, conversation, preview, rail). Its documentation, layout and
+resize behaviour live with the plugin — see
+[`plugins/hana-shell/README.md`](../wasm-plugin-host/plugins/hana-shell/README.md)
+and [`docs/仿照-openhanako-外壳.md`](../wasm-plugin-host/docs/仿照-openhanako-外壳.md).
+
+Two tests here guard the shell specifically, because a failure in either is
+**invisible at runtime**: a contribution to a declared-but-unmounted slot goes
+nowhere, and a module the entry requires but the manifest forgets ships as an
+empty space.
+
 
 ## Persistence
 
@@ -155,12 +194,25 @@ Then in the app: **Plugins → Load plugin**, slot `greet`, path
 **Validate** button checks the file without loading it. Or drop `.wasm` files
 into the plugins directory and use **Discover** to list and load them.
 
-## ⚠️ No capability/permission model yet
+## ⚠️ Capability model: trusted plugins, maximum permission
 
-Plugins currently receive **full WASI** — arbitrary file read/write and network
-access. This app is for **your own, trusted** `.wasm` only. Do not load
-untrusted plugins. (The host repo's roadmap item P0 tracks this; the
-Capabilities page restates the warning in-app.)
+This is a **decision**, not an unfinished item. A plugin gets preopened access to
+`/` (read/write anywhere the app can) plus `host.http_fetch` (the host makes the
+request on its behalf). The point of the WASM boundary here is **lifecycle and
+isolation from crashes** — a plugin can be unloaded for real, and a bad build
+cannot take the app down — not sandboxing.
+
+So: load **your own, trusted** `.wasm` only. Not untrusted third-party plugins.
+
+What makes the WASM boundary still worth having, rather than an in-process
+dylib: unloading really releases the code and its linear memory, and a broken
+rebuild is rejected while the old one keeps serving. Those are the properties
+`dlopen` cannot give. If third-party plugins ever become a goal, the host repo's
+P0 lists what a real sandbox would need (fuel, memory ceilings, a preopen
+whitelist) and keeps its acceptance criteria.
+
+See the host repo's [`docs/已知问题.md` §1.1](../wasm-plugin-host/docs/已知问题.md)
+for the reasoning, and note the **Capabilities page** restates this in-app.
 
 ## Notes on the Rust side
 
