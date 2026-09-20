@@ -848,6 +848,7 @@ impl Studio {
     /// One agent as a UI row.
     pub fn agent_row(&self, agent: &Arc<dyn dsh_rs::api::services::AgentView>) -> AgentRow {
         let session = agent.session();
+        let messages = session.derive_messages();
         AgentRow {
             id: agent.id().to_string(),
             status: match agent.status() {
@@ -855,9 +856,11 @@ impl Studio {
                 dsh_rs::types::AgentStatus::Running => "running",
             }
             .to_string(),
-            messages: session.derive_messages().len(),
+            messages: messages.len(),
             turns: session.events().len(),
             busy: agent.driver_busy(),
+            title: session_title(&messages),
+            usage: session_usage(&session.events()),
         }
     }
 
@@ -1429,7 +1432,22 @@ impl Studio {
             tool_count,
             service_count: self.shared.host.services().len(),
             watching: self.watching(),
+            providers: self.providers(),
         }
+    }
+
+    /// Registered LLM route names.
+    ///
+    /// `mock` is always available — dsh's base bundle registers it — but it is
+    /// only *reported* here if the service says so, rather than being asserted
+    /// by us. If the LLM seam is missing entirely the list is empty, and the UI
+    /// renders "no provider"; inventing one would hide a broken boot.
+    pub fn providers(&self) -> Vec<String> {
+        self.shared
+            .ctx
+            .require::<dsh_rs::api::services::LlmService>(dsh_rs::api::LLM_SERVICE)
+            .map(|llm| llm.list_providers().into_iter().map(|p| p.name).collect())
+            .unwrap_or_default()
     }
 }
 
@@ -1642,6 +1660,12 @@ pub struct StudioStatus {
     pub service_count: usize,
     /// Whether the auto-reload watcher is running.
     pub watching: bool,
+    /// Registered LLM route names (`mock`, plus anything from `extra.llm`).
+    ///
+    /// The UI needs these to pick a provider instead of hardcoding `mock`:
+    /// a configured model that the chat silently ignores is the kind of bug
+    /// that looks like "the model is bad".
+    pub providers: Vec<String>,
 }
 
 
@@ -1658,6 +1682,34 @@ pub struct AgentRow {
     /// Number of session events (turns/steps/tool calls) — a rough activity meter.
     pub turns: usize,
     pub busy: bool,
+    /// A human-readable label for lists: the first user message, truncated.
+    ///
+    /// Derived rather than stored, because the agent's own id is a generated
+    /// string and a list of those is unreadable. Empty until the first message
+    /// — the UI shows a placeholder for that case.
+    pub title: String,
+    /// Cumulative token usage across the session, when the provider reported it.
+    pub usage: TokenUsageRow,
+}
+
+/// Cumulative per-session token accounting.
+///
+/// `None` fields mean "the provider did not report this", which is why they are
+/// separate from a `0`: a provider without cache support should not look like
+/// one that reported a cache miss.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct TokenUsageRow {
+    pub input: u64,
+    pub output: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_read: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cache_write: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning: Option<u64>,
+    /// Number of assistant messages that carried usage — i.e. how many calls
+    /// these totals span. Without it, "1234 tokens" cannot be read as a rate.
+    pub calls: usize,
 }
 
 /// One message in a chat transcript.
@@ -1693,6 +1745,87 @@ pub struct ChatToolResult {
 /// A text content block.
 fn text_block(text: impl Into<String>) -> dsh_rs::types::ContentBlock {
     dsh_rs::types::ContentBlock::Text { text: text.into() }
+}
+
+/// A readable label for an agent, derived from its first user message.
+///
+/// An agent's own id is a generated string ("agent-7f3a…"), which makes a
+/// session list unreadable. The first thing the user typed is the label they
+/// will recognise, and it needs no extra storage — it is already in the
+/// transcript. Truncated **by characters, not bytes**, so a multi-byte title
+/// cannot be cut mid-codepoint.
+fn session_title(messages: &[dsh_rs::types::Message]) -> String {
+    use dsh_rs::types::{ContentBlock, Role};
+    let Some(first) = messages.iter().find(|m| m.role == Role::User) else {
+        return String::new();
+    };
+    let mut text = String::new();
+    for block in &first.content {
+        if let ContentBlock::Text { text: t } = block {
+            if !text.is_empty() {
+                text.push(' ');
+            }
+            text.push_str(t.trim());
+        }
+    }
+    let text = text.trim();
+    const MAX: usize = 60;
+    if text.chars().count() <= MAX {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(MAX).collect();
+    out.push('…');
+    out
+}
+
+/// Cumulative token usage across a session's assistant messages.
+///
+/// Read from the session events rather than tracked separately, because dsh
+/// already attaches [`TokenUsage`](dsh_rs::types::TokenUsage) to each
+/// `AssistantMessage` event — the numbers exist, they were just not reachable
+/// from the UI. Summing them here means no second source of truth to drift.
+///
+/// `cache_*` and `reasoning` stay `None` unless **every** contributing call
+/// reported them: a partial sum would understate the total while looking
+/// exact.
+fn session_usage(events: &[dsh_rs::types::SessionEvent]) -> TokenUsageRow {
+    use dsh_rs::types::SessionEventData;
+    let mut row = TokenUsageRow::default();
+    let mut cache_read = Some(0u64);
+    let mut cache_write = Some(0u64);
+    let mut reasoning = Some(0u64);
+
+    for event in events {
+        let SessionEventData::AssistantMessage { usage: Some(u), .. } = &event.data else {
+            continue;
+        };
+        row.input += u.input_tokens;
+        row.output += u.output_tokens;
+        row.calls += 1;
+        match (u.cache_read_tokens, &mut cache_read) {
+            (Some(v), Some(acc)) => *acc += v,
+            (None, acc) => *acc = None,
+            _ => {}
+        }
+        match (u.cache_write_tokens, &mut cache_write) {
+            (Some(v), Some(acc)) => *acc += v,
+            (None, acc) => *acc = None,
+            _ => {}
+        }
+        match (u.reasoning_tokens, &mut reasoning) {
+            (Some(v), Some(acc)) => *acc += v,
+            (None, acc) => *acc = None,
+            _ => {}
+        }
+    }
+
+    // A session with no reported usage at all should not claim zero cache use.
+    if row.calls > 0 {
+        row.cache_read = cache_read;
+        row.cache_write = cache_write;
+        row.reasoning = reasoning;
+    }
+    row
 }
 
 /// Map a dsh `Message` onto the UI transcript shape.
