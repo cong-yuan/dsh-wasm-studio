@@ -183,11 +183,18 @@ impl Studio {
         .context("building the WASM host")?;
 
         // Boot the dsh harness (agent loop, sessions, tools, llm seam).
-        boot_harness(&ctx).await?;
-
-        // Register any model provider from config. Without one the harness can
-        // only run the `mock` route, which is still enough to test tool calls.
-        register_llm_providers(&ctx, &config);
+        //
+        // We pass a real `BaseConfig` rather than using
+        // `install_base_default`, which is documented as *"with an in-memory
+        // store"*. Two things come from the dsh bundle itself instead of us
+        // re-implementing them:
+        //
+        // * `store_dir` attaches dsh's own JSONL session persistence, so a
+        //   conversation survives a restart.
+        // * `adapters` mounts each configured OpenAI-compatible endpoint as a
+        //   provider route — the same thing we used to do by hand, after boot,
+        //   through a second path that could drift from dsh's own.
+        boot_harness(&ctx, base_config(&config, &app_data_dir)).await?;
 
         // Tell the WASM registry which dsh services WASM plugins may inject.
         for svc in dsh_services() {
@@ -914,7 +921,36 @@ impl Studio {
             vec![text_block(text)],
         ));
         agent.when_idle().await;
+        self.flush_session(agent_id).await;
         Ok(())
+    }
+
+    /// Checkpoint a session to its persistence backend.
+    ///
+    /// `attach_persistence` only registers a **write** backend, and that backend
+    /// buffers in memory — `JsonlPersistence::on_event` pushes lines onto a
+    /// `HashMap` and `flush()` is what writes them to the `.jsonl` file. Nothing
+    /// calls it automatically, so without this the transcript never reaches the
+    /// disk and the session does not survive a restart.
+    ///
+    /// This mirrors dsh's own CLI, which flushes explicitly after a turn
+    /// (`main.rs`: `flush_session`). It is deliberate rather than a missing
+    /// feature there: a checkpoint per turn is cheap, and flushing on every
+    /// event would make the append path synchronous for every token.
+    ///
+    /// Best-effort: a failed checkpoint must not fail the turn the user just
+    /// watched succeed. The events are still in memory for this process.
+    async fn flush_session(&self, agent_id: &str) {
+        let Ok(store) = self
+            .shared
+            .ctx
+            .require::<dsh_rs::api::services::SessionService>(dsh_rs::api::SESSIONS_SERVICE)
+        else {
+            return;
+        };
+        if let Err(e) = store.flush(agent_id).await {
+            eprintln!("[studio] flushing session `{agent_id}` failed: {e}");
+        }
     }
 
     /// Queue a steer message (delivered at the next step boundary).
@@ -1446,7 +1482,13 @@ impl Studio {
         self.shared
             .ctx
             .require::<dsh_rs::api::services::LlmService>(dsh_rs::api::LLM_SERVICE)
-            .map(|llm| llm.list_providers().into_iter().map(|p| p.name).collect())
+            // `id` is the **route** the user configured (`deepseek`); `name` is
+            // the adapter's display name, which is the same string
+            // (`openai-compatible`) for every OpenAI-shaped endpoint. Taking
+            // `name` would report one indistinguishable entry per configured
+            // provider — and the shell passes this value to `create_agent` as
+            // the provider route, so it has to be the id.
+            .map(|llm| llm.list_providers().into_iter().map(|p| p.id).collect())
             .unwrap_or_default()
     }
 }
@@ -1616,11 +1658,44 @@ async fn join_bounded(
 /// the runtime this runs on must outlive the studio. Tauri owns a global runtime
 /// for exactly this reason; `Studio::boot` blocks on it, while tests call
 /// [`Studio::with_hook`] inside their own `#[tokio::test]`.
-async fn boot_harness(ctx: &cordis::Context) -> Result<()> {
-    dsh_rs::bundle::install_base_default(ctx)
+async fn boot_harness(ctx: &cordis::Context, config: dsh_rs::bundle::BaseConfig) -> Result<()> {
+    dsh_rs::bundle::install_base(ctx, config)
         .await
         .map(|_| ())
         .map_err(|e| anyhow::anyhow!("dsh base bundle: {e}"))
+}
+
+/// Translate the studio's own config into dsh's [`BaseConfig`].
+///
+/// This is the single place the studio config meets the harness's, so the two
+/// things we take from dsh rather than re-implementing are both decided here
+/// and nowhere else:
+///
+/// * **`store_dir`** — session persistence. Derived from the app-data dir so it
+///   sits beside `studio.json` and the plugin cache, and created on demand (dsh
+///   writes into it; a missing directory would fail the first append).
+/// * **`adapters`** — the provider routes. `studio.json` keeps them under
+///   `extra.llm.providers` as `{ name: { base_url, api_key, model } }`, which is
+///   exactly the shape dsh's llm plugin reads under `adapters`; this copies it
+///   across unchanged rather than reserialising, so a section dsh understands
+///   and we do not still reaches it.
+fn base_config(config: &Config, app_data_dir: &Path) -> dsh_rs::bundle::BaseConfig {
+    let store_dir = app_data_dir.join("sessions");
+    let _ = std::fs::create_dir_all(&store_dir);
+
+    let adapters = config
+        .extra
+        .as_ref()
+        .and_then(|e| e.get("llm"))
+        .and_then(|llm| llm.get("providers"))
+        .filter(|p| p.as_object().is_some_and(|m| !m.is_empty()))
+        .cloned();
+
+    dsh_rs::bundle::BaseConfig {
+        store_dir: Some(store_dir),
+        adapters,
+        ..Default::default()
+    }
 }
 
 /// The dsh services a WASM plugin is allowed to `inject` across the boundary.
@@ -1896,34 +1971,6 @@ fn chat_message(m: &dsh_rs::types::Message) -> ChatMessage {
 ///
 /// The `mock` route is always available (dsh registers it), so an app with no
 /// provider configured can still exercise tool calls.
-fn register_llm_providers(ctx: &cordis::Context, config: &Config) {
-    // The host `Config` has a generic `extra` section precisely so an embedder
-    // can keep its own settings in the same file. Ours live under `extra.llm`.
-    let Some(llm) = config.extra.as_ref().and_then(|e| e.get("llm")) else {
-        return;
-    };
-    let Some(providers) = llm.get("providers").and_then(|p| p.as_object()) else {
-        return;
-    };
-    let Ok(runtime) = ctx.require::<dsh_rs::api::services::LlmService>(dsh_rs::api::LLM_SERVICE)
-    else {
-        return;
-    };
-    for (name, section) in providers {
-        // Each section is an OpenAI-compatible endpoint configuration.
-        match dsh_rs::llm::adapters::openai::OpenAiAdapter::new(section.clone()) {
-            Ok(adapter) => {
-                let adapter: Arc<dyn dsh_rs::api::services::LlmAdapterApi> = Arc::new(adapter);
-                if let Err(e) = runtime.register_adapter(&[name.as_str()], adapter) {
-                    eprintln!("[studio] registering llm provider `{name}` failed: {e}");
-                }
-            }
-            Err(e) => eprintln!("[studio] building llm provider `{name}` failed: {e}"),
-        }
-    }
-}
-
-
 /// One row of the plugin catalog: known, and whether it is running.
 #[derive(Debug, Clone, Serialize)]
 pub struct CatalogEntry {
