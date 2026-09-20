@@ -1779,3 +1779,188 @@ async fn the_shell_ships_every_module_its_entry_requires() {
     );
     assert!(assets.iter().any(|a| a == "entry.js"), "entry.js must ship");
 }
+
+// ---------------------------------------------------------------------------
+// The agent list: a readable title, and token usage read from the session
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn the_agent_list_carries_a_readable_title_and_usage() {
+    use dsh_rs::api::services::LlmService;
+    use dsh_rs::types::{FinishReason, StreamChunk, TokenUsage};
+    use std::sync::Arc;
+
+    // The shell's session list renders `AgentRow` directly, so an agent id
+    // ("a1") with no title is a list of generated strings nobody recognises.
+    // The title is derived from the first user message.
+    //
+    // **Usage must arrive BEFORE `Finish`.** The agent loop breaks on the first
+    // `Finish` chunk, so a provider that reports usage after it is never heard —
+    // including dsh's own `MockAdapter::with_usage()`, which appends the usage
+    // chunk to the end. Scripting the chunks ourselves is therefore the only way
+    // to exercise the extraction, and it documents the ordering it requires.
+    let dir = tmpdir("agent-row");
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+
+    let runtime = studio
+        .ctx()
+        .require::<LlmService>(dsh_rs::api::LLM_SERVICE)
+        .unwrap();
+    runtime.unregister_adapter(&["mock"]);
+    runtime
+        .register_adapter(
+            &["mock"],
+            Arc::new(dsh_rs::llm::adapters::mock::MockAdapter::scripted(vec![vec![
+                StreamChunk::BlockStart { index: 0, block_type: "text".into() },
+                StreamChunk::TextDelta { index: 0, text: "ok".into() },
+                StreamChunk::BlockEnd {
+                    index: 0,
+                    block: dsh_rs::types::ContentBlock::Text { text: "ok".into() },
+                },
+                StreamChunk::Usage {
+                    usage: TokenUsage {
+                        input_tokens: 12,
+                        output_tokens: 7,
+                        ..Default::default()
+                    },
+                },
+                StreamChunk::Finish { reason: FinishReason::Stop },
+            ]])),
+        )
+        .unwrap();
+
+    studio
+        .create_agent(Some("a1".into()), "mock".into(), "mock-1".into(), Some("/tmp".into()))
+        .expect("agent created");
+
+    // Before any message there is nothing to derive a title from, and the UI
+    // shows a placeholder rather than an empty row.
+    let before = studio.list_agents();
+    assert_eq!(before.len(), 1);
+    assert_eq!(before[0].title, "", "no user message yet, so no title");
+    assert_eq!(before[0].usage.calls, 0, "no calls yet");
+
+    studio
+        .send_message("a1", "refactor the token estimator".into(), "u1".into())
+        .await
+        .expect("turn completes");
+
+    let after = studio.list_agents();
+    assert_eq!(
+        after[0].title, "refactor the token estimator",
+        "the title is the first user message"
+    );
+    assert_eq!(after[0].usage.calls, 1, "one assistant message carried usage");
+    assert_eq!(after[0].usage.input, 12, "input tokens are summed");
+    assert_eq!(after[0].usage.output, 7, "output tokens are summed");
+    // The optional fields were not reported, so they stay absent rather than
+    // becoming a misleading zero.
+    assert_eq!(after[0].usage.cache_read, None);
+}
+
+// A provider that reports usage after `Finish` is inaudible to the loop — the
+// ordering trap above, asserted so the behaviour is a fact rather than folklore.
+#[tokio::test]
+async fn usage_after_finish_is_invisible_to_the_loop() {
+    use dsh_rs::api::services::LlmService;
+    use std::sync::Arc;
+
+    let dir = tmpdir("agent-usage-late");
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    let runtime = studio
+        .ctx()
+        .require::<LlmService>(dsh_rs::api::LLM_SERVICE)
+        .unwrap();
+    runtime.unregister_adapter(&["mock"]);
+    // dsh's own `with_usage()` appends Usage to the end of `text_response`,
+    // i.e. *after* Finish. This asserts the consequence, which is why the shell
+    // must render "no usage reported" rather than "0 tokens".
+    runtime
+        .register_adapter(
+            &["mock"],
+            Arc::new(dsh_rs::llm::adapters::mock::MockAdapter::new().with_usage()),
+        )
+        .unwrap();
+
+    studio
+        .create_agent(Some("a1".into()), "mock".into(), "mock-1".into(), Some("/tmp".into()))
+        .expect("agent created");
+    studio
+        .send_message("a1", "hi".into(), "u1".into())
+        .await
+        .expect("turn completes");
+
+    let row = &studio.list_agents()[0];
+    assert_eq!(
+        row.usage.calls, 0,
+        "a usage chunk after Finish never reaches the session, even from dsh's \
+         own mock; if this starts failing, dsh fixed the ordering"
+    );
+    assert_eq!(row.usage.cache_read, None, "and nothing is invented to fill it");
+}
+
+#[tokio::test]
+async fn usage_is_absent_when_the_provider_does_not_report_it() {
+    // The default mock reports nothing, and so would any gateway that omits the
+    // usage block. The distinction matters: "no tokens reported" must not render
+    // as "0 tokens used", which reads as a real measurement.
+    let dir = tmpdir("agent-usage-none");
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    studio
+        .create_agent(Some("a1".into()), "mock".into(), "mock-1".into(), Some("/tmp".into()))
+        .expect("agent created");
+    studio
+        .send_message("a1", "hello".into(), "u1".into())
+        .await
+        .expect("turn completes");
+
+    let row = &studio.list_agents()[0];
+    assert_eq!(row.usage.calls, 0, "nothing reported usage");
+    assert_eq!(row.usage.input, 0);
+    // The optional fields stay absent rather than becoming a misleading zero.
+    assert_eq!(row.usage.cache_read, None, "no cache figure to claim");
+    assert_eq!(row.usage.cache_write, None);
+    assert_eq!(row.usage.reasoning, None);
+}
+
+#[tokio::test]
+async fn a_long_first_message_is_truncated_by_characters_not_bytes() {
+    // Truncation by byte would split a multi-byte codepoint and produce invalid
+    // UTF-8 (or panic). Using 4-byte characters makes the difference visible:
+    // 60 chars is 240 bytes.
+    let dir = tmpdir("agent-title-i18n");
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    studio
+        .create_agent(Some("a1".into()), "mock".into(), "mock-1".into(), Some("/tmp".into()))
+        .expect("agent created");
+
+    let long: String = "汉".repeat(200);
+    studio
+        .send_message("a1", long.clone(), "u1".into())
+        .await
+        .expect("turn completes");
+
+    let title = studio.list_agents()[0].title.clone();
+    assert!(title.ends_with('…'), "a truncated title is marked: {title}");
+    // 60 kept characters plus the ellipsis. If this were byte-based the string
+    // would be mangled rather than merely long.
+    assert_eq!(title.chars().count(), 61, "60 chars + ellipsis: {title}");
+    assert!(title.starts_with('汉'), "the kept prefix is intact: {title}");
+    assert!(title.is_char_boundary(title.len()), "still valid UTF-8");
+}
+
+#[tokio::test]
+async fn status_always_reports_the_mock_route() {
+    // The shell's chat picks a provider from `status().providers`, and treats an
+    // empty list as "no LLM configured" — which would leave the composer unable
+    // to send anything. dsh's base bundle always registers `mock`, so the list
+    // must never be empty: if this fails, the shell would wrongly report "no
+    // provider" on a perfectly healthy boot.
+    let dir = tmpdir("status-providers");
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    let providers = studio.status().providers;
+    assert!(
+        providers.iter().any(|p| p == "mock"),
+        "the base bundle registers `mock`, so it must be reported: {providers:?}"
+    );
+}
