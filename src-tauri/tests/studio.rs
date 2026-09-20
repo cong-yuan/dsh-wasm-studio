@@ -2062,3 +2062,151 @@ async fn a_configured_provider_reaches_the_llm_seam() {
         "and the base bundle's mock is still there: {providers:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// A: reading stored sessions; B: resuming them
+// ---------------------------------------------------------------------------
+
+/// Build a session on disk the way a previous run would have left one.
+fn seeded_session(dir: &std::path::Path, id: &str, user_text: &str) {
+    use dsh_rs::types::{ContentBlock, Message, SessionEvent, SessionEventData, TurnEndReason};
+    let msg = Message::user(
+        "u1",
+        vec![ContentBlock::Text { text: user_text.to_string() }],
+    );
+    let events = [
+        SessionEvent::new(0, 1, SessionEventData::TurnStart { turn: 1 }),
+        SessionEvent::new(1, 2, SessionEventData::UserMessage { message: msg }),
+        SessionEvent::new(2, 3, SessionEventData::TurnEnd {
+            turn: 1,
+            reason: TurnEndReason::Completed,
+        }),
+    ];
+    let sessions = dir.join("sessions");
+    std::fs::create_dir_all(&sessions).unwrap();
+    let body: String = events
+        .iter()
+        .map(|e| serde_json::to_string(e).unwrap() + "\n")
+        .collect();
+    std::fs::write(sessions.join(format!("{id}.jsonl")), body).unwrap();
+}
+
+#[tokio::test]
+async fn a_restart_lists_the_sessions_that_were_written_to_disk() {
+    // The whole point of persistence: after a restart the sidebar shows the
+    // conversation even though nothing has it in memory.
+    let dir = tmpdir("list-stored");
+    seeded_session(&dir, "old-1", "what did we decide about the parser");
+
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    assert!(
+        studio.list_agents().is_empty(),
+        "a fresh process has no live agents"
+    );
+
+    let rows = studio.list_sessions();
+    let row = rows
+        .iter()
+        .find(|r| r.id == "old-1")
+        .expect("the stored session must be listed");
+    assert!(!row.live, "a session with no driver behind it is not live: {row:?}");
+    assert_eq!(row.status, "stored");
+    assert_eq!(
+        row.title, "what did we decide about the parser",
+        "the title comes from the stored first user message"
+    );
+}
+
+#[tokio::test]
+async fn a_stored_session_is_not_listed_twice_once_it_is_live() {
+    // A restored session is live *and* on disk. Reporting it as both would show
+    // the user two rows for one conversation, one of them read-only.
+    let dir = tmpdir("no-double-list");
+    seeded_session(&dir, "old-1", "hello there");
+
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    studio.resume_session("old-1").unwrap();
+
+    let rows = studio.list_sessions();
+    let matching: Vec<_> = rows.iter().filter(|r| r.id == "old-1").collect();
+    assert_eq!(matching.len(), 1, "exactly one row: {rows:?}");
+    assert!(matching[0].live, "and it is the live one");
+}
+
+#[tokio::test]
+async fn resuming_a_session_restores_its_history_and_can_be_continued() {
+    // B's acceptance test: the restored agent can actually run a turn, and the
+    // reply lands on top of the old history rather than replacing it.
+    let dir = tmpdir("resume");
+    seeded_session(&dir, "old-1", "first question");
+
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+
+    // Before resuming: readable, but there is no agent to send to.
+    let before = studio.transcript("old-1");
+    assert!(
+        before.is_err(),
+        "a stored session has no live agent until resumed"
+    );
+
+    studio.resume_session("old-1").unwrap();
+
+    // The seeded history is visible through the normal transcript path, so the
+    // UI needs no special case for a resumed session.
+    let after = studio.transcript("old-1").unwrap();
+    assert_eq!(after.len(), 1, "the stored user message is restored: {after:?}");
+    assert_eq!(after[0].text, "first question");
+
+    // And it is live: sending appends to the restored log.
+    studio
+        .send_message("old-1", "second question".into(), "m2".into())
+        .await
+        .unwrap();
+    let grown = studio.transcript("old-1").unwrap();
+    assert!(
+        grown.len() > 1,
+        "the new turn was appended to the restored history: {grown:?}"
+    );
+    assert_eq!(grown[0].text, "first question", "and the old turn survived");
+}
+
+#[tokio::test]
+async fn resuming_then_restarting_does_not_duplicate_the_history() {
+    // The dangerous failure mode of seeding from a file: if the seed events are
+    // re-broadcast to the persistence backend, the next flush *appends the whole
+    // history again*, and the file grows a second copy of every message on each
+    // resume. The bug is invisible within one process (the in-memory session is
+    // correct) and only shows up after a restart reads the file back.
+    //
+    // So this asserts on the *reloaded* history, across two studios.
+    let dir = tmpdir("resume-no-dup");
+    seeded_session(&dir, "old-1", "first question");
+
+    {
+        let studio = Studio::with_hook(None, None, dir.clone()).await.unwrap();
+        studio.resume_session("old-1").unwrap();
+        studio
+            .send_message("old-1", "second question".into(), "m2".into())
+            .await
+            .unwrap();
+    }
+
+    // A genuinely fresh process: only the file survives.
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    let rows = studio.list_sessions();
+    let row = rows.iter().find(|r| r.id == "old-1").expect("still listed");
+
+    let users = {
+        let mut events = studio.stored_events("old-1").expect("stored log readable");
+        dsh_rs::session::repair_crash_turns(&mut events);
+        events
+            .iter()
+            .filter(|e| matches!(&e.data, dsh_rs::types::SessionEventData::UserMessage { .. }))
+            .count()
+    };
+    assert_eq!(
+        users, 2,
+        "the two user messages must each appear once — a rewritten seed would \
+         double them on every resume. Row: {row:?}"
+    );
+}

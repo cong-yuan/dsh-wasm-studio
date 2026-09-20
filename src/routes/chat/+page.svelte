@@ -2,7 +2,8 @@
   import { onMount, tick } from "svelte";
   import {
     createAgent,
-    listAgents,
+    listSessions,
+    resumeSession,
     sendMessage,
     steerAgent,
     cancelAgent,
@@ -36,25 +37,52 @@
 
   onMount(async () => {
     await refreshAgents();
-    if (agents.length > 0) await select(agents[0].id);
+    if (agents.length > 0) await select(agents[0]);
   });
 
   async function refreshAgents() {
     try {
-      agents = await listAgents();
+      // `listSessions`, not `listAgents`: the list should also show sessions
+      // left on disk by a previous run, which is the whole point of storing
+      // them. Each row says whether it is live, so the UI can tell the
+      // difference instead of offering a send that cannot work.
+      agents = await listSessions();
       err = null;
     } catch (e) {
       err = errorMessage(e);
     }
   }
 
-  async function select(id: string) {
+  /**
+   * Open a row, resuming it first when it came from disk.
+   *
+   * A stored session has no agent behind it, so `transcript` would fail until
+   * one is built. Resuming here (rather than in a separate button) is what makes
+   * clicking a restored session behave exactly like clicking a live one.
+   */
+  async function select(row: AgentRow | string) {
+    const id = typeof row === "string" ? row : row.id;
+    const stored = typeof row !== "string" && !row.live;
     activeId = id;
     try {
+      if (stored) {
+        await resumeSession(id);
+        // It is live now, so its `live` flag is stale.
+        await refreshAgents();
+      }
       messages = await transcript(id);
+      err = null;
       scrollDown();
     } catch (e) {
+      // Still show the history when the session cannot be resumed: readable is
+      // better than invisible, and the error says why it cannot be continued.
       err = errorMessage(e);
+      try {
+        messages = await transcript(id);
+        scrollDown();
+      } catch {
+        messages = [];
+      }
     }
   }
 
@@ -157,12 +185,16 @@
       </div>
     {:else}
       {#each agents as a}
-        <div class="agent-row" class:active={a.id === activeId}>
-          <button class="agent-pick" onclick={() => select(a.id)}>
-            <span class="mono">{a.id}</span>
-            <span class="faint" style="font-size: 11px;">{a.messages} msg · {a.turns} ev</span>
+        <div class="agent-row" class:active={a.id === activeId} class:stored={!a.live}>
+          <button class="agent-pick" onclick={() => select(a)}>
+            <span class="mono">{a.title || a.id}</span>
+            <span class="faint" style="font-size: 11px;">
+              {#if a.live}{a.messages} msg · {a.turns} ev{:else}on disk · click to continue{/if}
+            </span>
           </button>
-          <button class="ghost danger" onclick={() => doDispose(a.id)} title="Dispose">×</button>
+          {#if a.live}
+            <button class="ghost danger" onclick={() => doDispose(a.id)} title="Dispose">×</button>
+          {/if}
         </div>
       {/each}
     {/if}
@@ -292,6 +324,14 @@
   }
   .agent-row.active {
     background: var(--accent-soft);
+  }
+  /* A session left on disk by a previous run: openable, not yet live. Dimmed so
+     "can I send to this" is answerable at a glance, not after clicking. */
+  .agent-row.stored .agent-pick {
+    opacity: 0.75;
+  }
+  .agent-row.stored .mono {
+    font-style: italic;
   }
   .agent-pick {
     flex: 1;

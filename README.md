@@ -119,6 +119,31 @@ transcript alongside reasoning blocks.
 The `mock` provider route always works — it echoes input, and (as the backend
 tests show) is enough to exercise a full tool call into a `.wasm` guest.
 
+### Sessions survive a restart
+
+Conversations are written to `<app-data>/sessions/<id>.jsonl` by **dsh's own**
+JSONL persistence (`BaseConfig::store_dir`), not by hand-rolled code — so the
+format is dsh's, and the CLI's `transcript` command reads the same files.
+
+On boot the session list shows both the agents running now **and** the sessions
+left on disk by previous runs. They are marked as *not live* (a hollow dot),
+because a stored session has no agent behind it yet: opening one calls
+`resume_session`, which seeds a live agent from the stored event log, and from
+then on it behaves like any other session.
+
+Two details worth knowing:
+
+* **Seeding replays the log; it does not re-run tools.** The event history is
+  restored, so the derived messages come back without any tool call re-executing.
+  Seeded events are not re-broadcast to the persistence backend, so resuming
+  does not duplicate the transcript on disk — there is a test asserting exactly
+  that, across a restart, because the bug is invisible within one process.
+* **The working directory is not restored.** dsh stores `cwd` in the session
+  *header*, and the JSONL backend writes only events. A resumed session's tools
+  therefore run without a cwd; guessing one would look right and run tools in
+  the wrong place. The model configuration *is* recovered, from the
+  `RequestHeader` each turn appends.
+
 ### Wiring a real model
 
 Put an OpenAI-compatible endpoint under `extra.llm` in `studio.json`, then use
@@ -169,9 +194,15 @@ Checks:
 
 ```sh
 pnpm check                          # svelte-check + tsc
+pnpm test                           # frontend unit tests (incl. a command-surface guard)
 cd src-tauri && cargo test          # backend integration tests
 cd src-tauri && cargo clippy --all-targets
 ```
+
+> Run the Rust tests with **no dev app running**: `tauri dev` compiles with
+> `--no-default-features`, and sharing one `target/` between two feature sets
+> produces spurious "two different versions of `serde_json`" errors that look
+> like a dependency problem and are not.
 
 ## Build
 

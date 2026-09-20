@@ -317,10 +317,34 @@ export const onChanged = (handler: () => void): Promise<UnlistenFn> =>
 /** One agent as the UI sees it (mirrors `studio::AgentRow`). */
 export interface AgentRow {
   id: string;
-  status: "idle" | "running";
+  /**
+   * `stored` means the session is on disk with no driver behind it yet:
+   * readable, but not sendable until resumed.
+   */
+  status: "idle" | "running" | "stored";
+  /**
+   * Whether a driver is behind this row right now. A `false` row came from the
+   * store on disk; opening it is read-only until `resumeSession` succeeds.
+   */
+  live: boolean;
   messages: number;
   turns: number;
   busy: boolean;
+  /** First user message, truncated — a label, not the id. */
+  title: string;
+  /** Cumulative usage, when the provider reported it. */
+  usage: TokenUsageRow;
+}
+
+/** Cumulative per-session token accounting (mirrors `studio::TokenUsageRow`). */
+export interface TokenUsageRow {
+  input: number;
+  output: number;
+  cache_read?: number;
+  cache_write?: number;
+  reasoning?: number;
+  /** Model calls these totals span; `0` means nothing was reported. */
+  calls: number;
 }
 
 /** One message in a chat transcript (mirrors `studio::ChatMessage`). */
@@ -358,6 +382,19 @@ export const createAgent = (
   });
 
 export const listAgents = () => invoke<AgentRow[]>("list_agents");
+
+/**
+ * Every session for the list: live agents **and** the sessions on disk.
+ *
+ * Distinct from `listAgents` on purpose — that answers "what can I send to
+ * right now", this answers "what exists", which is what a session list means.
+ * Each row carries `live` so the two can be told apart.
+ */
+export const listSessions = () => invoke<AgentRow[]>("list_sessions");
+
+/** Put a live agent behind a stored session so it can be continued. */
+export const resumeSession = (sessionId: string) =>
+  invoke<string>("resume_session", { sessionId });
 
 export const sendMessage = (agentId: string, text: string, msgId: string) =>
   invoke<void>("send_message", { agentId, text, msgId });
