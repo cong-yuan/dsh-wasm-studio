@@ -1964,3 +1964,101 @@ async fn status_always_reports_the_mock_route() {
         "the base bundle registers `mock`, so it must be reported: {providers:?}"
     );
 }
+
+#[tokio::test]
+async fn a_session_is_written_to_disk() {
+    // dsh's JSONL persistence is attached via `BaseConfig::store_dir`. This
+    // asserts the write half: a turn's events reach a file under the app-data
+    // directory, so nothing is lost when the process exits.
+    //
+    // The *read* half is separate — `attach_persistence` only adds a write
+    // backend, so the store does not reload what is on disk. dsh's own CLI
+    // reloads explicitly (`backend.list()` then `backend.load(id)`), and the
+    // studio does not do that yet.
+    let dir = tmpdir("session-persist");
+    let studio = Studio::with_hook(None, None, dir.clone()).await.unwrap();
+
+    studio
+        .create_agent(Some("p1".into()), "mock".into(), "mock-1".into(), Some("/tmp".into()))
+        .expect("agent created");
+    studio
+        .send_message("p1", "persist me".into(), "u1".into())
+        .await
+        .expect("turn completes");
+
+    let sessions = dir.join("sessions");
+    let mut found: Option<std::path::PathBuf> = None;
+    if let Ok(entries) = std::fs::read_dir(&sessions) {
+        for e in entries.flatten() {
+            if e.file_name().to_string_lossy().ends_with(".jsonl") {
+                found = Some(e.path());
+            }
+        }
+    }
+    let path = found.unwrap_or_else(|| {
+        panic!("no session jsonl under {} (was store_dir wired up?)", sessions.display())
+    });
+
+    let body = std::fs::read_to_string(&path).unwrap();
+    assert!(
+        body.contains("persist me"),
+        "the user message must be on disk: {}",
+        path.display()
+    );
+    // The event *type* is kebab-case on the wire (`turn-start`), not the
+    // slash-form the cordis event carries (`turn/start`) — asserting the wrong
+    // one would pass on the text alone and miss a half-written log.
+    assert!(
+        body.contains("\"type\":\"turn-start\""),
+        "the whole event stream is recorded, not just the message text: {}",
+        path.display()
+    );
+    assert!(
+        body.contains("\"type\":\"turn-end\""),
+        "the turn is closed on disk, so a reload sees a complete turn: {}",
+        path.display()
+    );
+}
+
+#[tokio::test]
+async fn a_configured_provider_reaches_the_llm_seam() {
+    // `base_config` copies `extra.llm.providers` into dsh's `BaseConfig::adapters`,
+    // and the bundle mounts each entry as a provider route. This is what makes a
+    // configured endpoint *reachable* rather than silently ignored — the bug the
+    // shell's provider picker was written to stop hiding.
+    //
+    // Asserted by writing a real `studio.json` before boot and reading the routes
+    // back off the seam, so it exercises the whole path (config file → base
+    // config → adapters → registered routes), not just the translation helper.
+    let dir = tmpdir("provider-config");
+    let cfg_path = dir.join("studio.json");
+    std::fs::write(
+        &cfg_path,
+        json!({
+            "extra": {
+                "llm": {
+                    "providers": {
+                        "deepseek": {
+                            "base_url": "https://api.deepseek.com/v1",
+                            "api_key": "test-key",
+                            "model": "deepseek-chat"
+                        }
+                    }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    let providers = studio.status().providers;
+    assert!(
+        providers.iter().any(|p| p == "deepseek"),
+        "a configured provider must be registered as a route: {providers:?}"
+    );
+    assert!(
+        providers.iter().any(|p| p == "mock"),
+        "and the base bundle's mock is still there: {providers:?}"
+    );
+}
