@@ -97,6 +97,37 @@ struct Shared {
     wanted_windows: Mutex<Vec<String>>,
     /// slot -> its cordis fiber (the slot's own plugin instance).
     mounted: Mutex<Vec<(String, FiberHandle)>>,
+    /// Agents **resumed from a stored session**, keyed by id.
+    ///
+    /// dsh's `AgentRegistry` only has `create`, and `create` always mints an
+    /// *empty* session (`CreateSessionOptions { ..Default::default() }`); there
+    /// is no `insert`. So an agent built on a session that was *seeded* from
+    /// disk (resume) cannot live in the registry, and is held here instead.
+    ///
+    /// Everything that reads an agent by id (`agent`, `list_agents`,
+    /// `dispose_agent`) consults this map, so a resumed agent is
+    /// indistinguishable from a created one to the rest of the studio.
+    resumed: Mutex<std::collections::HashMap<String, Arc<dsh_rs::core::Agent>>>,
+    /// Cached rows for the sessions on disk; `None` means "not scanned yet".
+    ///
+    /// The scan reads whole `.jsonl` files, and dsh logs **every stream chunk**
+    /// as its own line, so a session is not small. The sidebar polls the session
+    /// list every few seconds, so without this each poll would re-read every
+    /// session file. Invalidated whenever this process changes what is on disk.
+    stored_cache: Mutex<Option<Vec<AgentRow>>>,
+    /// Handed out to auto-created sessions so their ids cannot collide with
+    /// sessions already on disk (see [`Studio::new_session_id`]).
+    id_seq: std::sync::atomic::AtomicU64,
+    /// A registry used **only** to dispose resumed agents.
+    ///
+    /// Disposal needs to flip an agent's private `disposed` flag, and the only
+    /// public way to do that is `AgentRegistry::dispose`, which acts on any
+    /// `&Arc<Agent>` — it does not require the agent to be in its map. The
+    /// registry the harness provides is behind a service wrapper whose `dispose`
+    /// *does* look in the map, so it is a no-op for a resumed agent. Rather than
+    /// build a throwaway registry per disposal, this empty one is built once at
+    /// boot for that one call.
+    agent_owner: dsh_rs::core::AgentRegistry,
     /// The single shared flow-bridge fiber.
     bridge: Mutex<Option<FiberHandle>>,
     plugins_dir: PathBuf,
@@ -207,6 +238,14 @@ impl Studio {
         let bridge = ctx.plugin(bridge_plugin, None);
         join_bounded(&bridge, SETTLE_TIMEOUT, "flow bridge").await?;
 
+        // An empty registry, used only as the vehicle for disposing resumed
+        // agents (see `Shared::agent_owner`). Built here because the sessions
+        // service it needs exists only after the harness boots.
+        let sessions = ctx
+            .require::<dsh_rs::api::services::SessionService>(dsh_rs::api::SESSIONS_SERVICE)
+            .context("sessions service — is the dsh base bundle installed?")?;
+        let agent_owner = dsh_rs::core::AgentRegistry::new(ctx.clone(), (*sessions).clone());
+
         let studio = Studio {
             shared: Arc::new(Shared {
                 ctx,
@@ -216,6 +255,10 @@ impl Studio {
                 pending_params: Mutex::new(std::collections::HashMap::new()),
                 wanted_windows: Mutex::new(Vec::new()),
                 mounted: Mutex::new(Vec::new()),
+                resumed: Mutex::new(std::collections::HashMap::new()),
+                stored_cache: Mutex::new(None),
+                id_seq: std::sync::atomic::AtomicU64::new(0),
+                agent_owner,
                 bridge: Mutex::new(Some(bridge)),
                 plugins_dir,
                 config_path,
@@ -857,6 +900,7 @@ impl Studio {
         let session = agent.session();
         let messages = session.derive_messages();
         AgentRow {
+            live: true,
             id: agent.id().to_string(),
             status: match agent.status() {
                 dsh_rs::types::AgentStatus::Idle => "idle",
@@ -873,10 +917,219 @@ impl Studio {
 
     /// Every live agent.
     pub fn list_agents(&self) -> Vec<AgentRow> {
-        match self.agents() {
-            Ok(reg) => reg.list().iter().map(|a| self.agent_row(a)).collect(),
-            Err(_) => Vec::new(),
+        self.live_agents()
+            .iter()
+            .map(|a| self.agent_row(a))
+            .collect()
+    }
+
+    /// Every session the sidebar should show: live agents **first**, then the
+    /// sessions on disk that are not currently loaded.
+    ///
+    /// This is the honest single list. A stored session that *is* live is
+    /// reported once (as its live row), not twice — otherwise a user who
+    /// restored a session would see two rows for it, one of them read-only.
+    ///
+    /// `live: false` rows are the read-only ones: openable, but with no driver
+    /// behind them until `resume_session` builds one.
+    pub fn list_sessions(&self) -> Vec<AgentRow> {
+        let live = self.live_agents();
+        let mut rows: Vec<AgentRow> = live.iter().map(|a| self.agent_row(a)).collect();
+        let live_ids: std::collections::HashSet<String> =
+            live.iter().map(|a| a.id().to_string()).collect();
+        for mut row in self.stored_session_rows() {
+            if live_ids.contains(&row.id) {
+                continue;
+            }
+            row.live = false;
+            rows.push(row);
         }
+        rows
+    }
+
+    /// Rows for the sessions on disk, in the order the backend reports them.
+    ///
+    /// Each row is projected through the **same** `Session` type a live one uses
+    /// (`Session::new` with the stored log as its seed), so a restored session
+    /// shows exactly the title, turn count and usage it had while live. Deriving
+    /// the counts by hand here would be a second implementation of dsh's surface
+    /// projection, free to drift from the one the live rows use.
+    ///
+    /// Cached: `dsh` writes one line per stream chunk, so reading every session
+    /// on every sidebar poll would be expensive. Invalidated by
+    /// [`Studio::invalidate_stored_cache`] whenever this process writes.
+    fn stored_session_rows(&self) -> Vec<AgentRow> {
+        if let Some(cached) = self.shared.stored_cache.lock().unwrap().clone() {
+            return cached;
+        }
+        let rows = self.scan_stored_sessions();
+        *self.shared.stored_cache.lock().unwrap() = Some(rows.clone());
+        rows
+    }
+
+    /// Drop the cached disk rows; the next `list_sessions` rescans.
+    fn invalidate_stored_cache(&self) {
+        *self.shared.stored_cache.lock().unwrap() = None;
+    }
+
+    fn scan_stored_sessions(&self) -> Vec<AgentRow> {
+        let Some(backend) = self.persistence() else {
+            return Vec::new();
+        };
+        // Newest first: the sessions a user is most likely to want are the ones
+        // they were last in. `created_at` is not persisted (the JSONL backend
+        // writes events, not the header), so the last event's timestamp is the
+        // best available "last used" — and it is already in hand during the scan,
+        // so ordering costs no second read of the file.
+        let mut scanned: Vec<(u64, AgentRow)> = backend
+            .list()
+            .into_iter()
+            .filter_map(|id| {
+                let mut events = backend.load(&id).ok()?;
+                // A session whose process was killed mid-turn has an open turn.
+                // dsh's own reload path repairs it; project the repaired form so
+                // the row matches what resuming it would show.
+                dsh_rs::session::repair_crash_turns(&mut events);
+                let last = events.iter().map(|e| e.time).max().unwrap_or(0);
+                let session = dsh_rs::session::Session::new(
+                    id.clone(),
+                    dsh_rs::types::SessionHeader::default(),
+                    events,
+                );
+                let messages = session.derive_messages();
+                Some((
+                    last,
+                    AgentRow {
+                        live: false,
+                        id,
+                        status: "stored".to_string(),
+                        messages: messages.len(),
+                        turns: session.events().len(),
+                        busy: false,
+                        title: session_title(&messages),
+                        usage: session_usage(&session.events()),
+                    },
+                ))
+            })
+            .collect();
+        scanned.sort_by_key(|(time, _)| std::cmp::Reverse(*time));
+        scanned.into_iter().map(|(_, row)| row).collect()
+    }
+
+    /// The raw stored event log for a session — the persistence layer's view.
+    ///
+    /// Exposed so a test can assert on what is actually **on disk** (the thing
+    /// that survives a restart) rather than on the in-memory session, which can
+    /// look correct while the file is being rewritten with duplicates.
+    pub fn stored_events(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<dsh_rs::types::SessionEvent>> {
+        let backend = self
+            .persistence()
+            .ok_or_else(|| anyhow::anyhow!("no session store configured"))?;
+        backend
+            .load(session_id)
+            .map_err(|e| anyhow::anyhow!("loading session `{session_id}`: {e}"))
+    }
+
+    /// The JSONL persistence backend, when a store directory is configured.
+    fn persistence(
+        &self,
+    ) -> Option<Arc<dyn dsh_rs::api::services::SessionPersistenceApi>> {
+        // The service is provided as `Arc<dyn SessionPersistenceApi>` (dsh's CLI
+        // reads it the same way), so `get` yields an `Arc` of that `Arc`; the
+        // inner one is what the callers want.
+        self.shared
+            .ctx
+            .get::<Arc<dyn dsh_rs::api::services::SessionPersistenceApi>>(
+                dsh_rs::api::SESSION_PERSISTENCE_SERVICE,
+            )
+            .map(|outer| (*outer).clone())
+    }
+
+    /// Load a stored session and put a live agent behind it, so the user can
+    /// continue the conversation instead of only reading it.
+    ///
+    /// dsh has no `resume` entry point of its own — its CLI can *read* a
+    /// transcript (`cmd_transcript`) but never continues one. The pieces it does
+    /// provide are exactly what this needs, though: `CreateSessionOptions.seed`
+    /// is documented as the "resume/fork/replay" hook, and it is what dsh's own
+    /// `fork` uses. Seeding replays the stored **event log**, so the derived
+    /// message history is restored without re-running any tool call.
+    ///
+    /// Idempotent: resuming an id that is already live returns that agent.
+    pub fn resume_session(&self, session_id: &str) -> Result<String> {
+        if let Some(agent) = self.shared.resumed.lock().unwrap().get(session_id) {
+            return Ok(agent.id.to_string());
+        }
+        // Already live in the registry (created this run, not restored): nothing
+        // to seed — the in-memory session is strictly newer than the file.
+        if self.agents()?.get(session_id).is_some() {
+            return Ok(session_id.to_string());
+        }
+
+        let backend = self
+            .persistence()
+            .ok_or_else(|| anyhow::anyhow!("no session store configured"))?;
+        let mut events = backend
+            .load(session_id)
+            .map_err(|e| anyhow::anyhow!("loading session `{session_id}`: {e}"))?;
+        if events.is_empty() {
+            return Err(anyhow::anyhow!("session `{session_id}` has no events"));
+        }
+        // Close a turn left open by a crash, so the seed ends outside a turn.
+        // dsh's `fork` *rejects* an open turn; repairing is the read path's
+        // answer to the same condition, and it is what makes a killed-mid-turn
+        // session resumable rather than permanently stuck.
+        dsh_rs::session::repair_crash_turns(&mut events);
+
+        // Resume keeps the session's own model configuration, recovered from the
+        // log: every turn appends a `RequestHeader` carrying `LlmCallConfig`
+        // (provider, model). Falling back to a default instead would silently
+        // move a restored conversation onto a different model.
+        let options = last_request_options(&events);
+
+        // The working directory is **not** recoverable: dsh keeps `cwd` in the
+        // `SessionHeader`, and the JSONL backend writes only events, never the
+        // header. So a resumed session's tools run without a cwd. Passing a
+        // guessed one (`$HOME`, the app-data dir) would be worse — it would
+        // look like the original and quietly run tools somewhere else.
+        let cwd = None;
+
+        let sessions = self
+            .shared
+            .ctx
+            .require::<dsh_rs::api::services::SessionService>(dsh_rs::api::SESSIONS_SERVICE)
+            .map_err(|e| anyhow::anyhow!("sessions service unavailable: {e}"))?;
+
+        let agent = in_runtime(|| -> Result<Arc<dsh_rs::core::Agent>> {
+            let session = sessions.create(dsh_rs::types::CreateSessionOptions {
+                id: Some(session_id.to_string()),
+                cwd,
+                seed: events,
+                parent_session: None,
+            });
+            let agent = dsh_rs::core::Agent::new(
+                session_id.to_string(),
+                options,
+                session,
+                self.shared.ctx.clone(),
+            );
+            // Same spawn the registry uses, so a resumed agent's driver behaves
+            // identically to a created one's.
+            dsh_rs::core::loop_driver::spawn_driver(agent.clone());
+            Ok(agent)
+        })?;
+
+        self.shared
+            .resumed
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string(), agent);
+        // It is live now, so it must not also be listed as a stored row.
+        self.invalidate_stored_cache();
+        Ok(session_id.to_string())
     }
 
     /// Create an agent. `provider`/`model` select the route; `cwd` is the tool
@@ -888,6 +1141,17 @@ impl Studio {
         model: String,
         cwd: Option<String>,
     ) -> Result<String> {
+        // Auto-minted ids must not collide with a session already on disk.
+        // dsh's own `mint_id` is a process-local counter that restarts at 1, so
+        // after a restart a "new" session would be handed the id of a restored
+        // one — and since the JSONL backend **appends**, the new conversation
+        // would be written into the old session's file. Two conversations in one
+        // transcript, recoverable only by reading the timestamps.
+        //
+        // dsh's CLI does not hit this because every run is a new process with an
+        // empty store directory in practice. The studio is long-lived and the
+        // directory is its whole point, so it must pick ids around what exists.
+        let id = Some(id.unwrap_or_else(|| self.new_session_id()));
         // `reg.create` spawns the agent's driver task with a bare `tokio::spawn`,
         // so a runtime context is mandatory here.
         in_runtime(|| {
@@ -898,14 +1162,67 @@ impl Studio {
                 max_tokens: None,
             };
             let agent = reg.create(id, options, cwd, None).map_err(anyhow::Error::msg)?;
+            self.invalidate_stored_cache();
             Ok(agent.id().to_string())
         })
     }
 
+    /// An id that no live agent and no stored session is using.
+    ///
+    /// Starts from a timestamp so the id also *reads* as distinct across runs
+    /// (a bare counter would be legible but would look like a continuation of
+    /// an older session); the counter only breaks ties within the same
+    /// millisecond.
+    fn new_session_id(&self) -> String {
+        let taken = |cand: &str| -> bool {
+            self.shared.resumed.lock().unwrap().contains_key(cand)
+                || self
+                    .agents()
+                    .map(|r| r.get(cand).is_some())
+                    .unwrap_or(false)
+                || self.session_on_disk(cand)
+        };
+        loop {
+            let n = self.shared.id_seq.fetch_add(1, Ordering::SeqCst);
+            let ms = dsh_rs::types::now_ms();
+            let cand = format!("session-{ms}-{n}");
+            if !taken(&cand) {
+                return cand;
+            }
+        }
+    }
+
+    /// Whether a session with this id is already stored on disk.
+    fn session_on_disk(&self, id: &str) -> bool {
+        self.persistence()
+            .map(|b| b.list().iter().any(|s| s == id))
+            .unwrap_or(false)
+    }
+
     fn agent(&self, id: &str) -> Result<Arc<dyn dsh_rs::api::services::AgentView>> {
+        // Resumed agents are held by us, not by the registry (see `Shared::resumed`).
+        if let Some(agent) = self.shared.resumed.lock().unwrap().get(id) {
+            return Ok(agent.clone() as Arc<dyn dsh_rs::api::services::AgentView>);
+        }
         self.agents()?
             .get(id)
             .ok_or_else(|| anyhow::anyhow!("no agent `{id}`"))
+    }
+
+    /// Every live agent — registry-created and resumed alike.
+    ///
+    /// The registry cannot hold a resumed agent (`AgentRegistry` has no
+    /// `insert`), so a caller that only asked the registry would silently
+    /// omit exactly the sessions the user restored.
+    fn live_agents(&self) -> Vec<Arc<dyn dsh_rs::api::services::AgentView>> {
+        let mut out: Vec<Arc<dyn dsh_rs::api::services::AgentView>> = self
+            .agents()
+            .map(|reg| reg.list().to_vec())
+            .unwrap_or_default();
+        for agent in self.shared.resumed.lock().unwrap().values() {
+            out.push(agent.clone() as Arc<dyn dsh_rs::api::services::AgentView>);
+        }
+        out
     }
 
     /// Send a user message and wait for the turn to finish.
@@ -922,6 +1239,8 @@ impl Studio {
         ));
         agent.when_idle().await;
         self.flush_session(agent_id).await;
+        // The session file just grew, so the cached disk rows are stale.
+        self.invalidate_stored_cache();
         Ok(())
     }
 
@@ -969,9 +1288,18 @@ impl Studio {
 
     /// Dispose an agent (its session stays readable until disposed separately).
     pub fn dispose_agent(&self, agent_id: &str) -> Result<()> {
-        // Disposal emits an `agent/disposed` event, and cordis's fire-and-forget
-        // dispatch uses a bare `tokio::spawn`.
+        // A resumed agent is not in the harness registry's map, so going through
+        // the service wrapper would find nothing and return — leaving the driver
+        // task running with no handle left to stop it (a leak per disposed
+        // session). `AgentRegistry::dispose` cancels the agent and sets its
+        // `disposed` flag *before* consulting the map, so it works here.
+        let resumed = self.shared.resumed.lock().unwrap().remove(agent_id);
         in_runtime(|| {
+            if let Some(agent) = resumed {
+                self.shared.agent_owner.dispose(&agent);
+                self.invalidate_stored_cache();
+                return Ok(());
+            }
             let reg = self.agents()?;
             if let Some(agent) = reg.get(agent_id) {
                 reg.dispose(&agent);
@@ -1752,7 +2080,13 @@ pub struct StudioStatus {
 #[derive(Debug, Clone, Serialize)]
 pub struct AgentRow {
     pub id: String,
+    /// `idle` | `running` | `stored`. `stored` means the session is on disk but
+    /// has no driver behind it yet — opening it is read-only until resumed.
     pub status: String,
+    /// Whether a driver is behind this row right now. A stored row is readable
+    /// but cannot be sent to; the UI must know the difference rather than
+    /// offering a composer that will fail.
+    pub live: bool,
     pub messages: usize,
     /// Number of session events (turns/steps/tool calls) — a rough activity meter.
     pub turns: usize,
@@ -1820,6 +2154,38 @@ pub struct ChatToolResult {
 /// A text content block.
 fn text_block(text: impl Into<String>) -> dsh_rs::types::ContentBlock {
     dsh_rs::types::ContentBlock::Text { text: text.into() }
+}
+
+/// The model configuration a stored session was last using.
+///
+/// Every turn appends a `RequestHeader` carrying the full `LlmCallConfig`, so the
+/// log is its own record of which provider and model the conversation ran on.
+/// Resuming with a *default* instead would silently move a restored conversation
+/// onto a different model — the events would say one thing and the next request
+/// another.
+///
+/// Falls back to the mock route only when the log has no header at all (an empty
+/// or hand-truncated session). `mock` is dsh's own default and is always
+/// registered, so the agent is still constructible; it will refuse real work,
+/// which is the honest outcome for a log that does not say what it used.
+fn last_request_options(events: &[dsh_rs::types::SessionEvent]) -> dsh_rs::types::AgentOptions {
+    use dsh_rs::types::SessionEventData;
+    let config = events.iter().rev().find_map(|e| match &e.data {
+        SessionEventData::RequestHeader { header } => Some(&header.config),
+        _ => None,
+    });
+    match config {
+        Some(c) => dsh_rs::types::AgentOptions {
+            provider: c.provider.clone(),
+            model: c.model.clone(),
+            max_tokens: c.max_tokens,
+        },
+        None => dsh_rs::types::AgentOptions {
+            provider: "mock".to_string(),
+            model: "mock-1".to_string(),
+            max_tokens: None,
+        },
+    }
 }
 
 /// A readable label for an agent, derived from its first user message.

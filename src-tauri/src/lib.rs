@@ -120,6 +120,8 @@ pub fn run() {
             commands::set_log_level,
             commands::create_agent,
             commands::list_agents,
+            commands::list_sessions,
+            commands::resume_session,
             commands::send_message,
             commands::steer_agent,
             commands::cancel_agent,

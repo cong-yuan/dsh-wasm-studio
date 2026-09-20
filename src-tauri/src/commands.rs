@@ -534,6 +534,27 @@ pub fn list_agents(studio: State<'_, Studio>) -> Vec<crate::studio::AgentRow> {
     studio.list_agents()
 }
 
+/// Every session to show in the sidebar: live agents **and** the sessions on
+/// disk that are not currently loaded.
+///
+/// Separate from [`list_agents`] because the two answer different questions.
+/// `list_agents` is "what can I send a message to right now"; this is "what
+/// exists", which is what a session list means to a user. Rows carry `live` so
+/// the UI can tell them apart instead of offering a composer that will fail.
+#[tauri::command]
+pub fn list_sessions(studio: State<'_, Studio>) -> Vec<crate::studio::AgentRow> {
+    studio.list_sessions()
+}
+
+/// Put a live agent behind a stored session so it can be continued.
+///
+/// Returns the session id. Idempotent: resuming an already-live session is a
+/// no-op that returns the same id.
+#[tauri::command]
+pub fn resume_session(studio: State<'_, Studio>, session_id: String) -> Result<String, String> {
+    studio.resume_session(&session_id).map_err(err)
+}
+
 /// Send a user message and wait for the turn to finish.
 #[tauri::command]
 pub async fn send_message(
