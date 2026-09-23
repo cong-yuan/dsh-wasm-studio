@@ -227,6 +227,11 @@ impl Studio {
         //   through a second path that could drift from dsh's own.
         boot_harness(&ctx, base_config(&config, &app_data_dir)).await?;
 
+        // Cover the gateway's baked-in "minimal coding agent" persona (9router
+        // models answer "你是谁" in that voice, sometimes Vietnamese). A Studio
+        // section at order 0 becomes the deployment persona on every turn.
+        install_studio_persona(&ctx, &config);
+
         // Tell the WASM registry which dsh services WASM plugins may inject.
         for svc in dsh_services() {
             host.declare_dsh_service(svc);
@@ -2489,6 +2494,35 @@ async fn boot_harness(ctx: &cordis::Context, config: dsh_rs::bundle::BaseConfig)
 ///   exactly the shape dsh's llm plugin reads under `adapters`; this copies it
 ///   across unchanged rather than reserialising, so a section dsh understands
 ///   and we do not still reaches it.
+
+/// Default / configurable system-prompt persona for Studio agents.
+///
+/// Without this, OpenAI-compatible gateways (notably 9router) often ship their
+/// own coding-agent system prompt, so "你是谁" yields a terse coding persona
+/// and subsequent turns keep reinforcing it via session history.
+fn install_studio_persona(ctx: &cordis::Context, config: &Config) {
+    let Ok(prompt) = ctx.require::<dsh_rs::api::services::SystemPromptService>(
+        dsh_rs::api::SYSTEM_PROMPT_SERVICE,
+    ) else {
+        return;
+    };
+    let custom = config
+        .extra
+        .as_ref()
+        .and_then(|e| e.get("llm"))
+        .and_then(|llm| llm.get("system_prompt"))
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let default = concat!(
+        "你是 Studio 里的助手。用用户正在用的语言简洁回答。\n\n",
+        "你可以读写文件、搜索代码、执行命令来完成任务；但用户只是闲聊、打招呼或问你是谁时，",
+        "正常对话即可。不要自称「极简编程代理」，也不要主动要求用户「给任务」。",
+    );
+    let text = custom.unwrap_or(default);
+    prompt.section("studio-persona", 0, text, false);
+}
+
 fn base_config(config: &Config, app_data_dir: &Path) -> dsh_rs::bundle::BaseConfig {
     let store_dir = app_data_dir.join("sessions");
     let _ = std::fs::create_dir_all(&store_dir);
