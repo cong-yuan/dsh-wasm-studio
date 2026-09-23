@@ -47,3 +47,6 @@ strip = true
 
 [dev-dependencies]
 wat = "1"
+
+[patch.crates-io]
+dsh-rs = { path = "../vendor/dsh-rs" }

@@ -1255,8 +1255,6 @@ checksum = "a278968413d15203bfc0e5b74fcb29d2157e18694d4dc2f1cd69f2366f69964f"
 [[package]]
 name = "dsh-rs"
 version = "0.2.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b114f1ef6040712798bfb15a9af0cdade95941a60fecbfc1a0caea0a999bf91e"
 dependencies = [
  "bytes",
  "cordis-rust",

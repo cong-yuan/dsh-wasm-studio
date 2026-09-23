@@ -1764,19 +1764,48 @@ impl Studio {
                 if asst_text == last_text && asst_reasoning == last_reasoning {
                     continue;
                 }
+                // Ignore stale shorter snapshots (assembler reset between
+                // steps). Emitting them as a full "new segment" delta made
+                // openhanako append intro/identity text again.
+                let text_rewound = !asst_text.is_empty()
+                    && !last_text.is_empty()
+                    && last_text.starts_with(&asst_text)
+                    && last_text != asst_text;
+                let reasoning_rewound = !asst_reasoning.is_empty()
+                    && !last_reasoning.is_empty()
+                    && last_reasoning.starts_with(&asst_reasoning)
+                    && last_reasoning != asst_reasoning;
+                if text_rewound && (asst_reasoning.is_empty() || reasoning_rewound || last_reasoning.starts_with(&asst_reasoning)) {
+                    continue;
+                }
                 // Prefer pure prefix growth. On a new step's assistant (text
                 // does not extend the previous segment), treat the whole
                 // current segment as the delta so openhanako can append it.
                 let text_delta = if asst_text.starts_with(&last_text) {
                     asst_text[last_text.len()..].to_string()
+                } else if last_text.starts_with(&asst_text) {
+                    String::new()
                 } else {
                     asst_text.clone()
                 };
                 let reasoning_delta = if asst_reasoning.starts_with(&last_reasoning) {
                     asst_reasoning[last_reasoning.len()..].to_string()
+                } else if last_reasoning.starts_with(&asst_reasoning) {
+                    String::new()
                 } else {
                     asst_reasoning.clone()
                 };
+                if text_delta.is_empty() && reasoning_delta.is_empty() {
+                    // Still advance last_* when we only observed a rewind so
+                    // the next real growth computes a clean suffix.
+                    if text_rewound {
+                        last_text = asst_text;
+                    }
+                    if reasoning_rewound {
+                        last_reasoning = asst_reasoning;
+                    }
+                    continue;
+                }
                 last_text = asst_text;
                 last_reasoning = asst_reasoning;
                 let Some(app) = studio.shared.app.lock().unwrap().clone() else {
@@ -1892,6 +1921,183 @@ impl Studio {
             Ok(())
         })
     }
+
+    /// Soft-unbind a live agent **without** deleting its JSONL.
+    ///
+    /// Used by model rebind: stop the driver and drop the in-memory session
+    /// entry so the same id can be recreated with a new provider/model while
+    /// the transcript file stays intact. Archive/delete still use
+    /// [`Self::dispose_agent`], which deletes the file.
+    pub fn soft_unbind_agent(&self, agent_id: &str) -> Result<()> {
+        let resumed = self.shared.resumed.lock().unwrap().remove(agent_id);
+        in_runtime(|| {
+            if let Some(agent) = resumed {
+                self.shared.agent_owner.dispose(&agent);
+            } else {
+                let reg = self.agents()?;
+                if let Some(agent) = reg.get(agent_id) {
+                    reg.dispose(&agent);
+                }
+            }
+            if let Ok(sessions) = self
+                .shared
+                .ctx
+                .require::<dsh_rs::api::services::SessionService>(dsh_rs::api::SESSIONS_SERVICE)
+            {
+                let _ = sessions.remove(agent_id);
+            }
+            self.invalidate_stored_cache();
+            Ok(())
+        })
+    }
+
+    /// Rebind an existing session to a new provider/model, keeping the JSONL.
+    ///
+    /// Refuses while the driver is busy (streaming). Soft-unbinds any live
+    /// driver, then recreates the agent with the same id and the new options
+    /// seeded from the on-disk (or just-flushed) event log.
+    pub async fn rebind_agent_model(
+        &self,
+        agent_id: &str,
+        provider: String,
+        model: String,
+    ) -> Result<String> {
+        if provider.trim().is_empty() || model.trim().is_empty() {
+            anyhow::bail!("provider and model are required");
+        }
+        if provider != "mock" && !self.providers().iter().any(|p| p == &provider) {
+            let _ = self.sync_llm_adapters();
+        }
+        if provider != "mock" && !self.providers().iter().any(|p| p == &provider) {
+            anyhow::bail!(
+                "LLM provider `{provider}` is not registered. Check base_url/api_key in settings, then retry."
+            );
+        }
+
+                // Live check: resumed agents are Arc<Agent>; registry agents are AgentView.
+        let resumed_live = self.shared.resumed.lock().unwrap().get(agent_id).cloned();
+        let registry_busy = self
+            .agents()
+            .ok()
+            .and_then(|reg| reg.get(agent_id))
+            .map(|agent| agent.driver_busy())
+            .unwrap_or(false);
+        let busy = resumed_live
+            .as_ref()
+            .map(|agent| agent.driver_busy())
+            .unwrap_or(false)
+            || registry_busy;
+        if busy {
+            anyhow::bail!("cannot switch model while streaming");
+        }
+        let was_live = resumed_live.is_some()
+            || self
+                .agents()
+                .ok()
+                .and_then(|reg| reg.get(agent_id))
+                .is_some();
+        if was_live {
+            // Checkpoint so the file matches the in-memory log we seed from.
+            self.flush_session(agent_id).await;
+        }
+
+
+        let backend = self
+            .persistence()
+            .ok_or_else(|| anyhow::anyhow!("no session store configured"))?;
+        let mut events = backend
+            .load(agent_id)
+            .map_err(|e| anyhow::anyhow!("loading session `{agent_id}`: {e}"))?;
+        if events.is_empty() && !was_live && !self.session_on_disk(agent_id) {
+            anyhow::bail!("session `{agent_id}` not found");
+        }
+        dsh_rs::session::repair_crash_turns(&mut events);
+
+        if was_live {
+            self.soft_unbind_agent(agent_id)?;
+        }
+
+        let options = dsh_rs::types::AgentOptions {
+            provider,
+            model,
+            max_tokens: None,
+        };
+
+        let sessions = self
+            .shared
+            .ctx
+            .require::<dsh_rs::api::services::SessionService>(dsh_rs::api::SESSIONS_SERVICE)
+            .map_err(|e| anyhow::anyhow!("sessions service unavailable: {e}"))?;
+
+        let agent = in_runtime(|| -> Result<Arc<dsh_rs::core::Agent>> {
+            let session = sessions.create(dsh_rs::types::CreateSessionOptions {
+                id: Some(agent_id.to_string()),
+                cwd: None,
+                seed: events,
+                parent_session: None,
+            });
+            let agent = dsh_rs::core::Agent::new(
+                agent_id.to_string(),
+                options,
+                session,
+                self.shared.ctx.clone(),
+            );
+            dsh_rs::core::loop_driver::spawn_driver(agent.clone());
+            Ok(agent)
+        })?;
+
+        self.shared
+            .resumed
+            .lock()
+            .unwrap()
+            .insert(agent_id.to_string(), agent);
+        self.invalidate_stored_cache();
+        Ok(agent_id.to_string())
+    }
+
+    /// Models advertised to the openhanako ModelSelector (from llm config).
+    pub fn list_models(&self) -> Vec<serde_json::Value> {
+        let llm = self.llm_config();
+        let mut out = Vec::new();
+        if let Some(lists) = llm.get("model_lists").and_then(|v| v.as_object()) {
+            for (provider, arr) in lists {
+                if let Some(models) = arr.as_array() {
+                    for m in models {
+                        let id = m
+                            .as_str()
+                            .map(|s| s.to_string())
+                            .or_else(|| m.get("id").and_then(|x| x.as_str()).map(|s| s.to_string()));
+                        if let Some(id) = id {
+                            out.push(serde_json::json!({
+                                "id": id,
+                                "name": id,
+                                "provider": provider,
+                            }));
+                        }
+                    }
+                }
+            }
+        }
+        if out.is_empty() {
+            if let Some(cur) = llm.get("current") {
+                let provider = cur
+                    .get("provider")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("mock");
+                let model = cur
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("mock-1");
+                out.push(serde_json::json!({
+                    "id": model,
+                    "name": model,
+                    "provider": provider,
+                }));
+            }
+        }
+        out
+    }
+
 
     /// Live mid-turn assistant text for UI polling (token-level when chunks exist).
     pub fn chat_partial(&self, agent_id: &str) -> Result<serde_json::Value> {

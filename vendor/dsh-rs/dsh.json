@@ -1,0 +1,11 @@
+{
+  "provider": "deepseek",
+  "model": "deepseek-v4-flash",
+  "store_dir": "/tmp/dsh-sessions",
+  "openai": {
+    "providers": ["deepseek", "openai"],
+    "base_url": "https://api.deepseek.com/v1",
+    "api_key": "sk-403fac1917d444dda4372b478da62148",
+    "model": "deepseek-v4-flash"
+  }
+}

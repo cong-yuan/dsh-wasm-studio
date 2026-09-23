@@ -664,6 +664,30 @@ pub fn set_llm_config(
 }
 
 #[tauri::command]
+pub fn soft_unbind_agent(studio: State<'_, Studio>, agent_id: String) -> Result<(), String> {
+    studio.soft_unbind_agent(&agent_id).map_err(err)
+}
+
+#[tauri::command]
+pub async fn rebind_agent_model(
+    studio: State<'_, Studio>,
+    agent_id: String,
+    provider: String,
+    model: String,
+) -> Result<String, String> {
+    studio
+        .rebind_agent_model(&agent_id, provider, model)
+        .await
+        .map_err(err)
+}
+
+#[tauri::command]
+pub fn list_models(studio: State<'_, Studio>) -> Vec<serde_json::Value> {
+    studio.list_models()
+}
+
+
+#[tauri::command]
 pub fn capabilities(studio: State<'_, Studio>) -> Capabilities {
     Capabilities {
         dsh_services: crate::studio::dsh_services()
