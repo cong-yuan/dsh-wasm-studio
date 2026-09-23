@@ -118,6 +118,8 @@ pub fn run() {
             commands::list_services,
             commands::get_logs,
             commands::set_log_level,
+            commands::get_llm_config,
+            commands::set_llm_config,
             commands::create_agent,
             commands::list_agents,
             commands::list_sessions,

@@ -423,3 +423,11 @@ export function errorMessage(e: unknown): string {
   if (e instanceof Error) return e.message;
   return JSON.stringify(e);
 }
+
+
+/** Persisted LLM providers + live registered routes (`extra.llm`). */
+export const getLlmConfig = () => invoke<Record<string, unknown>>("get_llm_config");
+
+/** Merge a patch into `extra.llm` and persist `studio.json`. */
+export const setLlmConfig = (patch: Record<string, unknown>) =>
+  invoke<Record<string, unknown>>("set_llm_config", { patch });

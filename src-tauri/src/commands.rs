@@ -614,6 +614,24 @@ pub struct Capabilities {
     pub disk_cache: bool,
 }
 
+
+/// Persisted LLM providers (`extra.llm`) plus live registered route names.
+#[tauri::command]
+pub fn get_llm_config(studio: State<'_, Studio>) -> serde_json::Value {
+    studio.llm_config()
+}
+
+/// Merge a patch into `extra.llm` and write `studio.json`.
+///
+/// New provider routes are not live until Studio restarts (`restart_required`).
+#[tauri::command]
+pub fn set_llm_config(
+    studio: State<'_, Studio>,
+    patch: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    studio.set_llm_config(patch).map_err(err)
+}
+
 #[tauri::command]
 pub fn capabilities(studio: State<'_, Studio>) -> Capabilities {
     Capabilities {

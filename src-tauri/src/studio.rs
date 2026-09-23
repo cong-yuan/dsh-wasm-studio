@@ -612,6 +612,173 @@ impl Studio {
     // Persistence
     // -----------------------------------------------------------------------
 
+
+    /// Read the persisted LLM section (`extra.llm`) plus live registered routes.
+    ///
+    /// `providers` here is the **config** map (base_url / api_key / model). The
+    /// live registry may still only know a subset until the app restarts after a
+    /// write — see [`Studio::set_llm_config`].
+    pub fn llm_config(&self) -> serde_json::Value {
+        let cfg = self.shared.config.lock().unwrap();
+        let llm = cfg
+            .extra
+            .as_ref()
+            .and_then(|e| e.get("llm"))
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let mut providers = llm
+            .get("providers")
+            .and_then(|p| p.as_object())
+            .cloned()
+            .unwrap_or_default();
+        // Always surface `mock` so the picker is never empty on a fresh install.
+        providers
+            .entry("mock".to_string())
+            .or_insert_with(|| serde_json::json!({ "model": "mock-1" }));
+        let model_lists = llm
+            .get("model_lists")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let current = llm.get("current").cloned().unwrap_or_else(|| {
+            serde_json::json!({ "provider": "mock", "model": "mock-1" })
+        });
+        let default_provider = llm
+            .get("default")
+            .and_then(|d| d.as_str())
+            .unwrap_or("mock")
+            .to_string();
+        drop(cfg);
+        let registered = self.providers();
+        serde_json::json!({
+            "providers": providers,
+            "model_lists": model_lists,
+            "current": current,
+            "default": default_provider,
+            "registered": registered,
+        })
+    }
+
+    /// Merge a patch into `extra.llm` and persist `studio.json`.
+    ///
+    /// Patch shape (all fields optional):
+    /// ```json
+    /// {
+    ///   "providers": { "deepseek": { "base_url": "...", "api_key": "...", "model": "..." } | null },
+    ///   "model_lists": { "deepseek": ["deepseek-chat"] },
+    ///   "current": { "provider": "deepseek", "model": "deepseek-chat" },
+    ///   "default": "deepseek"
+    /// }
+    /// ```
+    /// New provider routes only reach the live registry after restart
+    /// (`restart_required` is set when a key is not yet registered).
+    pub fn set_llm_config(&self, patch: serde_json::Value) -> Result<serde_json::Value> {
+        let registered_before = self.providers();
+        {
+            let mut cfg = self.shared.config.lock().unwrap();
+            let mut extra = cfg.extra.clone().unwrap_or_else(|| serde_json::json!({}));
+            if !extra.is_object() {
+                extra = serde_json::json!({});
+            }
+            let extra_obj = extra.as_object_mut().unwrap();
+            let mut llm = extra_obj
+                .get("llm")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            if !llm.is_object() {
+                llm = serde_json::json!({});
+            }
+            let llm_obj = llm.as_object_mut().unwrap();
+
+            if let Some(providers_patch) = patch.get("providers").and_then(|p| p.as_object()) {
+                let mut providers = llm_obj
+                    .get("providers")
+                    .and_then(|p| p.as_object())
+                    .cloned()
+                    .unwrap_or_default();
+                let mut model_lists = llm_obj
+                    .get("model_lists")
+                    .and_then(|p| p.as_object())
+                    .cloned()
+                    .unwrap_or_default();
+                for (name, value) in providers_patch {
+                    if value.is_null() {
+                        providers.remove(name);
+                        model_lists.remove(name);
+                        continue;
+                    }
+                    let src = value.as_object().cloned().unwrap_or_default();
+                    let mut clean = serde_json::Map::new();
+                    // Accept both snake_case (studio) and camelCase (openhanako).
+                    for (from, to) in [
+                        ("base_url", "base_url"),
+                        ("baseUrl", "base_url"),
+                        ("api_key", "api_key"),
+                        ("apiKey", "api_key"),
+                        ("model", "model"),
+                    ] {
+                        if let Some(v) = src.get(from) {
+                            if !v.is_null() {
+                                clean.insert(to.to_string(), v.clone());
+                            }
+                        }
+                    }
+                    // Preserve previously known fields when the patch is partial.
+                    let entry = providers.entry(name.clone()).or_insert_with(|| serde_json::json!({}));
+                    if let Some(obj) = entry.as_object_mut() {
+                        for (k, v) in clean {
+                            obj.insert(k, v);
+                        }
+                    } else {
+                        *entry = serde_json::Value::Object(clean);
+                    }
+                    if let Some(models) = src.get("models") {
+                        model_lists.insert(name.clone(), models.clone());
+                    }
+                }
+                llm_obj.insert("providers".into(), serde_json::Value::Object(providers));
+                llm_obj.insert("model_lists".into(), serde_json::Value::Object(model_lists));
+            }
+
+            if let Some(lists) = patch.get("model_lists").and_then(|p| p.as_object()) {
+                let mut model_lists = llm_obj
+                    .get("model_lists")
+                    .and_then(|p| p.as_object())
+                    .cloned()
+                    .unwrap_or_default();
+                for (k, v) in lists {
+                    model_lists.insert(k.clone(), v.clone());
+                }
+                llm_obj.insert("model_lists".into(), serde_json::Value::Object(model_lists));
+            }
+
+            if let Some(current) = patch.get("current") {
+                llm_obj.insert("current".into(), current.clone());
+            }
+            if let Some(default) = patch.get("default") {
+                llm_obj.insert("default".into(), default.clone());
+            }
+
+            extra_obj.insert("llm".into(), serde_json::Value::Object(llm_obj.clone()));
+            cfg.extra = Some(extra);
+        }
+        self.save()?;
+        let mut out = self.llm_config();
+        let registered = self.providers();
+        let providers = out
+            .get("providers")
+            .and_then(|p| p.as_object())
+            .map(|m| m.keys().cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let needs_restart = providers.iter().any(|p| {
+            p != "mock" && !registered.iter().any(|r| r == p) && !registered_before.iter().any(|r| r == p)
+        }) || providers.iter().any(|p| p != "mock" && !registered.iter().any(|r| r == p));
+        if let Some(obj) = out.as_object_mut() {
+            obj.insert("restart_required".into(), serde_json::json!(needs_restart));
+            obj.insert("registered".into(), serde_json::json!(registered));
+        }
+        Ok(out)
+    }
+
     fn save(&self) -> Result<()> {
         let cfg = self.shared.config.lock().unwrap().clone();
         // Write atomically so a crash cannot leave a truncated studio.json.
