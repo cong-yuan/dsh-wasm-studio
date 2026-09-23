@@ -978,6 +978,11 @@ impl Studio {
                     .cloned()
                     .unwrap_or_default();
                 for (name, value) in providers_patch {
+                    // `mock` is built into dsh; never persist it as a real adapter.
+                    if name == "mock" {
+                        providers.remove(name);
+                        continue;
+                    }
                     if value.is_null() {
                         providers.remove(name);
                         model_lists.remove(name);
@@ -2488,13 +2493,36 @@ fn base_config(config: &Config, app_data_dir: &Path) -> dsh_rs::bundle::BaseConf
     let store_dir = app_data_dir.join("sessions");
     let _ = std::fs::create_dir_all(&store_dir);
 
+    // dsh's llm plugin always registers a built-in `mock` route first, then
+    // mounts whatever we put in `adapters`. If studio.json still has a
+    // display-only `mock: {}` (or any entry without base_url), install_base
+    // dies with ROUTE_CONFLICT / a useless empty adapter. Strip those here.
     let adapters = config
         .extra
         .as_ref()
         .and_then(|e| e.get("llm"))
         .and_then(|llm| llm.get("providers"))
-        .filter(|p| p.as_object().is_some_and(|m| !m.is_empty()))
-        .cloned();
+        .and_then(|p| p.as_object())
+        .map(|providers| {
+            let mut out = serde_json::Map::new();
+            for (name, entry) in providers {
+                if name == "mock" {
+                    continue;
+                }
+                let Some(obj) = entry.as_object() else { continue };
+                let base_url = obj
+                    .get("base_url")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .trim();
+                if base_url.is_empty() {
+                    continue;
+                }
+                out.insert(name.clone(), entry.clone());
+            }
+            serde_json::Value::Object(out)
+        })
+        .filter(|p| p.as_object().is_some_and(|m| !m.is_empty()));
 
     dsh_rs::bundle::BaseConfig {
         store_dir: Some(store_dir),
