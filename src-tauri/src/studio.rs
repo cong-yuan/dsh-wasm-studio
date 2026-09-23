@@ -1713,18 +1713,80 @@ impl Studio {
     }
 
     /// Send a user message and wait for the turn to finish.
+    ///
+    /// While the agent is busy, a background task polls
+    /// [`Self::transcript`] and emits `studio://chat-partial` events so the
+    /// openhanako bridge (and Studio chat) can typewrite mid-generation
+    /// instead of waiting for `when_idle`.
     pub async fn send_message(
         &self,
         agent_id: &str,
         text: String,
         msg_id: String,
     ) -> Result<()> {
+        // Snapshot length *before* followup so the poller never treats the
+        // previous assistant message as the new turn's stream seed.
+        let baseline_len = self.transcript(agent_id).map(|m| m.len()).unwrap_or(0);
+
         let agent = self.agent(agent_id)?;
         agent.followup(dsh_rs::types::Message::user(
             msg_id,
             vec![text_block(text)],
         ));
+
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let stop_flag = stop.clone();
+        let studio = self.clone();
+        let id = agent_id.to_string();
+        let poller = tauri::async_runtime::spawn(async move {
+            let mut last_text = String::new();
+            let mut last_reasoning = String::new();
+            while !stop_flag.load(Ordering::Relaxed) {
+                tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+                let Ok(rows) = studio.transcript(&id) else {
+                    continue;
+                };
+                let Some(asst) = rows
+                    .iter()
+                    .skip(baseline_len)
+                    .rev()
+                    .find(|m| m.role == "assistant")
+                else {
+                    continue;
+                };
+                if asst.text == last_text && asst.reasoning == last_reasoning {
+                    continue;
+                }
+                let text_delta = if asst.text.starts_with(&last_text) {
+                    asst.text[last_text.len()..].to_string()
+                } else {
+                    String::new()
+                };
+                let reasoning_delta = if asst.reasoning.starts_with(&last_reasoning) {
+                    asst.reasoning[last_reasoning.len()..].to_string()
+                } else {
+                    String::new()
+                };
+                last_text = asst.text.clone();
+                last_reasoning = asst.reasoning.clone();
+                let Some(app) = studio.shared.app.lock().unwrap().clone() else {
+                    continue;
+                };
+                let payload = serde_json::json!({
+                    "agentId": id,
+                    "text": last_text,
+                    "reasoning": last_reasoning,
+                    "textDelta": text_delta,
+                    "reasoningDelta": reasoning_delta,
+                });
+                let _ = app.emit("studio://chat-partial", payload);
+            }
+        });
+
         agent.when_idle().await;
+        stop.store(true, Ordering::Relaxed);
+        let _ = poller.await;
+
         self.flush_session(agent_id).await;
         // The session file just grew, so the cached disk rows are stale.
         self.invalidate_stored_cache();

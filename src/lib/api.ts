@@ -408,8 +408,23 @@ export const cancelAgent = (agentId: string) =>
 export const disposeAgent = (agentId: string) =>
   invoke<void>("dispose_agent", { agentId });
 
+
 export const transcript = (agentId: string) =>
   invoke<ChatMessage[]>("transcript", { agentId });
+
+/** Mid-turn assistant growth emitted by `send_message` while awaiting idle. */
+export interface ChatPartial {
+  agentId: string;
+  text: string;
+  reasoning: string;
+  textDelta: string;
+  reasoningDelta: string;
+}
+
+export const onChatPartial = (
+  handler: (partial: ChatPartial) => void,
+): Promise<UnlistenFn> =>
+  listen<ChatPartial>("studio://chat-partial", (event) => handler(event.payload));
 
 // ---------------------------------------------------------------------------
 // Capabilities

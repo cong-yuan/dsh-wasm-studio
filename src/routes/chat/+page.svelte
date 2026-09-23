@@ -9,6 +9,7 @@
     cancelAgent,
     disposeAgent,
     transcript,
+    onChatPartial,
     errorMessage,
     type AgentRow,
     type ChatMessage,
@@ -103,18 +104,39 @@
   async function submit() {
     if (!input.trim() || !activeId) return;
     const text = input;
+    const id = activeId;
     input = "";
     sending = true;
     err = null;
+    // Optimistic user bubble; assistant grows via studio://chat-partial.
+    messages = [
+      ...messages,
+      { role: "user", text, reasoning: "", tool_calls: [], tool_results: [] },
+      { role: "assistant", text: "", reasoning: "", tool_calls: [], tool_results: [] },
+    ];
+    scrollDown();
+    const unlisten = await onChatPartial((partial) => {
+      if (partial.agentId !== id) return;
+      const next = messages.slice();
+      const last = next[next.length - 1];
+      if (!last || last.role !== "assistant") return;
+      next[next.length - 1] = {
+        ...last,
+        text: partial.text,
+        reasoning: partial.reasoning,
+      };
+      messages = next;
+      scrollDown();
+    });
     try {
-      // Send and wait for the turn; the backend resolves when the agent is idle.
-      await sendMessage(activeId, text, nextId());
-      messages = await transcript(activeId);
+      await sendMessage(id, text, nextId());
+      messages = await transcript(id);
       await refreshAgents();
       scrollDown();
     } catch (e) {
       err = errorMessage(e);
     } finally {
+      unlisten();
       sending = false;
     }
   }
