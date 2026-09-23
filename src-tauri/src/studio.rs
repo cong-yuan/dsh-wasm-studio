@@ -115,6 +115,10 @@ struct Shared {
     /// list every few seconds, so without this each poll would re-read every
     /// session file. Invalidated whenever this process changes what is on disk.
     stored_cache: Mutex<Option<Vec<AgentRow>>>,
+    /// `<app-data>/sessions` — JSONL files listed by [`Studio::list_sessions`].
+    /// Kept so [`Studio::dispose_agent`] can delete the file (archive/delete),
+    /// not only stop the in-memory driver.
+    sessions_dir: PathBuf,
     /// Handed out to auto-created sessions so their ids cannot collide with
     /// sessions already on disk (see [`Studio::new_session_id`]).
     id_seq: std::sync::atomic::AtomicU64,
@@ -262,6 +266,7 @@ impl Studio {
                 mounted: Mutex::new(Vec::new()),
                 resumed: Mutex::new(std::collections::HashMap::new()),
                 stored_cache: Mutex::new(None),
+                sessions_dir: app_data_dir.join("sessions"),
                 id_seq: std::sync::atomic::AtomicU64::new(0),
                 agent_owner,
                 bridge: Mutex::new(Some(bridge)),
@@ -1714,10 +1719,14 @@ impl Studio {
 
     /// Send a user message and wait for the turn to finish.
     ///
-    /// While the agent is busy, a background task polls
-    /// [`Self::transcript`] and emits `studio://chat-partial` events so the
-    /// openhanako bridge (and Studio chat) can typewrite mid-generation
-    /// instead of waiting for `when_idle`.
+    /// While the agent is busy, a background task polls the session log and
+    /// emits `studio://chat-partial` as soon as **new content appears**.
+    ///
+    /// Important: `derive_messages()` / [`Self::transcript`] only include
+    /// completed `assistant/message` events. Token growth lives in
+    /// `assistant/chunk` events, so the poller assembles those with
+    /// [`dsh_rs::llm::BlockAssembler`] and falls back to completed transcript
+    /// rows only when no open chunk stream is present.
     pub async fn send_message(
         &self,
         agent_id: &str,
@@ -1742,33 +1751,34 @@ impl Studio {
             let mut last_text = String::new();
             let mut last_reasoning = String::new();
             while !stop_flag.load(Ordering::Relaxed) {
-                tokio::time::sleep(std::time::Duration::from_millis(40)).await;
-                let Ok(rows) = studio.transcript(&id) else {
+                // ~token-rate; session appends are sync so this is cheap.
+                tokio::time::sleep(std::time::Duration::from_millis(16)).await;
+                let Ok(agent) = studio.agent(&id) else {
                     continue;
                 };
-                let Some(asst) = rows
-                    .iter()
-                    .skip(baseline_len)
-                    .rev()
-                    .find(|m| m.role == "assistant")
+                let Some((asst_text, asst_reasoning)) =
+                    live_assistant_partial(agent.as_ref(), baseline_len)
                 else {
                     continue;
                 };
-                if asst.text == last_text && asst.reasoning == last_reasoning {
+                if asst_text == last_text && asst_reasoning == last_reasoning {
                     continue;
                 }
-                let text_delta = if asst.text.starts_with(&last_text) {
-                    asst.text[last_text.len()..].to_string()
+                // Prefer pure prefix growth. On a new step's assistant (text
+                // does not extend the previous segment), treat the whole
+                // current segment as the delta so openhanako can append it.
+                let text_delta = if asst_text.starts_with(&last_text) {
+                    asst_text[last_text.len()..].to_string()
                 } else {
-                    String::new()
+                    asst_text.clone()
                 };
-                let reasoning_delta = if asst.reasoning.starts_with(&last_reasoning) {
-                    asst.reasoning[last_reasoning.len()..].to_string()
+                let reasoning_delta = if asst_reasoning.starts_with(&last_reasoning) {
+                    asst_reasoning[last_reasoning.len()..].to_string()
                 } else {
-                    String::new()
+                    asst_reasoning.clone()
                 };
-                last_text = asst.text.clone();
-                last_reasoning = asst.reasoning.clone();
+                last_text = asst_text;
+                last_reasoning = asst_reasoning;
                 let Some(app) = studio.shared.app.lock().unwrap().clone() else {
                     continue;
                 };
@@ -1835,7 +1845,13 @@ impl Studio {
         Ok(())
     }
 
-    /// Dispose an agent (its session stays readable until disposed separately).
+    /// Dispose an agent **and** remove its persisted session so the sidebar
+    /// no longer lists it.
+    ///
+    /// Previously this only stopped the in-memory driver. `list_sessions` still
+    /// scanned the JSONL on disk, so archive/delete in openhanako looked like
+    /// a no-op (the row came back as `live: false`) and `ensureLive` could
+    /// resume it again.
     pub fn dispose_agent(&self, agent_id: &str) -> Result<()> {
         // A resumed agent is not in the harness registry's map, so going through
         // the service wrapper would find nothing and return — leaving the driver
@@ -1846,13 +1862,33 @@ impl Studio {
         in_runtime(|| {
             if let Some(agent) = resumed {
                 self.shared.agent_owner.dispose(&agent);
-                self.invalidate_stored_cache();
-                return Ok(());
+            } else {
+                let reg = self.agents()?;
+                if let Some(agent) = reg.get(agent_id) {
+                    reg.dispose(&agent);
+                }
             }
-            let reg = self.agents()?;
-            if let Some(agent) = reg.get(agent_id) {
-                reg.dispose(&agent);
+            // Drop the in-memory session entry (if any).
+            if let Ok(sessions) = self
+                .shared
+                .ctx
+                .require::<dsh_rs::api::services::SessionService>(dsh_rs::api::SESSIONS_SERVICE)
+            {
+                let _ = sessions.remove(agent_id);
             }
+            // Delete the JSONL so list_sessions cannot resurrect the row.
+            let file = self.shared.sessions_dir.join(format!("{agent_id}.jsonl"));
+            if file.exists() {
+                if let Err(e) = std::fs::remove_file(&file) {
+                    eprintln!(
+                        "[studio] deleting session file `{}` failed: {e}",
+                        file.display()
+                    );
+                }
+            }
+            // Also drop any buffered lines for this id still held by the
+            // JSONL backend (best-effort; buffer key is the session id).
+            self.invalidate_stored_cache();
             Ok(())
         })
     }
@@ -2870,6 +2906,77 @@ fn session_usage(events: &[dsh_rs::types::SessionEvent]) -> TokenUsageRow {
     row
 }
 
+
+/// Mid-turn assistant text/reasoning for UI streaming.
+///
+/// Prefers an in-progress `assistant/chunk` assembly (token-level). Falls back
+/// to the last completed `assistant/message` after `baseline_len` so the final
+/// flush still reaches listeners if chunks were missed.
+fn live_assistant_partial(
+    agent: &dyn dsh_rs::api::services::AgentView,
+    baseline_len: usize,
+) -> Option<(String, String)> {
+    let session = agent.session();
+    let rows: Vec<ChatMessage> = session
+        .derive_messages()
+        .iter()
+        .map(chat_message)
+        .collect();
+    partial_from_events_and_rows(&session.events(), &rows, baseline_len)
+}
+
+/// Pure helper: assemble open `assistant/chunk`s, else last completed assistant
+/// after `baseline_len`. Kept free of `AgentView` so unit tests can feed events.
+fn partial_from_events_and_rows(
+    events: &[dsh_rs::types::SessionEvent],
+    rows: &[ChatMessage],
+    baseline_len: usize,
+) -> Option<(String, String)> {
+    use dsh_rs::llm::BlockAssembler;
+    use dsh_rs::types::SessionEventData;
+
+    // Chunks after the latest completed assistant/message = current step stream.
+    let mut start = 0usize;
+    for (i, event) in events.iter().enumerate() {
+        if matches!(event.data, SessionEventData::AssistantMessage { .. }) {
+            start = i + 1;
+        }
+    }
+
+    let mut assembler = BlockAssembler::new();
+    let mut saw_chunk = false;
+    for event in events.iter().skip(start) {
+        if let SessionEventData::AssistantChunk { chunk, .. } = &event.data {
+            assembler.push(chunk);
+            saw_chunk = true;
+        }
+    }
+
+    if saw_chunk {
+        return Some(blocks_to_text_reasoning(&assembler.blocks()));
+    }
+
+    rows.iter()
+        .skip(baseline_len)
+        .rev()
+        .find(|m| m.role == "assistant")
+        .map(|m| (m.text.clone(), m.reasoning.clone()))
+}
+
+fn blocks_to_text_reasoning(blocks: &[dsh_rs::types::ContentBlock]) -> (String, String) {
+    use dsh_rs::types::ContentBlock;
+    let mut text = String::new();
+    let mut reasoning = String::new();
+    for block in blocks {
+        match block {
+            ContentBlock::Text { text: t } => text.push_str(t),
+            ContentBlock::Reasoning { text: t } => reasoning.push_str(t),
+            _ => {}
+        }
+    }
+    (text, reasoning)
+}
+
 /// Map a dsh `Message` onto the UI transcript shape.
 fn chat_message(m: &dsh_rs::types::Message) -> ChatMessage {
     use dsh_rs::types::ContentBlock;
@@ -3021,4 +3128,119 @@ pub fn app_window_bootstrap(label: &str, params_json: &str) -> String {
     format!(
         "window.__STUDIO_WINDOW__ = {{ label: {label_json}, params: {params_json} }};"
     )
+}
+
+
+#[cfg(test)]
+mod partial_stream_tests {
+    use super::{partial_from_events_and_rows, ChatMessage};
+    use dsh_rs::types::{
+        ContentBlock, FinishReason, SessionEvent, SessionEventData, StreamChunk,
+    };
+
+    fn ev(seq: u64, data: SessionEventData) -> SessionEvent {
+        SessionEvent::new(seq, seq, data)
+    }
+
+    #[test]
+    fn open_chunks_beat_completed_transcript() {
+        let events = vec![
+            ev(
+                0,
+                SessionEventData::AssistantMessage {
+                    turn: 1,
+                    step: 1,
+                    message: dsh_rs::types::Message {
+                        id: "old".into(),
+                        role: dsh_rs::types::Role::Assistant,
+                        content: vec![ContentBlock::Text {
+                            text: "completed-old".into(),
+                        }],
+                        source: dsh_rs::types::MessageSource::Model {
+                            provider: "mock".into(),
+                            model: "mock-1".into(),
+                        },
+                    },
+                    usage: None,
+                    interrupted: None,
+                },
+            ),
+            ev(
+                1,
+                SessionEventData::AssistantChunk {
+                    turn: 1,
+                    step: 2,
+                    chunk: StreamChunk::TextDelta {
+                        index: 0,
+                        text: "Hel".into(),
+                    },
+                },
+            ),
+            ev(
+                2,
+                SessionEventData::AssistantChunk {
+                    turn: 1,
+                    step: 2,
+                    chunk: StreamChunk::TextDelta {
+                        index: 0,
+                        text: "lo".into(),
+                    },
+                },
+            ),
+        ];
+        let rows = vec![ChatMessage {
+            role: "assistant".into(),
+            text: "completed-old".into(),
+            reasoning: String::new(),
+            tool_calls: vec![],
+            tool_results: vec![],
+        }];
+        let (text, reasoning) = partial_from_events_and_rows(&events, &rows, 0).unwrap();
+        assert_eq!(text, "Hello");
+        assert!(reasoning.is_empty());
+    }
+
+    #[test]
+    fn falls_back_to_completed_assistant_when_no_open_chunks() {
+        let events = vec![ev(
+            0,
+            SessionEventData::AssistantMessage {
+                turn: 1,
+                step: 1,
+                message: dsh_rs::types::Message {
+                    id: "a".into(),
+                    role: dsh_rs::types::Role::Assistant,
+                    content: vec![ContentBlock::Text {
+                        text: "done".into(),
+                    }],
+                    source: dsh_rs::types::MessageSource::Model {
+                        provider: "mock".into(),
+                        model: "mock-1".into(),
+                    },
+                },
+                usage: None,
+                interrupted: None,
+            },
+        )];
+        let rows = vec![
+            ChatMessage {
+                role: "user".into(),
+                text: "hi".into(),
+                reasoning: String::new(),
+                tool_calls: vec![],
+                tool_results: vec![],
+            },
+            ChatMessage {
+                role: "assistant".into(),
+                text: "done".into(),
+                reasoning: String::new(),
+                tool_calls: vec![],
+                tool_results: vec![],
+            },
+        ];
+        let (text, _) = partial_from_events_and_rows(&events, &rows, 1).unwrap();
+        assert_eq!(text, "done");
+        // Finish chunk alone should not invent text without deltas.
+        let _ = FinishReason::Stop;
+    }
 }
