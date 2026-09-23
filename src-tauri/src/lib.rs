@@ -131,6 +131,7 @@ pub fn run() {
             commands::cancel_agent,
             commands::dispose_agent,
             commands::transcript,
+            commands::chat_partial,
             commands::capabilities,
         ])
         .run(tauri::generate_context!())

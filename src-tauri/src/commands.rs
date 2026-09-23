@@ -592,6 +592,16 @@ pub async fn dispose_agent(studio: State<'_, Studio>, agent_id: String) -> Resul
     studio.dispose_agent(&agent_id).map_err(err)
 }
 
+
+/// Mid-turn assistant text/reasoning (poll-friendly companion to studio://chat-partial).
+#[tauri::command]
+pub fn chat_partial(
+    studio: State<'_, Studio>,
+    agent_id: String,
+) -> Result<serde_json::Value, String> {
+    studio.chat_partial(&agent_id).map_err(err)
+}
+
 /// The full message history of an agent's session.
 #[tauri::command]
 pub fn transcript(

@@ -1893,6 +1893,18 @@ impl Studio {
         })
     }
 
+    /// Live mid-turn assistant text for UI polling (token-level when chunks exist).
+    pub fn chat_partial(&self, agent_id: &str) -> Result<serde_json::Value> {
+        let agent = self.agent(agent_id)?;
+        let (text, reasoning) = live_assistant_partial(agent.as_ref(), 0)
+            .unwrap_or_else(|| (String::new(), String::new()));
+        Ok(serde_json::json!({
+            "agentId": agent_id,
+            "text": text,
+            "reasoning": reasoning,
+        }))
+    }
+
     /// The full message history of an agent's session, mapped for the UI.
     pub fn transcript(&self, agent_id: &str) -> Result<Vec<ChatMessage>> {
         let agent = self.agent(agent_id)?;
