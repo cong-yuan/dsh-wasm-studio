@@ -120,6 +120,8 @@ pub fn run() {
             commands::set_log_level,
             commands::get_llm_config,
             commands::set_llm_config,
+            commands::fetch_llm_models,
+            commands::sync_llm_adapters,
             commands::create_agent,
             commands::list_agents,
             commands::list_sessions,

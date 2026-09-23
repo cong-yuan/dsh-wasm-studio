@@ -1296,6 +1296,7 @@ dependencies = [
  "cordis-rust",
  "dsh-rs",
  "dsh-wasm-host",
+ "reqwest 0.12.28",
  "serde",
  "serde_json",
  "tauri",

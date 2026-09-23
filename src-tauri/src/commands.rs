@@ -624,6 +624,27 @@ pub fn get_llm_config(studio: State<'_, Studio>) -> serde_json::Value {
 /// Merge a patch into `extra.llm` and write `studio.json`.
 ///
 /// New provider routes are not live until Studio restarts (`restart_required`).
+
+/// List models from an OpenAI-compatible `/models` endpoint and cache them.
+#[tauri::command]
+pub async fn fetch_llm_models(
+    studio: State<'_, Studio>,
+    provider: Option<String>,
+    base_url: Option<String>,
+    api_key: Option<String>,
+) -> Result<serde_json::Value, String> {
+    studio
+        .fetch_llm_models(provider, base_url, api_key)
+        .await
+        .map_err(err)
+}
+
+/// Hot-register adapters from `extra.llm.providers` without restarting.
+#[tauri::command]
+pub fn sync_llm_adapters(studio: State<'_, Studio>) -> Result<Vec<String>, String> {
+    studio.sync_llm_adapters().map_err(err)
+}
+
 #[tauri::command]
 pub fn set_llm_config(
     studio: State<'_, Studio>,

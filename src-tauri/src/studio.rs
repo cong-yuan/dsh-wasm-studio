@@ -613,6 +613,278 @@ impl Studio {
     // -----------------------------------------------------------------------
 
 
+
+    /// Re-register OpenAI-compatible adapters from `extra.llm.providers`.
+    ///
+    /// Boot only mounts whatever was in studio.json at startup; the settings UI
+    /// writes providers later. Without this, `create_agent("9router", …)` fails
+    /// with "no adapter registered" until a full restart.
+    pub fn sync_llm_adapters(&self) -> Result<Vec<String>> {
+        let llm = self
+            .shared
+            .ctx
+            .require::<dsh_rs::api::services::LlmService>(dsh_rs::api::LLM_SERVICE)
+            .map_err(|e| anyhow::anyhow!("llm service unavailable: {e}"))?;
+
+        let cfg = self.shared.config.lock().unwrap().clone();
+        let providers = cfg
+            .extra
+            .as_ref()
+            .and_then(|e| e.get("llm"))
+            .and_then(|llm| llm.get("providers"))
+            .and_then(|p| p.as_object())
+            .cloned()
+            .unwrap_or_default();
+
+        let current = cfg
+            .extra
+            .as_ref()
+            .and_then(|e| e.get("llm"))
+            .and_then(|llm| llm.get("current"))
+            .cloned()
+            .unwrap_or(serde_json::json!({}));
+
+        let mut live = Vec::new();
+        for (name, entry) in &providers {
+            if name == "mock" {
+                continue;
+            }
+            let Some(obj) = entry.as_object() else { continue };
+            let base_url = obj
+                .get("base_url")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .trim_end_matches('/');
+            if base_url.is_empty() {
+                continue;
+            }
+            let api_key = obj.get("api_key").and_then(|v| v.as_str()).unwrap_or("");
+            // Prefer explicit model, then current selection for this provider, then first model_lists entry.
+            let mut model = obj
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            if model.is_empty() {
+                if current.get("provider").and_then(|v| v.as_str()) == Some(name.as_str()) {
+                    model = current
+                        .get("model")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                }
+            }
+            if model.is_empty() {
+                if let Some(list) = cfg
+                    .extra
+                    .as_ref()
+                    .and_then(|e| e.get("llm"))
+                    .and_then(|llm| llm.get("model_lists"))
+                    .and_then(|m| m.get(name))
+                    .and_then(|v| v.as_array())
+                {
+                    for item in list {
+                        if let Some(s) = item.as_str() {
+                            model = s.to_string();
+                            break;
+                        }
+                        if let Some(id) = item.get("id").and_then(|v| v.as_str()) {
+                            model = id.to_string();
+                            break;
+                        }
+                    }
+                }
+            }
+
+            let adapter_cfg = serde_json::json!({
+                "base_url": base_url,
+                "api_key": api_key,
+                "model": model,
+            });
+
+            // Replace any prior registration for this route.
+            llm.unregister_adapter(&[name.as_str()]);
+            let adapter = std::sync::Arc::new(
+                dsh_rs::llm::adapters::openai::OpenAiAdapter::new(adapter_cfg)
+                    .map_err(|e| anyhow::anyhow!("adapter {name}: {e}"))?,
+            );
+            llm.register_adapter(
+                &[name.as_str()],
+                adapter as std::sync::Arc<dyn dsh_rs::api::services::LlmAdapterApi>,
+            )
+            .map_err(|e| anyhow::anyhow!("register {name}: {e}"))?;
+            live.push(name.clone());
+        }
+        Ok(live)
+    }
+
+    /// Fetch `/models` from an OpenAI-compatible provider (by id or raw endpoint).
+    pub async fn fetch_llm_models(
+        &self,
+        provider: Option<String>,
+        base_url: Option<String>,
+        api_key: Option<String>,
+    ) -> Result<serde_json::Value> {
+        let (url, key, pname) = {
+            let cfg = self.shared.config.lock().unwrap();
+            let llm = cfg.extra.as_ref().and_then(|e| e.get("llm"));
+            let providers = llm.and_then(|l| l.get("providers")).and_then(|p| p.as_object());
+            if let Some(name) = provider.as_ref() {
+                let entry = providers.and_then(|p| p.get(name)).and_then(|v| v.as_object());
+                let bu = base_url
+                    .clone()
+                    .or_else(|| {
+                        entry
+                            .and_then(|e| e.get("base_url"))
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string())
+                    })
+                    .unwrap_or_default();
+                let key = api_key.clone().or_else(|| {
+                    entry
+                        .and_then(|e| e.get("api_key"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string())
+                });
+                (bu, key.unwrap_or_default(), name.clone())
+            } else {
+                (
+                    base_url.unwrap_or_default(),
+                    api_key.unwrap_or_default(),
+                    String::new(),
+                )
+            }
+        };
+
+        let base = url.trim().trim_end_matches('/').to_string();
+        if base.is_empty() {
+            anyhow::bail!("missing base_url");
+        }
+        let endpoint = format!("{base}/models");
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()?;
+        let mut req = client.get(&endpoint);
+        if !key.is_empty() {
+            req = req.bearer_auth(&key);
+        }
+        let res = req.send().await?;
+        let status = res.status();
+        let body = res.text().await.unwrap_or_default();
+        if !status.is_success() {
+            anyhow::bail!("GET {endpoint} -> {status}: {}", body.chars().take(300).collect::<String>());
+        }
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap_or(serde_json::json!({}));
+        let raw_list = parsed
+            .get("data")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .or_else(|| parsed.as_array().cloned())
+            .unwrap_or_default();
+
+        let mut models = Vec::new();
+        for item in raw_list {
+            let id = item
+                .get("id")
+                .or_else(|| item.get("name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_string();
+            if id.is_empty() {
+                continue;
+            }
+            let mut row = serde_json::json!({ "id": id, "name": item.get("name").and_then(|v| v.as_str()).unwrap_or(&id) });
+            // Pass through useful metadata when the upstream provides it.
+            for key in [
+                "context",
+                "context_window",
+                "contextWindow",
+                "max_output",
+                "maxOutput",
+                "max_tokens",
+                "maxTokens",
+                "owned_by",
+                "type",
+                "reasoning",
+                "vision",
+                "image",
+                "video",
+                "audio",
+            ] {
+                if let Some(v) = item.get(key) {
+                    row[key] = v.clone();
+                }
+            }
+            // Normalize a few aliases into the shape openhanako's DiscoveredModel expects.
+            if let Some(ctx) = item.get("context_window").or_else(|| item.get("contextWindow")) {
+                row["context"] = ctx.clone();
+                row["contextWindow"] = ctx.clone();
+            }
+            if item.get("vision").and_then(|v| v.as_bool()) == Some(true)
+                || item.get("image").and_then(|v| v.as_bool()) == Some(true)
+            {
+                row["image"] = serde_json::json!(true);
+                row["vision"] = serde_json::json!(true);
+            }
+            // Some local routers (e.g. 9router) nest flags under `capabilities`.
+            if let Some(caps) = item.get("capabilities").and_then(|v| v.as_object()) {
+                if caps.get("vision").and_then(|v| v.as_bool()) == Some(true) {
+                    row["image"] = serde_json::json!(true);
+                    row["vision"] = serde_json::json!(true);
+                }
+                if caps.get("reasoning").and_then(|v| v.as_bool()) == Some(true) {
+                    row["reasoning"] = serde_json::json!(true);
+                }
+                if caps.get("audioInput").and_then(|v| v.as_bool()) == Some(true)
+                    || caps.get("audio").and_then(|v| v.as_bool()) == Some(true)
+                {
+                    row["audio"] = serde_json::json!(true);
+                }
+                if caps.get("videoInput").and_then(|v| v.as_bool()) == Some(true) {
+                    row["video"] = serde_json::json!(true);
+                }
+                row["capabilities"] = item.get("capabilities").cloned().unwrap();
+            }
+            if let Some(owned) = item.get("owned_by") {
+                row["owned_by"] = owned.clone();
+            }
+            models.push(row);
+        }
+
+        // Cache discovered list under extra.llm.discovered.<provider>
+        if !pname.is_empty() {
+            let mut cfg = self.shared.config.lock().unwrap();
+            let mut extra = cfg.extra.clone().unwrap_or_else(|| serde_json::json!({}));
+            if !extra.is_object() {
+                extra = serde_json::json!({});
+            }
+            let extra_obj = extra.as_object_mut().unwrap();
+            let mut llm = extra_obj
+                .get("llm")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            if !llm.is_object() {
+                llm = serde_json::json!({});
+            }
+            let llm_obj = llm.as_object_mut().unwrap();
+            let mut discovered = llm_obj
+                .get("discovered")
+                .and_then(|v| v.as_object())
+                .cloned()
+                .unwrap_or_default();
+            discovered.insert(pname.clone(), serde_json::Value::Array(models.clone()));
+            llm_obj.insert("discovered".into(), serde_json::Value::Object(discovered));
+            extra_obj.insert("llm".into(), serde_json::Value::Object(llm_obj.clone()));
+            cfg.extra = Some(extra);
+            drop(cfg);
+            let _ = self.save();
+        }
+
+        Ok(serde_json::json!({ "models": models, "provider": pname }))
+    }
+
     /// Read the persisted LLM section (`extra.llm`) plus live registered routes.
     ///
     /// `providers` here is the **config** map (base_url / api_key / model). The
@@ -639,6 +911,10 @@ impl Studio {
             .get("model_lists")
             .cloned()
             .unwrap_or_else(|| serde_json::json!({}));
+        let discovered = llm
+            .get("discovered")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
         let current = llm.get("current").cloned().unwrap_or_else(|| {
             serde_json::json!({ "provider": "mock", "model": "mock-1" })
         });
@@ -652,6 +928,7 @@ impl Studio {
         serde_json::json!({
             "providers": providers,
             "model_lists": model_lists,
+            "discovered": discovered,
             "current": current,
             "default": default_provider,
             "registered": registered,
@@ -732,7 +1009,24 @@ impl Studio {
                         *entry = serde_json::Value::Object(clean);
                     }
                     if let Some(models) = src.get("models") {
-                        model_lists.insert(name.clone(), models.clone());
+                        let cleaned = match models.as_array() {
+                            Some(arr) => {
+                                let v: Vec<serde_json::Value> = arr
+                                    .iter()
+                                    .filter(|m| {
+                                        let id = m.as_str().map(|s| s.to_string()).or_else(|| {
+                                            m.get("id").and_then(|v| v.as_str()).map(|s| s.to_string())
+                                        });
+                                        // Drop the auto-seeded "model named like provider".
+                                        id.as_deref() != Some(name.as_str())
+                                    })
+                                    .cloned()
+                                    .collect();
+                                serde_json::Value::Array(v)
+                            }
+                            None => models.clone(),
+                        };
+                        model_lists.insert(name.clone(), cleaned);
                     }
                 }
                 llm_obj.insert("providers".into(), serde_json::Value::Object(providers));
@@ -762,8 +1056,15 @@ impl Studio {
             cfg.extra = Some(extra);
         }
         self.save()?;
+        // Mount / refresh adapters so new providers are usable without restart.
+        let sync_err = self.sync_llm_adapters().err().map(|e| e.to_string());
         let mut out = self.llm_config();
         let registered = self.providers();
+        if let Some(obj) = out.as_object_mut() {
+            if let Some(err) = sync_err {
+                obj.insert("sync_error".into(), serde_json::json!(err));
+            }
+        }
         let providers = out
             .get("providers")
             .and_then(|p| p.as_object())
@@ -1308,6 +1609,15 @@ impl Studio {
         model: String,
         cwd: Option<String>,
     ) -> Result<String> {
+        // Settings may have added this provider after boot; ensure the route exists.
+        if provider != "mock" && !self.providers().iter().any(|p| p == &provider) {
+            let _ = self.sync_llm_adapters();
+        }
+        if provider != "mock" && !self.providers().iter().any(|p| p == &provider) {
+            anyhow::bail!(
+                "LLM provider `{provider}` is not registered. Check base_url/api_key in settings, then retry."
+            );
+        }
         // Auto-minted ids must not collide with a session already on disk.
         // dsh's own `mint_id` is a process-local counter that restarts at 1, so
         // after a restart a "new" session would be handed the id of a restored

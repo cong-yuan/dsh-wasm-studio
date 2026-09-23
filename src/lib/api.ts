@@ -431,3 +431,16 @@ export const getLlmConfig = () => invoke<Record<string, unknown>>("get_llm_confi
 /** Merge a patch into `extra.llm` and persist `studio.json`. */
 export const setLlmConfig = (patch: Record<string, unknown>) =>
   invoke<Record<string, unknown>>("set_llm_config", { patch });
+
+export const fetchLlmModels = (args: {
+  provider?: string;
+  baseUrl?: string;
+  apiKey?: string;
+}) =>
+  invoke<Record<string, unknown>>("fetch_llm_models", {
+    provider: args.provider ?? null,
+    base_url: args.baseUrl ?? null,
+    api_key: args.apiKey ?? null,
+  });
+
+export const syncLlmAdapters = () => invoke<string[]>("sync_llm_adapters");
