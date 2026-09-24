@@ -1392,6 +1392,7 @@ impl Studio {
             .to_string(),
             messages: messages.len(),
             turns: session.events().len(),
+            updated_at: session.events().iter().map(|event| event.time).max(),
             busy: agent.driver_busy(),
             title: session_title(&messages),
             usage: session_usage(&session.events()),
@@ -1488,6 +1489,7 @@ impl Studio {
                         status: "stored".to_string(),
                         messages: messages.len(),
                         turns: session.events().len(),
+                        updated_at: (last > 0).then_some(last),
                         busy: false,
                         title: session_title(&messages),
                         usage: session_usage(&session.events()),
@@ -2945,6 +2947,9 @@ pub struct AgentRow {
     pub messages: usize,
     /// Number of session events (turns/steps/tool calls) — a rough activity meter.
     pub turns: usize,
+    /// Milliseconds since Unix epoch for latest persisted session event.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub updated_at: Option<u64>,
     pub busy: bool,
     /// A human-readable label for lists: the first user message, truncated.
     ///

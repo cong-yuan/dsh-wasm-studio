@@ -10,7 +10,7 @@
    * Nothing else of the app is shown (no sidebar, no nav) — see +layout.svelte,
    * which detects a plugin window and renders this route alone.
    */
-  import { onMount } from "svelte";
+  import { onDestroy, onMount } from "svelte";
   import { getCurrentWindow } from "@tauri-apps/api/window";
   import { pluginWindowFor, errorMessage, type PluginWindow } from "$lib/api";
   import { pluginHost } from "$lib/plugin-runtime";
@@ -20,6 +20,13 @@
   let ready = $state(false);
   let container: HTMLElement | undefined = $state();
   let dispose: (() => void) | null = null;
+
+  // Plugin watcher reloads replace handles and tear down their live mounts.
+  // Re-run this component's mount effect after every host sync so a plugin
+  // window cannot stay blank after its WASM is rebuilt.
+  let revision = $state(0);
+  const unsubscribe = pluginHost.subscribe(() => (revision += 1));
+  onDestroy(unsubscribe);
 
   onMount(async () => {
     try {
@@ -46,6 +53,7 @@
 
   // Mount the component once the host is synced and the element exists.
   $effect(() => {
+    void revision;
     const s = spec;
     const el = container;
     if (!s || !el || !ready) return;

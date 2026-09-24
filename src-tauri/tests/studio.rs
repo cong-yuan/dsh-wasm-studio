@@ -2111,6 +2111,7 @@ async fn a_restart_lists_the_sessions_that_were_written_to_disk() {
         .expect("the stored session must be listed");
     assert!(!row.live, "a session with no driver behind it is not live: {row:?}");
     assert_eq!(row.status, "stored");
+    assert_eq!(row.updated_at, Some(3), "latest event time drives sidebar age");
     assert_eq!(
         row.title, "what did we decide about the parser",
         "the title comes from the stored first user message"
@@ -2209,4 +2210,196 @@ async fn resuming_then_restarting_does_not_duplicate_the_history() {
         "the two user messages must each appear once — a rewritten seed would \
          double them on every resume. Row: {row:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Model rebind: switching a live session's provider/model without losing history
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn rebinding_the_model_keeps_the_transcript_and_resumes_the_driver() {
+    // The headline of the model-switch feature: an existing session is
+    // re-pointed at a new provider/model *in place*. The JSONL must survive (the
+    // soft-unbind drops the live driver but never deletes the file), the old
+    // history must still be visible, and the agent must be live again so the
+    // next turn appends on top rather than starting over.
+    let dir = tmpdir("rebind");
+    let studio = Studio::with_hook(None, None, dir.clone()).await.unwrap();
+
+    studio
+        .create_agent(Some("a1".into()), "mock".into(), "mock-1".into(), Some("/tmp".into()))
+        .expect("agent created");
+    studio
+        .send_message("a1", "before the switch".into(), "u1".into())
+        .await
+        .expect("first turn completes");
+
+    let before = studio.transcript("a1").unwrap();
+    assert!(before.iter().any(|m| m.text == "before the switch"));
+
+    // Rebind to a different mock model. `mock` is always registered, so this
+    // exercises the rebind path itself rather than provider validation.
+    let id = studio
+        .rebind_agent_model("a1", "mock".into(), "mock-2".into())
+        .await
+        .expect("rebind succeeds");
+    assert_eq!(id, "a1", "the same session id is reused");
+
+    // The old history survived the switch…
+    let after = studio.transcript("a1").unwrap();
+    assert!(
+        after.iter().any(|m| m.text == "before the switch"),
+        "rebinding must not erase the transcript: {after:?}"
+    );
+
+    // …and the agent is live again, so the next turn appends to it.
+    studio
+        .send_message("a1", "after the switch".into(), "u2".into())
+        .await
+        .expect("second turn completes");
+    let grown = studio.transcript("a1").unwrap();
+    assert!(
+        grown.iter().any(|m| m.text == "after the switch"),
+        "the rebound agent must accept new turns: {grown:?}"
+    );
+    assert!(
+        grown.len() > after.len(),
+        "the new turn was appended, not a fresh log: {grown:?}"
+    );
+
+    // The transcript file is still on disk — soft-unbind must not delete it.
+    assert!(
+        dir.join("sessions").join("a1.jsonl").exists(),
+        "the JSONL must outlive the rebind"
+    );
+}
+
+#[tokio::test]
+async fn rebinding_to_an_unregistered_provider_is_a_clear_error() {
+    // The UI's provider picker can offer a provider that is not actually wired
+    // up (bad base_url/api_key). Rebinding must refuse with an actionable
+    // message rather than silently pretending to switch.
+    let dir = tmpdir("rebind-bad-provider");
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    studio
+        .create_agent(Some("a1".into()), "mock".into(), "mock-1".into(), Some("/tmp".into()))
+        .expect("agent created");
+
+    let err = studio
+        .rebind_agent_model("a1", "ghost-provider".into(), "some-model".into())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(
+        err.contains("ghost-provider") && err.contains("not registered"),
+        "the error must name the provider and say it is unregistered, got: {err}"
+    );
+
+    // And the original agent is untouched — a failed rebind is a no-op.
+    studio
+        .send_message("a1", "still works".into(), "u1".into())
+        .await
+        .expect("the agent still runs on the old model");
+}
+
+#[tokio::test]
+async fn rebinding_a_session_that_was_never_live_reads_it_from_disk() {
+    // A stored-but-not-resumed session is a legitimate rebind target: the file
+    // is the source of truth, and the rebound agent comes up live with that
+    // history already loaded.
+    let dir = tmpdir("rebind-stored");
+    seeded_session(&dir, "old-1", "seeded question");
+
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    // Not resumed: no live agent yet.
+    assert!(studio.transcript("old-1").is_err());
+
+    studio
+        .rebind_agent_model("old-1", "mock".into(), "mock-2".into())
+        .await
+        .expect("rebinding a stored session succeeds");
+
+    // Now it is live and carries the seeded history.
+    let t = studio.transcript("old-1").unwrap();
+    assert_eq!(t.len(), 1, "the seeded user message is restored: {t:?}");
+    assert_eq!(t[0].text, "seeded question");
+
+    studio
+        .send_message("old-1", "follow up".into(), "u2".into())
+        .await
+        .expect("the rebound stored session is live");
+    assert!(studio.transcript("old-1").unwrap().iter().any(|m| m.text == "follow up"));
+}
+
+#[tokio::test]
+async fn rebinding_a_missing_session_is_an_error() {
+    let dir = tmpdir("rebind-missing");
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    let err = studio
+        .rebind_agent_model("nope", "mock".into(), "mock-2".into())
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("not found"), "expected a not-found error, got: {err}");
+}
+
+#[tokio::test]
+async fn list_models_reflects_the_configured_model_lists() {
+    // The openhanako ModelSelector reads this command. When the config carries
+    // per-provider model lists, every entry must come back tagged with its
+    // provider so the UI can group them.
+    let dir = tmpdir("list-models");
+    std::fs::write(
+        dir.join("studio.json"),
+        json!({
+            "extra": {
+                "llm": {
+                    "model_lists": {
+                        "deepseek": ["deepseek-chat", "deepseek-reasoner"],
+                        "openai": [{"id": "gpt-4o"}]
+                    },
+                    "current": { "provider": "deepseek", "model": "deepseek-chat" }
+                }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    let models = studio.list_models();
+
+    let ids: Vec<&str> = models.iter().filter_map(|m| m["id"].as_str()).collect();
+    assert!(ids.contains(&"deepseek-chat"), "string entries listed: {models:?}");
+    assert!(ids.contains(&"deepseek-reasoner"), "every entry listed: {models:?}");
+    assert!(ids.contains(&"gpt-4o"), "object entries (`id`) listed: {models:?}");
+
+    // Each entry carries its provider — the picker groups by it.
+    let chat = models.iter().find(|m| m["id"] == "deepseek-chat").unwrap();
+    assert_eq!(chat["provider"], "deepseek");
+    let gpt = models.iter().find(|m| m["id"] == "gpt-4o").unwrap();
+    assert_eq!(gpt["provider"], "openai");
+}
+
+#[tokio::test]
+async fn list_models_falls_back_to_the_current_selection() {
+    // With no configured lists, the picker must still show *something* — the
+    // current provider/model — rather than an empty selector.
+    let dir = tmpdir("list-models-fallback");
+    std::fs::write(
+        dir.join("studio.json"),
+        json!({
+            "extra": {
+                "llm": { "current": { "provider": "deepseek", "model": "deepseek-chat" } }
+            }
+        })
+        .to_string(),
+    )
+    .unwrap();
+
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    let models = studio.list_models();
+    assert_eq!(models.len(), 1, "the fallback is the current selection: {models:?}");
+    assert_eq!(models[0]["id"], "deepseek-chat");
+    assert_eq!(models[0]["provider"], "deepseek");
 }
