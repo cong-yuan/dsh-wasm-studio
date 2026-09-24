@@ -21,6 +21,7 @@
 
 use std::sync::Arc;
 
+use futures::future::join_all;
 use serde_json::{json, Value};
 
 use crate::api::services::{LlmService, SessionView, ToolsService};
@@ -29,7 +30,7 @@ use crate::llm::{
     MessageSource, Role, StreamChunk, StreamTable, stream_via_waterfall,
 };
 use crate::session::{
-    EpochHeader, SessionEventData, TurnEndReason,
+    now_ms, EpochHeader, SessionEventData, TurnEndReason,
 };
 use crate::tools::{ToolExecutionResult, ToolRunContext};
 
@@ -304,33 +305,63 @@ async fn run_turn(agent: &Arc<Agent>, claimed: Vec<Message>) -> Result<(), crate
             break;
         }
 
-        // Dispatch tool calls (sequentially in this driver; the registry's
-        // `is_concurrency_safe` flag is the future parallel-group seam).
-        for call in &tool_calls {
-            let ContentBlock::ToolCall { id, name, arguments } = call else { continue };
-            session.append(SessionEventData::ToolCall {
-                turn,
-                step,
-                call_id: id.clone(),
-                name: name.clone(),
-                arguments: arguments.clone(),
-            });
-            let parsed_args = serde_json::from_str(arguments).unwrap_or(Value::Null);
-            let run_ctx = ToolRunContext {
-                ctx: agent.ctx.clone(),
-                signal: agent.turn_token().unwrap_or_default(),
-                agent_id: Some(agent.id.clone()),
-                cwd: agent.session.header_cwd(),
-            };
-            let result = tools
-                .execute(id.clone(), name.clone(), parsed_args, run_ctx)
-                .await;
-            let result_message = tool_result_message(id, name, &result);
-            session.append(SessionEventData::ToolResult {
-                turn,
-                step,
-                message: result_message,
-            });
+        // Adjacent concurrency-safe calls overlap. Unsafe and unknown tools
+        // remain one-call barriers, preserving order around mutations.
+        let mut batch_start = 0;
+        while batch_start < tool_calls.len() {
+            let first_safe = tool_call_name(tool_calls[batch_start])
+                .map(|name| tools.is_concurrency_safe(name))
+                .unwrap_or(false);
+            let mut batch_end = batch_start + 1;
+            if first_safe {
+                while batch_end < tool_calls.len()
+                    && tool_call_name(tool_calls[batch_end])
+                        .map(|name| tools.is_concurrency_safe(name))
+                        .unwrap_or(false)
+                {
+                    batch_end += 1;
+                }
+            }
+
+            let mut executions = Vec::with_capacity(batch_end - batch_start);
+            for call in &tool_calls[batch_start..batch_end] {
+                let ContentBlock::ToolCall { id, name, arguments } = call else { continue };
+                session.append(SessionEventData::ToolCall {
+                    turn,
+                    step,
+                    call_id: id.clone(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                });
+                let parsed_args = serde_json::from_str(arguments).unwrap_or(Value::Null);
+                let run_ctx = ToolRunContext {
+                    ctx: agent.ctx.clone(),
+                    signal: agent.turn_token().unwrap_or_default(),
+                    agent_id: Some(agent.id.clone()),
+                    cwd: agent.session.header_cwd(),
+                };
+                let tools = tools.clone();
+                let id = id.clone();
+                let name = name.clone();
+                executions.push(async move {
+                    let result = tools
+                        .execute(id.clone(), name.clone(), parsed_args, run_ctx)
+                        .await;
+                    (id, name, result, now_ms())
+                });
+            }
+
+            // join_all polls concurrently but returns input order. Captured
+            // completion time preserves real duration when faster calls wait.
+            for (id, name, result, finished_at) in join_all(executions).await {
+                let result_message = tool_result_message(&id, &name, &result);
+                session.append_at(finished_at, SessionEventData::ToolResult {
+                    turn,
+                    step,
+                    message: result_message,
+                });
+            }
+            batch_start = batch_end;
         }
         agent.completed_turns.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         session.append(SessionEventData::StepEnd { turn, step });
@@ -359,6 +390,13 @@ async fn run_turn(agent: &Arc<Agent>, claimed: Vec<Message>) -> Result<(), crate
         reason: TurnEndReason::Completed,
     });
     Ok(())
+}
+
+fn tool_call_name(block: &ContentBlock) -> Option<&str> {
+    match block {
+        ContentBlock::ToolCall { name, .. } => Some(name),
+        _ => None,
+    }
 }
 
 /// The next turn number: one past the last logged `turn/start`.

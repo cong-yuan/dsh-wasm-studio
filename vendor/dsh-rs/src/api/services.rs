@@ -54,6 +54,9 @@ pub trait SessionView: Send + Sync + 'static {
     fn surface(&self) -> Vec<u64>;
     fn derive_messages(&self) -> Vec<Message>;
     fn append(&self, data: SessionEventData) -> SessionEvent;
+    fn append_at(&self, _time: u64, data: SessionEventData) -> SessionEvent {
+        self.append(data)
+    }
     fn request_header(&self) -> Option<EpochHeader>;
     /// The open turn number, if any.
     fn open_turn(&self) -> Option<u64>;
@@ -129,6 +132,9 @@ pub struct DynamicToolSpec {
 pub trait ToolRegistryApi: Send + Sync + 'static {
     fn schemas(&self) -> Vec<ToolSchema>;
     fn list(&self) -> Vec<String>;
+    fn is_concurrency_safe(&self, _name: &str) -> bool {
+        false
+    }
     fn execute(
         &self,
         call_id: String,
@@ -137,6 +143,13 @@ pub trait ToolRegistryApi: Send + Sync + 'static {
         run_ctx: crate::types::ToolRunContext,
     ) -> BoxFuture<ToolExecutionResult>;
     fn register_dynamic_tool(&self, spec: DynamicToolSpec);
+    fn register_dynamic_tool_with_concurrency(
+        &self,
+        spec: DynamicToolSpec,
+        _is_concurrency_safe: bool,
+    ) {
+        self.register_dynamic_tool(spec);
+    }
     fn unregister_dynamic_tool(&self, name: &str);
 }
 

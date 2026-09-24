@@ -630,6 +630,8 @@ async fn an_agent_calls_a_wasm_tool_in_a_real_turn() {
         calls.iter().any(|c| c.name == "alpha_tool"),
         "the model's tool call should be in the transcript, got {transcript:?}"
     );
+    let call = calls.iter().find(|c| c.id == "call-1").expect("call is projected");
+    assert!(call.started_at.is_some(), "tool/call event time must reach transcript");
     // …and its result came back from the WASM guest.
     let results: Vec<_> = transcript
         .iter()
@@ -639,6 +641,14 @@ async fn an_agent_calls_a_wasm_tool_in_a_real_turn() {
     assert!(
         results.iter().any(|r| r.content.contains("ran")),
         "the wasm guest's content should reach the transcript, got {results:?}"
+    );
+    let result = results
+        .iter()
+        .find(|r| r.tool_call_id == "call-1")
+        .expect("result is projected");
+    assert!(
+        result.finished_at >= call.started_at,
+        "tool/result event time must follow its call: {call:?} {result:?}"
     );
     // The turn closed with the model's final text.
     assert_eq!(transcript.last().unwrap().text, "done");

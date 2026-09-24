@@ -1,7 +1,9 @@
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use cordis::plugin::BoxFuture;
 use cordis::Context;
+use dsh_rs::api::services::{DynamicToolSpec, ToolsService};
 use dsh_rs::core::{AgentOptions, PromptSection, SystemPromptService, agent_loop_plugin, prompt::system_prompt_plugin};
 use dsh_rs::core::agent::user_message_with_text;
 use dsh_rs::llm::{ContentBlock, GenerateOptions, LlmAdapter, LlmError, StreamChunk, llm_plugin, runtime::stream_from_chunks};
@@ -350,6 +352,113 @@ async fn seed_prompt_enters_the_log() {
     assert!(users.iter().any(|t| t == "go"));
 }
 
+
+fn parallel_tool_response(calls: &[(&str, &str, Value)]) -> Vec<StreamChunk> {
+    let mut chunks = Vec::new();
+    for (index, (id, name, arguments)) in calls.iter().enumerate() {
+        let arguments = arguments.to_string();
+        chunks.push(StreamChunk::BlockStart { index, block_type: "tool-call".into() });
+        chunks.push(StreamChunk::ToolCallDelta {
+            index,
+            id: (*id).into(),
+            name: Some((*name).into()),
+            arguments_delta: arguments.clone(),
+        });
+        chunks.push(StreamChunk::BlockEnd {
+            index,
+            block: ContentBlock::ToolCall {
+                id: (*id).into(),
+                name: (*name).into(),
+                arguments,
+            },
+        });
+    }
+    chunks.push(StreamChunk::Finish { reason: dsh_rs::llm::FinishReason::ToolCalls });
+    chunks
+}
+
+#[tokio::test]
+async fn agent_loop_parallelizes_safe_tools_around_serial_barriers() {
+    let ctx = Context::new();
+    compose(&ctx).await;
+    let active = Arc::new(AtomicUsize::new(0));
+    let peak = Arc::new(AtomicUsize::new(0));
+    let barrier = Arc::new(AtomicBool::new(false));
+    let violation = Arc::new(AtomicBool::new(false));
+    let tools = ctx.require::<ToolsService>(dsh_rs::api::TOOLS_SERVICE).unwrap();
+
+    let (safe_active, safe_peak) = (active.clone(), peak.clone());
+    let (safe_barrier, safe_violation) = (barrier.clone(), violation.clone());
+    tools.register_dynamic_tool_with_concurrency(DynamicToolSpec {
+        name: "probe_safe".into(),
+        description: "safe concurrency probe".into(),
+        parameters: json!({ "type": "object" }),
+        exec: Arc::new(move |args: Value| {
+            let (active, peak) = (safe_active.clone(), safe_peak.clone());
+            let (barrier, violation) = (safe_barrier.clone(), safe_violation.clone());
+            Box::pin(async move {
+                if barrier.load(Ordering::SeqCst) { violation.store(true, Ordering::SeqCst); }
+                let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                peak.fetch_max(current, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(args["delay"].as_u64().unwrap())).await;
+                active.fetch_sub(1, Ordering::SeqCst);
+                dsh_rs::tools::ToolExecutionResult::success_value(args)
+            })
+        }),
+    }, true);
+
+    let barrier_active = active.clone();
+    let barrier_flag = barrier.clone();
+    let barrier_violation = violation.clone();
+    tools.register_dynamic_tool(DynamicToolSpec {
+        name: "probe_barrier".into(),
+        description: "serial barrier probe".into(),
+        parameters: json!({ "type": "object" }),
+        exec: Arc::new(move |_args: Value| {
+            let (active, flag, violation) = (barrier_active.clone(), barrier_flag.clone(), barrier_violation.clone());
+            Box::pin(async move {
+                if active.load(Ordering::SeqCst) != 0 { violation.store(true, Ordering::SeqCst); }
+                flag.store(true, Ordering::SeqCst);
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                flag.store(false, Ordering::SeqCst);
+                dsh_rs::tools::ToolExecutionResult::success_value(json!({ "ok": true }))
+            })
+        }),
+    });
+
+    let runtime = ctx.require::<dsh_rs::api::services::LlmService>("llm").unwrap();
+    runtime.unregister_adapter(&["mock"]);
+    runtime.register_adapter(
+        &["mock"],
+        Arc::new(dsh_rs::llm::adapters::mock::MockAdapter::scripted(vec![
+            parallel_tool_response(&[
+                ("slow", "probe_safe", json!({ "delay": 80 })),
+                ("fast", "probe_safe", json!({ "delay": 20 })),
+                ("barrier", "probe_barrier", json!({})),
+                ("after", "probe_safe", json!({ "delay": 1 })),
+            ]),
+            dsh_rs::llm::adapters::mock::MockAdapter::text_response("done"),
+        ])),
+    ).unwrap();
+
+    let agents = ctx.require::<dsh_rs::api::services::AgentRegistryService>("agents").unwrap();
+    let agent = agents.create(None, AgentOptions::mock("mock-1"), None, None).unwrap();
+    agent.followup(user_message_with_text("u-parallel", "run probes"));
+    agent.when_idle().await;
+
+    assert!(peak.load(Ordering::SeqCst) >= 2, "safe tools did not overlap");
+    assert!(!violation.load(Ordering::SeqCst), "serial barrier overlapped another tool");
+    let results: Vec<_> = agent.session().events().into_iter().filter_map(|event| {
+        let SessionEventData::ToolResult { message, .. } = event.data else { return None };
+        let ContentBlock::ToolResult { tool_call_id, .. } = message.content.first()? else { return None };
+        Some((tool_call_id.clone(), event.time))
+    }).collect();
+    let ids: Vec<_> = results.iter().map(|(id, _)| id.as_str()).collect();
+    assert_eq!(ids, ["slow", "fast", "barrier", "after"]);
+    assert!(results[0].1 > results[1].1, "completion timestamps lost fast-first finish");
+    assert!(results[2].1 >= results[0].1, "barrier started before safe batch completed");
+    assert!(results[3].1 >= results[2].1, "post-barrier tool ran too early");
+}
 
 /// Extract text nested inside a message's tool-result blocks.
 fn message_tool_result_text(message: &dsh_rs::llm::Message) -> String {

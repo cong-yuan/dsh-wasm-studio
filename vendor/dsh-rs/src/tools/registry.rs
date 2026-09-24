@@ -53,6 +53,11 @@ impl ToolDefinition {
         }
     }
 
+    pub fn concurrency_safe(mut self) -> Self {
+        self.is_concurrency_safe = true;
+        self
+    }
+
     pub fn schema(&self) -> ToolSchema {
         ToolSchema {
             name: self.name.clone(),
@@ -127,6 +132,12 @@ impl ToolRegistry {
 
     pub fn get(&self, name: &str) -> Option<Arc<ToolDefinition>> {
         self.inner.tools.lock().unwrap().get(name).cloned()
+    }
+
+    pub fn is_concurrency_safe(&self, name: &str) -> bool {
+        self.get(name)
+            .map(|tool| tool.is_concurrency_safe)
+            .unwrap_or(false)
     }
 
     /// Run one accepted call through the guarded pipeline.
@@ -265,6 +276,10 @@ impl crate::api::services::ToolRegistryApi for ToolRegistry {
         self.list()
     }
 
+    fn is_concurrency_safe(&self, name: &str) -> bool {
+        self.is_concurrency_safe(name)
+    }
+
     fn execute(
         &self,
         call_id: String,
@@ -281,16 +296,25 @@ impl crate::api::services::ToolRegistryApi for ToolRegistry {
     }
 
     fn register_dynamic_tool(&self, spec: crate::api::services::DynamicToolSpec) {
+        self.register_dynamic_tool_with_concurrency(spec, false);
+    }
+
+    fn register_dynamic_tool_with_concurrency(
+        &self,
+        spec: crate::api::services::DynamicToolSpec,
+        is_concurrency_safe: bool,
+    ) {
         let exec = spec.exec.clone();
-        let definition = ToolDefinition::new(
-            spec.name.clone(),
-            spec.description.clone(),
-            spec.parameters.clone(),
+        let mut definition = ToolDefinition::new(
+            spec.name,
+            spec.description,
+            spec.parameters,
             move |args: crate::types::ToolCallArgs, _run_ctx: crate::types::ToolRunContext| {
                 let exec = exec.clone();
                 Box::pin(async move { exec(args.arguments).await })
             },
         );
+        definition.is_concurrency_safe = is_concurrency_safe;
         self.register(Arc::new(definition));
     }
 

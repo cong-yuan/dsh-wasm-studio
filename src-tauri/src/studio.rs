@@ -49,6 +49,7 @@
 //! host CLI's supervisor, not a bespoke schema. Enabled plugins are loaded on
 //! boot; every mutation writes the file back.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -2116,12 +2117,8 @@ impl Studio {
     /// The full message history of an agent's session, mapped for the UI.
     pub fn transcript(&self, agent_id: &str) -> Result<Vec<ChatMessage>> {
         let agent = self.agent(agent_id)?;
-        Ok(agent
-            .session()
-            .derive_messages()
-            .iter()
-            .map(chat_message)
-            .collect())
+        let session = agent.session();
+        Ok(chat_transcript(&session.derive_messages(), &session.events()))
     }
 
     // -----------------------------------------------------------------------
@@ -3002,6 +2999,9 @@ pub struct ChatToolCall {
     pub name: String,
     /// Raw JSON string as the model produced it.
     pub arguments: String,
+    /// Time the driver dispatched this call, in Unix epoch milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<u64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3009,6 +3009,9 @@ pub struct ChatToolResult {
     pub tool_call_id: String,
     pub content: String,
     pub is_error: bool,
+    /// Time the driver persisted this result, in Unix epoch milliseconds.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub finished_at: Option<u64>,
 }
 
 /// A text content block.
@@ -3200,6 +3203,45 @@ fn blocks_to_text_reasoning(blocks: &[dsh_rs::types::ContentBlock]) -> (String, 
     (text, reasoning)
 }
 
+fn chat_transcript(
+    messages: &[dsh_rs::types::Message],
+    events: &[dsh_rs::types::SessionEvent],
+) -> Vec<ChatMessage> {
+    use dsh_rs::types::{ContentBlock, SessionEventData};
+
+    let mut started_at = HashMap::new();
+    let mut finished_at = HashMap::new();
+    for event in events {
+        match &event.data {
+            SessionEventData::ToolCall { call_id, .. } => {
+                started_at.insert(call_id.as_str(), event.time);
+            }
+            SessionEventData::ToolResult { message, .. } => {
+                for block in &message.content {
+                    if let ContentBlock::ToolResult { tool_call_id, .. } = block {
+                        finished_at.insert(tool_call_id.as_str(), event.time);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    messages
+        .iter()
+        .map(|message| {
+            let mut row = chat_message(message);
+            for call in &mut row.tool_calls {
+                call.started_at = started_at.get(call.id.as_str()).copied();
+            }
+            for result in &mut row.tool_results {
+                result.finished_at = finished_at.get(result.tool_call_id.as_str()).copied();
+            }
+            row
+        })
+        .collect()
+}
+
 /// Map a dsh `Message` onto the UI transcript shape.
 fn chat_message(m: &dsh_rs::types::Message) -> ChatMessage {
     use dsh_rs::types::ContentBlock;
@@ -3223,6 +3265,7 @@ fn chat_message(m: &dsh_rs::types::Message) -> ChatMessage {
                 id: id.clone(),
                 name: name.clone(),
                 arguments: arguments.clone(),
+                started_at: None,
             }),
             ContentBlock::ToolResult {
                 tool_call_id,
@@ -3238,6 +3281,7 @@ fn chat_message(m: &dsh_rs::types::Message) -> ChatMessage {
                     tool_call_id: tool_call_id.clone(),
                     content: inner,
                     is_error: is_error.unwrap_or(false),
+                    finished_at: None,
                 });
             }
         }

@@ -33,6 +33,11 @@ async fn lists_builtin_tools() {
     assert!(names.contains(&"glob".to_string()));
     assert!(names.contains(&"grep".to_string()));
     assert_eq!(registry.schemas().len(), 7);
+    assert!(registry.is_concurrency_safe("read_file"));
+    assert!(registry.is_concurrency_safe("glob"));
+    assert!(registry.is_concurrency_safe("grep"));
+    assert!(!registry.is_concurrency_safe("bash"));
+    assert!(!registry.is_concurrency_safe("write_file"));
 }
 
 #[tokio::test]

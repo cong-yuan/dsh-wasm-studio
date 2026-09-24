@@ -360,12 +360,14 @@ export interface ChatToolCall {
   id: string;
   name: string;
   arguments: string;
+  started_at?: number;
 }
 
 export interface ChatToolResult {
   tool_call_id: string;
   content: string;
   is_error: boolean;
+  finished_at?: number;
 }
 
 export const createAgent = (

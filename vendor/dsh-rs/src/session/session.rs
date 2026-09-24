@@ -63,11 +63,10 @@ impl Session {
         self.events.lock().unwrap().clone()
     }
 
-    /// Append one typed event. The hot path never blocks on I/O — notifiers
-    /// run synchronously but must not await.
-    pub fn append(&self, data: SessionEventData) -> SessionEvent {
+    /// Append one typed event with a caller-supplied timestamp.
+    pub fn append_at(&self, time: u64, data: SessionEventData) -> SessionEvent {
         let seq = self.next_seq.fetch_add(1, Ordering::SeqCst);
-        let event = SessionEvent::new(seq, now_ms(), data);
+        let event = SessionEvent::new(seq, time, data);
         let mut events = self.events.lock().unwrap();
         events.push(event.clone());
         if event.data.is_surface() {
@@ -82,6 +81,11 @@ impl Session {
             notifier(&event);
         }
         event
+    }
+
+    /// Append one typed event. Notifiers run synchronously but must not await.
+    pub fn append(&self, data: SessionEventData) -> SessionEvent {
+        self.append_at(now_ms(), data)
     }
 
     /// The surface node seqs in model-visible order.
@@ -252,7 +256,11 @@ impl crate::api::services::SessionView for Session {
     }
 
     fn append(&self, data: SessionEventData) -> SessionEvent {
-        self.append(data)
+        Session::append(self, data)
+    }
+
+    fn append_at(&self, time: u64, data: SessionEventData) -> SessionEvent {
+        Session::append_at(self, time, data)
     }
 
     fn request_header(&self) -> Option<crate::types::EpochHeader> {
