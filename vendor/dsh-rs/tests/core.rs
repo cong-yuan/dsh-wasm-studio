@@ -460,6 +460,55 @@ async fn agent_loop_parallelizes_safe_tools_around_serial_barriers() {
     assert!(results[3].1 >= results[2].1, "post-barrier tool ran too early");
 }
 
+#[tokio::test]
+async fn agent_loop_runs_multiple_bash_calls_concurrently() {
+    let ctx = Context::new();
+    compose(&ctx).await;
+    let dir = std::env::temp_dir().join(format!(
+        "dsh-parallel-bash-{}-{}",
+        std::process::id(),
+        dsh_rs::session::now_ms()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let command = |label: &str| format!(
+        "touch '{0}/{1}.ready'; while [ \"$(find '{0}' -name '*.ready' | wc -l | tr -d ' ')\" -lt 4 ]; do sleep 0.02; done; echo {1}",
+        dir.display(), label
+    );
+
+    let runtime = ctx.require::<dsh_rs::api::services::LlmService>("llm").unwrap();
+    runtime.unregister_adapter(&["mock"]);
+    runtime.register_adapter(
+        &["mock"],
+        Arc::new(dsh_rs::llm::adapters::mock::MockAdapter::scripted(vec![
+            parallel_tool_response(&[
+                ("bash-a", "bash", json!({ "command": command("a"), "timeout_ms": 2000 })),
+                ("bash-b", "bash", json!({ "command": command("b"), "timeout_ms": 2000 })),
+                ("bash-c", "bash", json!({ "command": command("c"), "timeout_ms": 2000 })),
+                ("bash-d", "bash", json!({ "command": command("d"), "timeout_ms": 2000 })),
+            ]),
+            dsh_rs::llm::adapters::mock::MockAdapter::text_response("done"),
+        ])),
+    ).unwrap();
+
+    let agents = ctx.require::<dsh_rs::api::services::AgentRegistryService>("agents").unwrap();
+    let agent = agents.create(None, AgentOptions::mock("mock-1"), None, None).unwrap();
+    agent.followup(user_message_with_text("u-bash-parallel", "run shell probes"));
+    agent.when_idle().await;
+
+    let events = agent.session().events();
+    let first_result = events.iter().position(|event| matches!(event.data, SessionEventData::ToolResult { .. })).unwrap();
+    assert_eq!(events[..first_result].iter().filter(|event| matches!(event.data, SessionEventData::ToolCall { .. })).count(), 4);
+    let errors = events.iter().filter_map(|event| match &event.data {
+        SessionEventData::ToolResult { message, .. } => match message.content.first() {
+            Some(ContentBlock::ToolResult { is_error, .. }) => Some(*is_error == Some(true)),
+            _ => None,
+        },
+        _ => None,
+    }).collect::<Vec<_>>();
+    assert_eq!(errors, [false, false, false, false]);
+    std::fs::remove_dir_all(dir).ok();
+}
+
 /// Extract text nested inside a message's tool-result blocks.
 fn message_tool_result_text(message: &dsh_rs::llm::Message) -> String {
     let mut out = String::new();
