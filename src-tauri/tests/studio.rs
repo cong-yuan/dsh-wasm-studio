@@ -121,6 +121,62 @@ async fn studio_boots_with_the_dsh_harness() {
 }
 
 #[tokio::test]
+async fn upload_blob_is_session_scoped_and_path_safe() {
+    let dir = tmpdir("upload-blob");
+    let studio = Studio::with_hook(None, None, dir.clone()).await.unwrap();
+    studio
+        .create_agent(
+            Some("upload-1".into()),
+            "mock".into(),
+            "mock-1".into(),
+            Some("/tmp".into()),
+        )
+        .expect("agent created");
+
+    let value = studio
+        .upload_blob(
+            Some("upload-1"),
+            "../notes.txt",
+            "aGVsbG8=",
+            Some("text/plain"),
+        )
+        .await
+        .expect("upload succeeds");
+
+    let dest = PathBuf::from(value["dest"].as_str().expect("dest"));
+    let expected_root = dir.join("session-files").join("upload-1");
+    assert!(
+        dest.starts_with(&expected_root),
+        "upload must stay under its session namespace: {dest:?}"
+    );
+    assert_eq!(
+        std::fs::read(&dest).unwrap(),
+        b"hello",
+        "decoded bytes must round-trip"
+    );
+    assert_eq!(value["name"], "notes.txt");
+    assert_eq!(value["kind"], "document");
+
+    let pending = studio
+        .upload_blob(None, "pending.txt", "eA==", Some("text/plain"))
+        .await
+        .expect("pending upload succeeds");
+    let pending_dest = PathBuf::from(pending["dest"].as_str().expect("pending dest"));
+    assert!(pending["sessionId"].is_null());
+    assert!(
+        pending_dest.starts_with(dir.join("session-files").join("pending")),
+        "pending uploads must use the isolated pending namespace: {pending_dest:?}"
+    );
+
+    let err = studio
+        .upload_blob(Some("../escape"), "x.txt", "eA==", Some("text/plain"))
+        .await
+        .unwrap_err()
+        .to_string();
+    assert!(err.contains("invalid session id"));
+}
+
+#[tokio::test]
 async fn a_plugin_can_be_mounted_called_and_unmounted() {
     let dir = tmpdir("mount");
     let wasm = dir.join("alpha.wasm");

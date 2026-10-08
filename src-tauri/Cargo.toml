@@ -26,6 +26,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
 anyhow = "1"
+base64 = "0.22"
 
 # The WASM plugin runtime and its dsh-rs (cordis) integration.
 wasm-plugin-host = { path = "../../wasm-plugin-host/host" }

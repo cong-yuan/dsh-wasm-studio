@@ -54,8 +54,10 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use anyhow::{Context as _, Result};
+use anyhow::{bail, Context as _, Result};
+use base64::Engine as _;
 use dsh_wasm_host::{FlowBridgePlugin, WasmHost, WasmSlotPlugin};
 use serde::Serialize;
 use serde_json::Value;
@@ -2446,6 +2448,88 @@ impl Studio {
         }))
     }
 
+    /// Persist a browser-provided attachment into a session-owned cache.
+    ///
+    /// The browser only supplies session identity + bytes + display metadata;
+    /// the server chooses the destination under app-data/session-files.
+    pub async fn upload_blob(
+        &self,
+        session_id: Option<&str>,
+        name: &str,
+        base64_data: &str,
+        mime_type: Option<&str>,
+    ) -> Result<Value> {
+        let namespace = if let Some(session_id) = session_id {
+            validate_upload_session_id(session_id)?;
+            if !self.session_exists_for_upload(session_id) {
+                bail!("session not found: {}", session_id);
+            }
+            session_id
+        } else {
+            "pending"
+        };
+
+        const MAX_BYTES: usize = 20 * 1024 * 1024;
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(base64_data)
+            .context("invalid base64 upload")?;
+        if bytes.len() > MAX_BYTES {
+            bail!(
+                "upload too large: {} bytes (max {} bytes)",
+                bytes.len(),
+                MAX_BYTES
+            );
+        }
+        if bytes.is_empty() {
+            bail!("upload is empty");
+        }
+
+        let safe_name = sanitize_upload_name(name);
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let seq = self
+            .shared
+            .id_seq
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let file_id = format!("studio-file-{:x}-{:x}", stamp, seq);
+        let dir = self
+            .shared
+            .sessions_dir
+            .parent()
+            .unwrap_or(&self.shared.sessions_dir)
+            .join("session-files")
+            .join(namespace);
+        tokio::fs::create_dir_all(&dir).await?;
+        let dest = dir.join(format!("{}-{}", file_id, safe_name));
+        tokio::fs::write(&dest, &bytes).await?;
+
+        let mime = mime_type.unwrap_or("application/octet-stream").trim();
+        let kind = upload_kind(mime);
+        Ok(serde_json::json!({
+            "ok": true,
+            "fileId": file_id,
+            "sessionId": session_id,
+            "sessionPath": session_id.map(|id| self.shared.sessions_dir.join(format!("{}.jsonl", id)).display().to_string()),
+            "dest": dest.display().to_string(),
+            "path": dest.display().to_string(),
+            "name": safe_name,
+            "mime": mime,
+            "mimeType": mime,
+            "size": bytes.len(),
+            "kind": kind,
+            "storageKind": "managed_cache",
+            "origin": "user_upload",
+            "presentation": "attachment",
+            "listed": true,
+        }))
+    }
+
+    fn session_exists_for_upload(&self, session_id: &str) -> bool {
+        self.session_on_disk(session_id) || self.agent(session_id).is_ok()
+    }
+
     /// The full message history of an agent's session, mapped for the UI.
     pub fn transcript(&self, agent_id: &str) -> Result<Vec<ChatMessage>> {
         let agent = self.agent(agent_id)?;
@@ -3168,6 +3252,58 @@ fn install_studio_persona(ctx: &cordis::Context, config: &Config) {
     );
     let text = custom.unwrap_or(default);
     prompt.section("studio-persona", 0, text, false);
+}
+
+fn validate_upload_session_id(session_id: &str) -> Result<()> {
+    if session_id.is_empty()
+        || session_id.len() > 128
+        || !session_id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.'))
+    {
+        bail!("invalid session id");
+    }
+    Ok(())
+}
+
+fn sanitize_upload_name(raw: &str) -> String {
+    let normalized = raw.replace(char::from(92), "/");
+    let candidate = normalized
+        .rsplit('/')
+        .next()
+        .unwrap_or("")
+        .trim();
+    let mut out = String::new();
+    for ch in candidate.chars().filter(|c| !c.is_control()) {
+        if ch == ':' || ch == '*' || ch == '?' || ch == '"' || ch == '<' || ch == '>' || ch == '|' {
+            out.push('_');
+        } else {
+            out.push(ch);
+        }
+        if out.chars().count() >= 120 {
+            break;
+        }
+    }
+    let out = out.trim_matches([' ', '.']).to_string();
+    if out.is_empty() {
+        "upload.bin".to_string()
+    } else {
+        out
+    }
+}
+
+fn upload_kind(mime: &str) -> &'static str {
+    if mime.starts_with("image/") {
+        "image"
+    } else if mime.starts_with("audio/") {
+        "audio"
+    } else if mime.starts_with("video/") {
+        "video"
+    } else if mime == "application/pdf" || mime.starts_with("text/") {
+        "document"
+    } else {
+        "file"
+    }
 }
 
 fn base_config(config: &Config, app_data_dir: &Path) -> dsh_rs::bundle::BaseConfig {

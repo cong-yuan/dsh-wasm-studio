@@ -135,6 +135,7 @@ pub fn run() {
             commands::soft_unbind_agent,
             commands::rebind_agent_model,
             commands::list_models,
+            commands::upload_blob,
             commands::transcript,
             commands::chat_partial,
             commands::capabilities,

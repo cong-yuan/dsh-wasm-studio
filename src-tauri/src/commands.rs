@@ -713,6 +713,20 @@ pub fn list_models(studio: State<'_, Studio>) -> Vec<serde_json::Value> {
 
 
 #[tauri::command]
+pub async fn upload_blob(
+    studio: State<'_, Studio>,
+    session_id: Option<String>,
+    name: String,
+    base64_data: String,
+    mime_type: Option<String>,
+) -> Result<serde_json::Value, String> {
+    studio
+        .upload_blob(session_id.as_deref(), &name, &base64_data, mime_type.as_deref())
+        .await
+        .map_err(err)
+}
+
+#[tauri::command]
 pub fn capabilities(studio: State<'_, Studio>) -> Capabilities {
     Capabilities {
         dsh_services: crate::studio::dsh_services()
