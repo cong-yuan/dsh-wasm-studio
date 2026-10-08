@@ -2207,6 +2207,136 @@ impl Studio {
         }))
     }
 
+    /// Read the latest durable session summary produced by fresh compact.
+    pub fn get_session_summary(&self, agent_id: &str) -> Result<serde_json::Value> {
+        let agent = self.agent(agent_id)?;
+        let session = agent.session();
+        let Some((_seq, time, summary)) = session.latest_compaction_summary() else {
+            return Ok(serde_json::json!({
+                "hasSummary": false,
+                "summary": null,
+                "createdAt": null,
+                "updatedAt": null,
+            }));
+        };
+        Ok(serde_json::json!({
+            "hasSummary": true,
+            "summary": summary,
+            "createdAt": time,
+            "updatedAt": time,
+        }))
+    }
+
+    /// Return the session's durable file-access scope.
+    pub fn get_session_folder_scope(&self, agent_id: &str) -> Result<serde_json::Value> {
+        let agent = self.agent(agent_id)?;
+        let session = agent.session();
+        let cwd = session.header_cwd();
+        let authorized = session.authorized_folders();
+        let mut sandbox = authorized.clone();
+        if let Some(primary) = cwd.clone() {
+            if !sandbox.iter().any(|item| item == &primary) {
+                sandbox.insert(0, primary);
+            }
+        }
+        Ok(serde_json::json!({
+            "ok": true,
+            "sessionId": agent_id,
+            "cwd": cwd,
+            "workspaceFolders": [],
+            "authorizedFolders": authorized,
+            "sandboxFolders": sandbox,
+        }))
+    }
+
+    /// Persist the session's additional file-access roots as a whole-list snapshot.
+    pub async fn set_session_authorized_folders(
+        &self,
+        agent_id: &str,
+        folders: Vec<String>,
+    ) -> Result<serde_json::Value> {
+        let agent = self.agent(agent_id)?;
+        if agent.driver_busy() || agent.session().open_turn().is_some() {
+            bail!("session is busy");
+        }
+        let cwd = agent.session().header_cwd();
+        let mut normalized = Vec::new();
+        for raw in folders {
+            let raw = raw.trim();
+            if raw.is_empty() {
+                bail!("folder is required");
+            }
+            let path = std::path::Path::new(raw);
+            let metadata = std::fs::metadata(path).map_err(|_| anyhow::anyhow!("folder does not exist"))?;
+            if !metadata.is_dir() {
+                bail!("folder must be a directory");
+            }
+            let canonical = std::fs::canonicalize(path)
+                .map_err(|_| anyhow::anyhow!("folder does not exist"))?
+                .display()
+                .to_string();
+            if cwd.as_deref() == Some(canonical.as_str()) || normalized.iter().any(|item| item == &canonical) {
+                continue;
+            }
+            normalized.push(canonical);
+        }
+
+        let session = agent.session();
+        session.append(dsh_rs::types::SessionEventData::AuthorizedFolders {
+            folders: normalized,
+        });
+        self.shared
+            .ctx
+            .require::<dsh_rs::api::services::SessionService>(dsh_rs::api::SESSIONS_SERVICE)
+            .map_err(|e| anyhow::anyhow!("sessions service unavailable: {e}"))?
+            .flush(agent_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("flushing authorized folders failed: {e}"))?;
+
+        self.get_session_folder_scope(agent_id)
+    }
+
+    /// Apply one OpenHanako authorized-folder mutation atomically.
+    pub async fn patch_session_authorized_folders(
+        &self,
+        agent_id: &str,
+        action: &str,
+        folder: Option<String>,
+        folders: Option<Vec<String>>,
+    ) -> Result<serde_json::Value> {
+        match action {
+            "set" => self
+                .set_session_authorized_folders(agent_id, folders.unwrap_or_default())
+                .await,
+            "add" => {
+                let folder = folder.ok_or_else(|| anyhow::anyhow!("folder is required"))?;
+                let mut current = self
+                    .agent(agent_id)?
+                    .session()
+                    .authorized_folders();
+                current.push(folder);
+                self.set_session_authorized_folders(agent_id, current).await
+            }
+            "remove" => {
+                let folder = folder.ok_or_else(|| anyhow::anyhow!("folder is required"))?;
+                let canonical = std::path::Path::new(folder.trim())
+                    .canonicalize()
+                    .unwrap_or_else(|_| std::path::PathBuf::from(folder.trim()))
+                    .display()
+                    .to_string();
+                let current = self
+                    .agent(agent_id)?
+                    .session()
+                    .authorized_folders()
+                    .into_iter()
+                    .filter(|item| item != &canonical)
+                    .collect();
+                self.set_session_authorized_folders(agent_id, current).await
+            }
+            _ => bail!("Invalid action"),
+        }
+    }
+
     /// Fresh-compact one Studio session using the active LLM route.
     ///
     /// The summary is persisted as a native dsh session/compact event. The
@@ -4586,6 +4716,84 @@ mod todo_mutation_tests {
         assert_eq!(derived.len(), 1);
         assert_eq!(derived[0].role, dsh_rs::types::Role::System);
         assert!(derived[0].text().contains("continue this old work"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn session_summary_and_authorized_folders_are_real_durable_capabilities() {
+        let dir = std::env::temp_dir().join(format!(
+            "dsh-studio-session-metadata-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let studio = Studio::with_hook(None, None, dir.clone()).await.unwrap();
+        let allowed = dir.join("allowed");
+        std::fs::create_dir_all(&allowed).unwrap();
+
+        studio
+            .create_agent(
+                Some("metadata".into()),
+                "mock".into(),
+                "mock-1".into(),
+                Some(dir.display().to_string()),
+            )
+            .expect("agent created");
+        let agent = studio.agent("metadata").expect("agent exists");
+        agent.session().append(dsh_rs::types::SessionEventData::Compaction {
+            summary: "Conversation summary: keep the metadata".into(),
+        });
+
+        let summary = studio.get_session_summary("metadata").unwrap();
+        assert_eq!(summary.get("hasSummary").and_then(|v| v.as_bool()), Some(true));
+        assert!(summary["summary"].as_str().unwrap().contains("keep the metadata"));
+
+        let scope = studio
+            .patch_session_authorized_folders(
+                "metadata",
+                "set",
+                None,
+                Some(vec![allowed.display().to_string()]),
+            )
+            .await
+            .unwrap();
+        let canonical_allowed = allowed.canonicalize().unwrap();
+        let canonical_allowed = canonical_allowed.to_string_lossy().to_string();
+        assert_eq!(
+            scope["authorizedFolders"][0].as_str(),
+            Some(canonical_allowed.as_str())
+        );
+        assert_eq!(
+            agent.session().authorized_folders(),
+            vec![canonical_allowed.clone()]
+        );
+
+        let reloaded = studio.get_session_folder_scope("metadata").unwrap();
+        assert_eq!(
+            reloaded["sandboxFolders"][1].as_str(),
+            Some(canonical_allowed.as_str())
+        );
+
+        let invalid = studio
+            .patch_session_authorized_folders(
+                "metadata",
+                "set",
+                None,
+                Some(vec![dir.join("missing").display().to_string()]),
+            )
+            .await
+            .expect_err("missing folder must be rejected");
+        assert!(invalid.to_string().contains("folder does not exist"));
+
+        studio.soft_unbind_agent("metadata").unwrap();
+        studio.resume_session("metadata").unwrap();
+        let hydrated_scope = studio.get_session_folder_scope("metadata").unwrap();
+        assert_eq!(
+            hydrated_scope["authorizedFolders"][0].as_str(),
+            Some(canonical_allowed.as_str())
+        );
+        let hydrated_summary = studio.get_session_summary("metadata").unwrap();
+        assert_eq!(hydrated_summary["hasSummary"].as_bool(), Some(true));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

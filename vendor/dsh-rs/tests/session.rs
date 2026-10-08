@@ -129,6 +129,32 @@ fn compaction_replaces_model_visible_prefix_but_keeps_log() {
 }
 
 #[test]
+fn latest_compaction_and_authorized_folders_are_durable_projections() {
+    let ctx = cordis::Context::new();
+    let store = SessionStore::new(ctx);
+    let session = seed_session(&store, "metadata-1");
+
+    session.append(SessionEventData::AuthorizedFolders {
+        folders: vec!["/tmp/project".into(), "/tmp/shared".into()],
+    });
+    session.append(SessionEventData::Compaction {
+        summary: "Conversation summary: durable state".into(),
+    });
+    session.append(SessionEventData::AuthorizedFolders {
+        folders: vec!["/tmp/project".into()],
+    });
+
+    let summary = session.latest_compaction_summary().expect("summary exists");
+    assert!(summary.2.contains("durable state"));
+    assert_eq!(session.authorized_folders(), vec!["/tmp/project".to_string()]);
+
+    let events = session.events();
+    assert_eq!(events[0].event_type(), "session/authorized-folders");
+    assert_eq!(events[1].event_type(), "session/compact");
+    assert_eq!(events[2].event_type(), "session/authorized-folders");
+}
+
+#[test]
 fn request_header_folds_latest_snapshot() {
     let ctx = cordis::Context::new();
     let store = SessionStore::new(ctx);

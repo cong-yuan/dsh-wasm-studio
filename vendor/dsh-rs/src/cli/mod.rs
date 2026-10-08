@@ -55,6 +55,9 @@ pub fn render_event(event: &SessionEvent) -> String {
         SessionEventData::AssistantChunk { chunk, .. } => format!("[assistant/chunk] {chunk:?}"),
         SessionEventData::TodoWrite { todos } => format!("[todo/write] {todos:?}"),
         SessionEventData::Compaction { summary } => format!("[session/compact] {summary}"),
+        SessionEventData::AuthorizedFolders { folders } => {
+            format!("[session/authorized-folders] {folders:?}")
+        }
         SessionEventData::RequestHeader { .. } => "[request/header]".to_string(),
         SessionEventData::SessionEndSeed => "[session/end-seed]".to_string(),
     }

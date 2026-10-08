@@ -115,6 +115,52 @@ fn resolve_path(run_ctx: &ToolRunContext, raw: &str) -> PathBuf {
     }
 }
 
+fn path_is_allowed(run_ctx: &ToolRunContext, path: &Path, for_write: bool) -> bool {
+    if run_ctx.allowed_roots.is_empty() {
+        return true;
+    }
+
+    let candidate = if path.exists() {
+        std::fs::canonicalize(path).ok()
+    } else if for_write {
+        let mut ancestor = path.parent();
+        while let Some(parent) = ancestor {
+            if parent.exists() {
+                let Some(resolved) = std::fs::canonicalize(parent).ok() else {
+                    return false;
+                };
+                return run_ctx.allowed_roots.iter().any(|root| {
+                    std::fs::canonicalize(root)
+                        .ok()
+                        .map(|root| resolved.starts_with(root))
+                        .unwrap_or(false)
+                });
+            }
+            ancestor = parent.parent();
+        }
+        return false;
+    } else {
+        None
+    };
+
+    let Some(candidate) = candidate else {
+        return false;
+    };
+    run_ctx.allowed_roots.iter().any(|root| {
+        std::fs::canonicalize(root)
+            .ok()
+            .map(|resolved| candidate.starts_with(resolved))
+            .unwrap_or(false)
+    })
+}
+
+fn denied_path(path: &Path) -> ToolExecutionResult {
+    ToolExecutionResult::error(
+        "PATH_DENIED",
+        format!("path is outside the session authorized folders: {}", path.display()),
+    )
+}
+
 // ---------------------------------------------------------------------------
 // bash
 // ---------------------------------------------------------------------------
@@ -293,6 +339,9 @@ fn read_file_tool() -> Arc<ToolDefinition> {
                     Err(err) => return ToolExecutionResult::error("INVALID_ARGS", err.to_string()),
                 };
                 let path = resolve_path(&run_ctx, &parsed.path);
+                if !path_is_allowed(&run_ctx, &path, false) {
+                    return denied_path(&path);
+                }
                 match tokio::fs::read_to_string(&path).await {
                     Ok(content) => {
                         let value = json!({ "path": path.display().to_string(), "content": content });
@@ -338,6 +387,9 @@ fn write_file_tool() -> Arc<ToolDefinition> {
                     Err(err) => return ToolExecutionResult::error("INVALID_ARGS", err.to_string()),
                 };
                 let path = resolve_path(&run_ctx, &parsed.path);
+                if !path_is_allowed(&run_ctx, &path, true) {
+                    return denied_path(&path);
+                }
                 if let Some(parent) = path.parent() {
                     if let Err(err) = tokio::fs::create_dir_all(parent).await {
                         return ToolExecutionResult::error(
@@ -399,6 +451,9 @@ fn edit_file_tool() -> Arc<ToolDefinition> {
                     Err(err) => return ToolExecutionResult::error("INVALID_ARGS", err.to_string()),
                 };
                 let path = resolve_path(&run_ctx, &parsed.path);
+                if !path_is_allowed(&run_ctx, &path, false) {
+                    return denied_path(&path);
+                }
                 let content = match tokio::fs::read_to_string(&path).await {
                     Ok(content) => content,
                     Err(err) => {
@@ -483,6 +538,9 @@ fn glob_tool() -> Arc<ToolDefinition> {
                     .map(|p| resolve_path(&run_ctx, &p))
                     .or_else(|| run_ctx.cwd.clone().map(PathBuf::from))
                     .unwrap_or_else(|| PathBuf::from("."));
+                if !path_is_allowed(&run_ctx, &base, false) {
+                    return denied_path(&base);
+                }
                 let pattern = parsed.pattern.clone();
                 let matches = walk_and_match(&base, &pattern).await;
                 let relative: Vec<String> = matches
@@ -522,7 +580,10 @@ async fn walk_and_match(base: &Path, pattern: &str) -> Vec<PathBuf> {
         collected.sort_by_key(|e| e.file_name());
         for entry in collected {
             let path = entry.path();
-            let Ok(meta) = entry.metadata().await else { continue };
+            let Ok(meta) = tokio::fs::symlink_metadata(&path).await else { continue };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
             if meta.is_dir() {
                 stack.push(path.clone());
             }
@@ -589,6 +650,9 @@ fn grep_tool() -> Arc<ToolDefinition> {
                     .map(|p| resolve_path(&run_ctx, &p))
                     .or_else(|| run_ctx.cwd.clone().map(PathBuf::from))
                     .unwrap_or_else(|| PathBuf::from("."));
+                if !path_is_allowed(&run_ctx, &base, false) {
+                    return denied_path(&base);
+                }
                 let files = collect_files(&base).await;
                 let mut matches: Vec<GrepMatch> = Vec::new();
                 for file in files {
@@ -646,7 +710,10 @@ async fn collect_files(base: &Path) -> Vec<PathBuf> {
         collected.sort_by_key(|e| e.file_name());
         for entry in collected {
             let path = entry.path();
-            let Ok(meta) = entry.metadata().await else { continue };
+            let Ok(meta) = tokio::fs::symlink_metadata(&path).await else { continue };
+            if meta.file_type().is_symlink() {
+                continue;
+            }
             if meta.is_dir() {
                 stack.push(path.clone());
             } else {

@@ -12,6 +12,7 @@ fn run_ctx(cwd: &str) -> ToolRunContext {
         signal: CancelToken::new(),
         agent_id: Some("agent-1".into()),
         cwd: Some(cwd.to_string()),
+        allowed_roots: vec![],
     }
 }
 
@@ -308,6 +309,46 @@ async fn guard_denies_after_waterfall() {
 }
 
 #[tokio::test]
+async fn authorized_roots_block_file_escape_but_allow_declared_folder() {
+    let root = std::env::temp_dir().join(format!("dsh-authorized-root-{}", std::process::id()));
+    let allowed = root.join("allowed");
+    let outside = root.join("outside");
+    std::fs::create_dir_all(&allowed).unwrap();
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::write(allowed.join("inside.txt"), "inside").unwrap();
+    std::fs::write(outside.join("secret.txt"), "secret").unwrap();
+
+    let (_, registry) = make_registry();
+    let mut ctx = run_ctx(allowed.to_str().unwrap());
+    ctx.allowed_roots = vec![allowed.to_string_lossy().to_string()];
+
+    let allowed_read = registry
+        .execute(
+            "call-allowed".into(),
+            "read_file".into(),
+            json!({ "path": "inside.txt" }),
+            ctx.clone(),
+        )
+        .await;
+    assert!(!allowed_read.is_error(), "allowed read failed: {allowed_read:?}");
+
+    let denied = registry
+        .execute(
+            "call-denied".into(),
+            "read_file".into(),
+            json!({ "path": outside.join("secret.txt") }),
+            ctx,
+        )
+        .await;
+    assert!(matches!(
+        denied,
+        ToolExecutionResult::Error { ref code, .. } if code == "PATH_DENIED"
+    ));
+
+    std::fs::remove_dir_all(root).ok();
+}
+
+#[tokio::test]
 async fn tools_plugin_provides_registry() {
     let ctx = cordis::Context::new();
     let handle = ctx.plugin(tools_plugin(), Some(Value::Null));
@@ -336,6 +377,7 @@ async fn bash_cancellation_kills_the_command_process_group() {
             signal: token2,
             agent_id: None,
             cwd: Some("/tmp".to_string()),
+            allowed_roots: vec![],
         };
         registry
             .execute("call-tree".into(), "bash".into(), json!({ "command": command }), run_ctx)

@@ -53,6 +53,8 @@ pub trait SessionView: Send + Sync + 'static {
     fn events(&self) -> Vec<SessionEvent>;
     fn surface(&self) -> Vec<u64>;
     fn derive_messages(&self) -> Vec<Message>;
+    fn latest_compaction_summary(&self) -> Option<(u64, u64, String)>;
+    fn authorized_folders(&self) -> Vec<String>;
     fn append(&self, data: SessionEventData) -> SessionEvent;
     fn append_at(&self, _time: u64, data: SessionEventData) -> SessionEvent {
         self.append(data)

@@ -107,6 +107,9 @@ pub enum SessionEventData {
     /// Session::derive_messages treats the latest compaction as the model
     /// context boundary.
     Compaction { summary: String },
+    /// Whole-list snapshot of the session's additional file-access roots.
+    /// The session cwd remains the implicit primary root.
+    AuthorizedFolders { folders: Vec<String> },
     /// Full header for the next request, appended inside its step.
     RequestHeader { header: EpochHeader },
     /// Marks the end of a constructor seed (resume/fork/replay).
@@ -137,6 +140,7 @@ impl SessionEventData {
             SessionEventData::ToolResult { .. } => "tool/result",
             SessionEventData::TodoWrite { .. } => "todo/write",
             SessionEventData::Compaction { .. } => "session/compact",
+            SessionEventData::AuthorizedFolders { .. } => "session/authorized-folders",
             SessionEventData::RequestHeader { .. } => "request/header",
             SessionEventData::SessionEndSeed => "session/end-seed",
         }

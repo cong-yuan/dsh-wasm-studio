@@ -334,11 +334,19 @@ async fn run_turn(agent: &Arc<Agent>, claimed: Vec<Message>) -> Result<(), crate
                     arguments: arguments.clone(),
                 });
                 let parsed_args = serde_json::from_str(arguments).unwrap_or(Value::Null);
+                let cwd = agent.session.header_cwd();
+                let mut allowed_roots = agent.session.authorized_folders();
+                if let Some(primary) = cwd.clone() {
+                    if !allowed_roots.iter().any(|root| root == &primary) {
+                        allowed_roots.insert(0, primary);
+                    }
+                }
                 let run_ctx = ToolRunContext {
                     ctx: agent.ctx.clone(),
                     signal: agent.turn_token().unwrap_or_default(),
                     agent_id: Some(agent.id.clone()),
-                    cwd: agent.session.header_cwd(),
+                    cwd,
+                    allowed_roots,
                 };
                 let tools = tools.clone();
                 let id = id.clone();

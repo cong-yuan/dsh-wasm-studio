@@ -48,6 +48,7 @@ fn run_ctx() -> dsh_rs::types::ToolRunContext {
         signal: dsh_rs::types::CancelToken::new(),
         agent_id: Some("agent-test".to_string()),
         cwd: Some("/tmp".to_string()),
+            allowed_roots: vec![],
     }
 }
 

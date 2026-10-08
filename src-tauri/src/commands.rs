@@ -614,6 +614,36 @@ pub async fn complete_session_todos(
 }
 
 #[tauri::command]
+pub fn get_session_summary(
+    studio: State<'_, Studio>,
+    agent_id: String,
+) -> Result<serde_json::Value, String> {
+    studio.get_session_summary(&agent_id).map_err(err)
+}
+
+#[tauri::command]
+pub fn get_session_folder_scope(
+    studio: State<'_, Studio>,
+    agent_id: String,
+) -> Result<serde_json::Value, String> {
+    studio.get_session_folder_scope(&agent_id).map_err(err)
+}
+
+#[tauri::command]
+pub async fn patch_session_authorized_folders(
+    studio: State<'_, Studio>,
+    agent_id: String,
+    action: String,
+    folder: Option<String>,
+    folders: Option<Vec<String>>,
+) -> Result<serde_json::Value, String> {
+    studio
+        .patch_session_authorized_folders(&agent_id, &action, folder, folders)
+        .await
+        .map_err(err)
+}
+
+#[tauri::command]
 pub async fn fresh_compact_session(
     studio: State<'_, Studio>,
     agent_id: String,

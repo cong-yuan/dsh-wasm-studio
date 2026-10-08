@@ -114,6 +114,35 @@ impl Session {
         *self.request_header_state.lock().unwrap() = latest;
     }
 
+    /// Return the latest durable compaction summary and its event watermark.
+    pub fn latest_compaction_summary(&self) -> Option<(u64, u64, String)> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find_map(|event| match &event.data {
+                SessionEventData::Compaction { summary } => {
+                    Some((event.seq, event.time, summary.clone()))
+                }
+                _ => None,
+            })
+    }
+
+    /// Return the latest additional file-access roots.
+    pub fn authorized_folders(&self) -> Vec<String> {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .rev()
+            .find_map(|event| match &event.data {
+                SessionEventData::AuthorizedFolders { folders } => Some(folders.clone()),
+                _ => None,
+            })
+            .unwrap_or_default()
+    }
+
     /// Derive the LLM message history by walking the event log.
     ///
     /// The latest session/compact event becomes a durable system-role summary
@@ -220,6 +249,9 @@ impl Session {
             }
             SessionEventData::TodoWrite { todos } => format!("[todo/write] {todos:?}"),
             SessionEventData::Compaction { summary } => format!("[session/compact] {summary}"),
+            SessionEventData::AuthorizedFolders { folders } => {
+                format!("[session/authorized-folders] {folders:?}")
+            }
             SessionEventData::RequestHeader { .. } => "[request/header]".to_string(),
             SessionEventData::SessionEndSeed => "[session/end-seed]".to_string(),
         }
@@ -265,6 +297,14 @@ impl crate::api::services::SessionView for Session {
 
     fn derive_messages(&self) -> Vec<Message> {
         self.derive_messages()
+    }
+
+    fn latest_compaction_summary(&self) -> Option<(u64, u64, String)> {
+        self.latest_compaction_summary()
+    }
+
+    fn authorized_folders(&self) -> Vec<String> {
+        self.authorized_folders()
     }
 
     fn append(&self, data: SessionEventData) -> SessionEvent {

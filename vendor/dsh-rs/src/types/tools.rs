@@ -76,4 +76,7 @@ pub struct ToolRunContext {
     pub signal: CancelToken,
     pub agent_id: Option<String>,
     pub cwd: Option<String>,
+    /// Canonical roots available to file-oriented built-ins for this call.
+    /// Empty means no additional restriction (legacy/plugin test context).
+    pub allowed_roots: Vec<String>,
 }
