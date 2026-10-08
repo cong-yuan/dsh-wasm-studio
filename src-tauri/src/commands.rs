@@ -555,6 +555,31 @@ pub fn resume_session(studio: State<'_, Studio>, session_id: String) -> Result<S
     studio.resume_session(&session_id).map_err(err)
 }
 
+/// Fork a session at an OpenHanako history node using dsh's durable event prefix.
+#[tauri::command]
+pub async fn fork_session(
+    studio: State<'_, Studio>,
+    session_id: String,
+    target: Value,
+) -> Result<Value, String> {
+    studio.fork_session(&session_id, target).await.map_err(err)
+}
+
+/// Rewind and replay one completed turn on the same durable session id.
+#[tauri::command]
+pub async fn retry_session_turn(
+    studio: State<'_, Studio>,
+    session_id: String,
+    target: Value,
+    replacement_text: Option<String>,
+    msg_id: Option<String>,
+) -> Result<Value, String> {
+    studio
+        .retry_session_turn(&session_id, target, replacement_text, msg_id)
+        .await
+        .map_err(err)
+}
+
 /// Send a user message and wait for the turn to finish.
 #[tauri::command]
 pub async fn send_message(

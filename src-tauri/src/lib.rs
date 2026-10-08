@@ -126,6 +126,8 @@ pub fn run() {
             commands::list_agents,
             commands::list_sessions,
             commands::resume_session,
+            commands::fork_session,
+            commands::retry_session_turn,
             commands::send_message,
             commands::steer_agent,
             commands::cancel_agent,

@@ -69,6 +69,36 @@ fn tmpdir(tag: &str) -> PathBuf {
     p
 }
 
+fn parallel_bash_response() -> Vec<dsh_rs::llm::StreamChunk> {
+    use dsh_rs::llm::{ContentBlock, FinishReason, StreamChunk};
+
+    let mut chunks = Vec::new();
+    for index in 0..4 {
+        let id = format!("bash-{index}");
+        let arguments = serde_json::json!({ "command": "while :; do sleep 30; done" }).to_string();
+        chunks.push(StreamChunk::BlockStart {
+            index,
+            block_type: "tool-call".into(),
+        });
+        chunks.push(StreamChunk::ToolCallDelta {
+            index,
+            id: id.clone(),
+            name: Some("bash".into()),
+            arguments_delta: arguments.clone(),
+        });
+        chunks.push(StreamChunk::BlockEnd {
+            index,
+            block: ContentBlock::ToolCall {
+                id,
+                name: "bash".into(),
+                arguments,
+            },
+        });
+    }
+    chunks.push(StreamChunk::Finish { reason: FinishReason::ToolCalls });
+    chunks
+}
+
 #[tokio::test]
 async fn studio_boots_with_the_dsh_harness() {
     let dir = tmpdir("boot");
@@ -652,6 +682,73 @@ async fn an_agent_calls_a_wasm_tool_in_a_real_turn() {
     );
     // The turn closed with the model's final text.
     assert_eq!(transcript.last().unwrap().text, "done");
+}
+
+#[tokio::test]
+async fn cancel_stops_parallel_infinite_shells_and_settles_send() {
+    use dsh_rs::api::services::LlmService;
+    use std::sync::Arc;
+
+    let dir = tmpdir("cancel-parallel-shells");
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    let runtime = studio.ctx().require::<LlmService>(dsh_rs::api::LLM_SERVICE).unwrap();
+    runtime.unregister_adapter(&["mock"]);
+    runtime.register_adapter(
+        &["mock"],
+        Arc::new(dsh_rs::llm::adapters::mock::MockAdapter::scripted(vec![parallel_bash_response()])),
+    ).unwrap();
+    studio.create_agent(Some("cancel-shells".into()), "mock".into(), "mock-1".into(), None).unwrap();
+
+    let sender = studio.clone();
+    let send = tokio::spawn(async move {
+        sender.send_message("cancel-shells", "run forever".into(), "u-cancel".into()).await
+    });
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let calls = studio.transcript("cancel-shells").unwrap().iter()
+            .flat_map(|message| message.tool_calls.iter()).count();
+        if calls == 4 { break; }
+        assert!(tokio::time::Instant::now() < deadline, "four shell calls did not start");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    studio.cancel_agent("cancel-shells").unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), send)
+        .await.expect("Stop must settle send_message").unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn dispose_stops_parallel_infinite_shells_and_settles_send() {
+    use dsh_rs::api::services::LlmService;
+    use std::sync::Arc;
+
+    let dir = tmpdir("dispose-parallel-shells");
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    let runtime = studio.ctx().require::<LlmService>(dsh_rs::api::LLM_SERVICE).unwrap();
+    runtime.unregister_adapter(&["mock"]);
+    runtime.register_adapter(
+        &["mock"],
+        Arc::new(dsh_rs::llm::adapters::mock::MockAdapter::scripted(vec![parallel_bash_response()])),
+    ).unwrap();
+    studio.create_agent(Some("dispose-shells".into()), "mock".into(), "mock-1".into(), None).unwrap();
+
+    let sender = studio.clone();
+    let send = tokio::spawn(async move {
+        sender.send_message("dispose-shells", "run forever".into(), "u-dispose".into()).await
+    });
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let calls = studio.transcript("dispose-shells").unwrap().iter()
+            .flat_map(|message| message.tool_calls.iter()).count();
+        if calls == 4 { break; }
+        assert!(tokio::time::Instant::now() < deadline, "four shell calls did not start");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+
+    studio.dispose_agent("dispose-shells").unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(2), send)
+        .await.expect("delete must settle send_message").unwrap().unwrap();
+    assert!(!studio.list_sessions().iter().any(|row| row.id == "dispose-shells"));
 }
 
 #[tokio::test]

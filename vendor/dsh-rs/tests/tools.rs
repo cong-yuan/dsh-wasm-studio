@@ -316,9 +316,18 @@ async fn tools_plugin_provides_registry() {
     assert_eq!(registry.list().len(), 7);
 }
 
+#[cfg(unix)]
 #[tokio::test]
-async fn bash_cancellation_returns_cancelled() {
+async fn bash_cancellation_kills_the_command_process_group() {
     let (_, registry) = make_registry();
+    let dir = std::env::temp_dir().join(format!(
+        "dsh-bash-cancel-tree-{}-{}",
+        std::process::id(),
+        dsh_rs::session::now_ms()
+    ));
+    std::fs::create_dir_all(&dir).unwrap();
+    let marker = dir.join("orphaned");
+    let command = format!("(sleep 1; touch '{}') & wait", marker.display());
     let token = CancelToken::new();
     let token2 = token.clone();
     let handle = tokio::spawn(async move {
@@ -329,14 +338,18 @@ async fn bash_cancellation_returns_cancelled() {
             cwd: Some("/tmp".to_string()),
         };
         registry
-            .execute("call-1".into(), "bash".into(), json!({ "command": "sleep 30" }), run_ctx)
+            .execute("call-tree".into(), "bash".into(), json!({ "command": command }), run_ctx)
             .await
     });
+
     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     token.cancel();
-    let result = handle.await.unwrap();
-    match result {
-        ToolExecutionResult::Error { code, .. } => assert_eq!(code, "CANCELLED"),
-        other => panic!("expected cancellation, got {other:?}"),
-    }
+    let result = tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+        .await
+        .expect("cancelled bash should settle")
+        .unwrap();
+    assert!(matches!(result, ToolExecutionResult::Error { ref code, .. } if code == "CANCELLED"));
+    tokio::time::sleep(std::time::Duration::from_millis(1200)).await;
+    assert!(!marker.exists(), "background descendant survived cancellation");
+    std::fs::remove_dir_all(dir).ok();
 }

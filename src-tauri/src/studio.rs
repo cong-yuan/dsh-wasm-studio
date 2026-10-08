@@ -451,6 +451,7 @@ impl Studio {
                 watch: None,
                 config: if config.is_null() { None } else { Some(config) },
                 restart_on_config: false,
+                ..PluginEntry::default()
             },
         );
         drop(cfg);
@@ -1618,6 +1619,334 @@ impl Studio {
         Ok(session_id.to_string())
     }
 
+    /// Fork one completed Studio session at an OpenHanako-visible history node.
+    ///
+    /// The UI target uses `studio-entry:<transcript-index>:<role>` ids. The
+    /// transcript index counts dsh's derived messages, including tool-result
+    /// transport rows that OpenHanako later hides, so it can be resolved back
+    /// to the exact source event without guessing from text.
+    pub async fn fork_session(&self, session_id: &str, target: Value) -> Result<Value> {
+        use dsh_rs::types::{CreateSessionOptions, SessionEventData, TurnEndReason};
+
+        let source_agent = self.agent(session_id)?;
+        if source_agent.driver_busy() {
+            anyhow::bail!("session_busy");
+        }
+        let source = source_agent.session();
+        let events = source.events();
+        if events.is_empty() {
+            anyhow::bail!("session `{session_id}` has no events");
+        }
+
+        let role = target
+            .get("role")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("session node target role is required"))?;
+        let entry_id = match role {
+            "user" | "assistant" => target.get("entryId").and_then(Value::as_str),
+            "assistant_turn" => target.get("turnInputEntryId").and_then(Value::as_str),
+            _ => None,
+        }
+        .ok_or_else(|| anyhow::anyhow!("session node target entry id is required"))?;
+        let (target_index, encoded_role) = parse_studio_entry_id(entry_id)?;
+        let expected_role = if role == "assistant" { "assistant" } else { "user" };
+        if encoded_role != expected_role {
+            anyhow::bail!("session node target role does not match entry id");
+        }
+
+        let target_event = transcript_event_at(&events, target_index)
+            .ok_or_else(|| anyhow::anyhow!("session node target is not on the active transcript"))?;
+        match (&target_event.data, expected_role) {
+            (SessionEventData::UserMessage { .. }, "user") => {}
+            (SessionEventData::AssistantMessage { .. }, "assistant") => {}
+            _ => anyhow::bail!("session node target does not match transcript role"),
+        }
+        let (turn, turn_start, turn_end) = turn_bounds_for_event(&events, target_event.seq)?;
+
+        let sessions = self
+            .shared
+            .ctx
+            .require::<dsh_rs::api::services::SessionService>(dsh_rs::api::SESSIONS_SERVICE)
+            .map_err(|e| anyhow::anyhow!("sessions service unavailable: {e}"))?;
+        let child_id = self.new_session_id();
+
+        let boundary = if role == "user" {
+            turn_start.checked_sub(1)
+        } else {
+            Some(turn_end)
+        };
+        let prefix: Vec<dsh_rs::types::SessionEvent> = boundary
+            .map(|seq| events.iter().filter(|event| event.seq <= seq).cloned().collect())
+            .unwrap_or_default();
+
+        let child = if let Some(seq) = boundary {
+            sessions
+                .fork(session_id, Some(seq), Some(child_id.clone()))
+                .map_err(|e| anyhow::anyhow!("forking session `{session_id}`: {e}"))?
+        } else {
+            let child = sessions.create(CreateSessionOptions {
+                id: Some(child_id.clone()),
+                cwd: source.header_cwd(),
+                seed: Vec::new(),
+                parent_session: Some(session_id.to_string()),
+            });
+            child.append(SessionEventData::SessionEndSeed);
+            child
+        };
+
+        // SessionStore::fork seeds the in-memory child but persistence only sees
+        // future appends. Persist the inherited prefix exactly once before the
+        // buffered SessionEndSeed/synthetic user-node events are flushed.
+        if !prefix.is_empty() {
+            std::fs::create_dir_all(&self.shared.sessions_dir)?;
+            let path = self.shared.sessions_dir.join(format!("{child_id}.jsonl"));
+            if path.exists() {
+                let _ = sessions.remove(&child_id);
+                anyhow::bail!("fork destination `{child_id}` already exists");
+            }
+            let mut jsonl = String::new();
+            for event in &prefix {
+                jsonl.push_str(&serde_json::to_string(event)?);
+                jsonl.push('\n');
+            }
+            if let Err(error) = std::fs::write(&path, jsonl.as_bytes()) {
+                let _ = sessions.remove(&child_id);
+                return Err(anyhow::anyhow!("persisting fork seed `{child_id}`: {error}"));
+            }
+        }
+
+        if role == "user" {
+            let message = match &target_event.data {
+                SessionEventData::UserMessage { message } => message.clone(),
+                _ => unreachable!(),
+            };
+            let next_turn = child
+                .events()
+                .iter()
+                .filter_map(|event| match event.data {
+                    SessionEventData::TurnStart { turn } => Some(turn),
+                    _ => None,
+                })
+                .max()
+                .unwrap_or(0)
+                + 1;
+            child.append(SessionEventData::TurnStart { turn: next_turn });
+            child.append(SessionEventData::UserMessage { message });
+            child.append(SessionEventData::TurnEnd {
+                turn: next_turn,
+                reason: TurnEndReason::Interrupted,
+            });
+        }
+
+        sessions
+            .flush(&child_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("flushing fork `{child_id}`: {e}"))?;
+
+        let options = last_request_options(&events);
+        let child_agent = in_runtime(|| -> Result<Arc<dsh_rs::core::Agent>> {
+            let agent = dsh_rs::core::Agent::new(
+                child_id.clone(),
+                options,
+                child,
+                self.shared.ctx.clone(),
+            );
+            dsh_rs::core::loop_driver::spawn_driver(agent.clone());
+            Ok(agent)
+        })?;
+        self.shared
+            .resumed
+            .lock()
+            .unwrap()
+            .insert(child_id.clone(), child_agent);
+        self.invalidate_stored_cache();
+
+        Ok(serde_json::json!({
+            "sessionId": child_id,
+            "agentId": child_id,
+            "sourceSessionId": session_id,
+            "forkedFromEntryId": entry_id,
+            "target": target,
+            "sourceTurn": turn,
+        }))
+    }
+
+    /// Rewind a session to immediately before the selected turn and replay its
+    /// original (or edited) user input on the same session id.
+    ///
+    /// dsh sessions are append-only in memory and the JSONL backend is append
+    /// only, so retry cannot be implemented by adding another message to the
+    /// old leaf. We checkpoint the idle source, atomically replace its JSONL
+    /// with the stable prefix, rebuild the same id from that prefix, then queue
+    /// the selected user message as a fresh turn.
+    pub async fn retry_session_turn(
+        &self,
+        session_id: &str,
+        target: Value,
+        replacement_text: Option<String>,
+        msg_id: Option<String>,
+    ) -> Result<Value> {
+        use dsh_rs::types::{CreateSessionOptions, SessionEventData};
+
+        if replacement_text.as_ref().is_some_and(|text| text.trim().is_empty()) {
+            anyhow::bail!("replacement text is required");
+        }
+
+        let source_agent = self.agent(session_id)?;
+        if source_agent.driver_busy() {
+            anyhow::bail!("session_busy");
+        }
+        let source = source_agent.session();
+        if source.open_turn().is_some() {
+            anyhow::bail!("session_busy");
+        }
+        let events = source.events();
+        if events.is_empty() {
+            anyhow::bail!("session `{session_id}` has no events");
+        }
+
+        let role = target
+            .get("role")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("session node target role is required"))?;
+        let entry_id = match role {
+            "user" | "assistant" => target.get("entryId").and_then(Value::as_str),
+            "assistant_turn" => target.get("turnInputEntryId").and_then(Value::as_str),
+            _ => None,
+        }
+        .ok_or_else(|| anyhow::anyhow!("session node target entry id is required"))?;
+        let (target_index, encoded_role) = parse_studio_entry_id(entry_id)?;
+        let expected_role = if role == "assistant" { "assistant" } else { "user" };
+        if encoded_role != expected_role {
+            anyhow::bail!("session node target role does not match entry id");
+        }
+        let target_event = transcript_event_at(&events, target_index)
+            .ok_or_else(|| anyhow::anyhow!("session node target is not on the active transcript"))?;
+        match (&target_event.data, expected_role) {
+            (SessionEventData::UserMessage { .. }, "user") => {}
+            (SessionEventData::AssistantMessage { .. }, "assistant") => {}
+            _ => anyhow::bail!("session node target does not match transcript role"),
+        }
+        let (turn, turn_start, turn_end) = turn_bounds_for_event(&events, target_event.seq)?;
+        let original_user = events
+            .iter()
+            .filter(|event| event.seq >= turn_start && event.seq <= turn_end)
+            .find_map(|event| match &event.data {
+                SessionEventData::UserMessage { message } => Some(message.clone()),
+                _ => None,
+            })
+            .ok_or_else(|| anyhow::anyhow!("target turn has no user input"))?;
+
+        let mut replay = original_user;
+        if let Some(text) = replacement_text {
+            replay.content = vec![text_block(text)];
+        }
+        if let Some(id) = msg_id.filter(|id| !id.trim().is_empty()) {
+            replay.id = id;
+        }
+
+        let prefix: Vec<dsh_rs::types::SessionEvent> = events
+            .iter()
+            .filter(|event| event.seq < turn_start)
+            .cloned()
+            .collect();
+        let options = last_request_options(&events);
+        let cwd = source.header_cwd();
+
+        // Clear the persistence buffer before replacing the file, otherwise a
+        // later flush could append discarded branch events after the rewind.
+        self.flush_session(session_id).await;
+
+        std::fs::create_dir_all(&self.shared.sessions_dir)?;
+        let path = self.shared.sessions_dir.join(format!("{session_id}.jsonl"));
+        let temp = self
+            .shared
+            .sessions_dir
+            .join(format!(".{session_id}.retry-{}.tmp", std::process::id()));
+        let backup = self
+            .shared
+            .sessions_dir
+            .join(format!(".{session_id}.retry-{}.bak", std::process::id()));
+        let _ = std::fs::remove_file(&temp);
+        let _ = std::fs::remove_file(&backup);
+        let mut jsonl = String::new();
+        for event in &prefix {
+            jsonl.push_str(&serde_json::to_string(event)?);
+            jsonl.push('\n');
+        }
+        std::fs::write(&temp, jsonl.as_bytes())?;
+
+        self.soft_unbind_agent(session_id)?;
+        let had_original = path.exists();
+        if had_original {
+            if let Err(error) = std::fs::rename(&path, &backup) {
+                let _ = std::fs::remove_file(&temp);
+                let _ = self.resume_session(session_id);
+                return Err(anyhow::anyhow!("preparing retry backup `{session_id}`: {error}"));
+            }
+        }
+        if let Err(error) = std::fs::rename(&temp, &path) {
+            if had_original {
+                let _ = std::fs::rename(&backup, &path);
+            }
+            let _ = self.resume_session(session_id);
+            return Err(anyhow::anyhow!("rewinding session `{session_id}`: {error}"));
+        }
+
+        let sessions = self
+            .shared
+            .ctx
+            .require::<dsh_rs::api::services::SessionService>(dsh_rs::api::SESSIONS_SERVICE)
+            .map_err(|e| anyhow::anyhow!("sessions service unavailable: {e}"))?;
+        let rebuilt = in_runtime(|| -> Result<Arc<dsh_rs::core::Agent>> {
+            let session = sessions.create(CreateSessionOptions {
+                id: Some(session_id.to_string()),
+                cwd,
+                seed: prefix,
+                parent_session: None,
+            });
+            let agent = dsh_rs::core::Agent::new(
+                session_id.to_string(),
+                options,
+                session,
+                self.shared.ctx.clone(),
+            );
+            dsh_rs::core::loop_driver::spawn_driver(agent.clone());
+            Ok(agent)
+        });
+        let agent = match rebuilt {
+            Ok(agent) => agent,
+            Err(error) => {
+                let _ = std::fs::remove_file(&path);
+                if had_original {
+                    let _ = std::fs::rename(&backup, &path);
+                    let _ = self.resume_session(session_id);
+                }
+                return Err(error);
+            }
+        };
+        let _ = std::fs::remove_file(&backup);
+        self.shared
+            .resumed
+            .lock()
+            .unwrap()
+            .insert(session_id.to_string(), agent.clone());
+
+        agent.followup(replay);
+        agent.when_idle().await;
+        self.flush_session(session_id).await;
+        self.invalidate_stored_cache();
+
+        Ok(serde_json::json!({
+            "sessionId": session_id,
+            "agentId": session_id,
+            "retried": true,
+            "retriedFromEntryId": entry_id,
+            "target": target,
+            "sourceTurn": turn,
+        }))
+    }
+
     /// Create an agent. `provider`/`model` select the route; `cwd` is the tool
     /// working directory.
     pub fn create_agent(
@@ -1873,7 +2202,10 @@ impl Studio {
     /// Cancel the agent's in-flight turn.
     pub fn cancel_agent(&self, agent_id: &str) -> Result<()> {
         let agent = self.agent(agent_id)?;
-        agent.cancel(dsh_rs::types::AgentCancelCause::User, true);
+        // Stop means quiesce this agent, not only interrupt current future.
+        // Retaining queued steer/inject work can immediately start another turn
+        // after cancellation and make UI appear impossible to stop.
+        agent.cancel(dsh_rs::types::AgentCancelCause::User, false);
         Ok(())
     }
 
@@ -3017,6 +3349,76 @@ pub struct ChatToolResult {
 /// A text content block.
 fn text_block(text: impl Into<String>) -> dsh_rs::types::ContentBlock {
     dsh_rs::types::ContentBlock::Text { text: text.into() }
+}
+
+fn parse_studio_entry_id(value: &str) -> Result<(usize, &str)> {
+    let mut parts = value.split(':');
+    if parts.next() != Some("studio-entry") {
+        anyhow::bail!("unsupported Studio entry id `{value}`");
+    }
+    let index = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("invalid Studio entry id `{value}`"))?
+        .parse::<usize>()
+        .map_err(|_| anyhow::anyhow!("invalid Studio entry id `{value}`"))?;
+    let role = parts
+        .next()
+        .ok_or_else(|| anyhow::anyhow!("invalid Studio entry id `{value}`"))?;
+    if parts.next().is_some() || (role != "user" && role != "assistant") {
+        anyhow::bail!("invalid Studio entry id `{value}`");
+    }
+    Ok((index, role))
+}
+
+fn transcript_event_at(
+    events: &[dsh_rs::types::SessionEvent],
+    target_index: usize,
+) -> Option<&dsh_rs::types::SessionEvent> {
+    use dsh_rs::types::SessionEventData;
+    let mut index = 0usize;
+    for event in events {
+        let produces_message = match &event.data {
+            SessionEventData::UserMessage { .. } | SessionEventData::ToolResult { .. } => true,
+            SessionEventData::AssistantMessage { message, .. } => !message.content.is_empty(),
+            _ => false,
+        };
+        if !produces_message {
+            continue;
+        }
+        if index == target_index {
+            return Some(event);
+        }
+        index += 1;
+    }
+    None
+}
+
+fn turn_bounds_for_event(
+    events: &[dsh_rs::types::SessionEvent],
+    target_seq: u64,
+) -> Result<(u64, u64, u64)> {
+    use dsh_rs::types::SessionEventData;
+    let mut open: Option<(u64, u64)> = None;
+    let mut target_turn: Option<(u64, u64)> = None;
+    for event in events {
+        if let SessionEventData::TurnStart { turn } = event.data {
+            open = Some((turn, event.seq));
+        }
+        if event.seq == target_seq {
+            target_turn = open;
+        }
+        if let SessionEventData::TurnEnd { turn, .. } = event.data {
+            if let Some((target, start)) = target_turn {
+                if target == turn {
+                    return Ok((turn, start, event.seq));
+                }
+            }
+            if open.map(|(current, _)| current) == Some(turn) {
+                open = None;
+            }
+        }
+    }
+    anyhow::bail!("target message is not inside a completed turn")
 }
 
 /// The model configuration a stored session was last using.

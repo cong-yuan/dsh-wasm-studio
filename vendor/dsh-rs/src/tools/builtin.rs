@@ -161,12 +161,17 @@ fn bash_tool() -> Arc<ToolDefinition> {
                 command.stdout(std::process::Stdio::piped());
                 command.stderr(std::process::Stdio::piped());
                 command.kill_on_drop(true);
+                // Give each shell its own process group. Killing only the direct
+                // `sh` leaves background children alive after Stop.
+                #[cfg(unix)]
+                command.process_group(0);
 
                 let child = match command.spawn() {
                     Ok(child) => child,
                     Err(err) => return ToolExecutionResult::error("SPAWN", err.to_string()),
                 };
 
+                let process_group = child.id();
                 let timeout = parsed.timeout_ms.map(Duration::from_millis);
                 let wait_fut = async {
                     let output = child.wait_with_output().await?;
@@ -195,6 +200,7 @@ fn bash_tool() -> Arc<ToolDefinition> {
 
                 let output = match outcome {
                     None => {
+                        kill_process_group(process_group);
                         return ToolExecutionResult::error(
                             "CANCELLED",
                             format!("command cancelled: {}", parsed.command),
@@ -202,6 +208,7 @@ fn bash_tool() -> Arc<ToolDefinition> {
                     }
                     Some(Ok(Some(output))) => output,
                     Some(Ok(None)) => {
+                        kill_process_group(process_group);
                         return ToolExecutionResult::error(
                             "TIMEOUT",
                             format!(
@@ -244,6 +251,21 @@ fn bash_tool() -> Arc<ToolDefinition> {
         },
     ).concurrency_safe())
 }
+
+#[cfg(unix)]
+fn kill_process_group(pid: Option<u32>) {
+    let Some(pid) = pid else { return };
+    // Process-group id equals shell pid because `process_group(0)` created it.
+    // `/bin/kill` avoids another native dependency while still killing every
+    // descendant that inherited the group.
+    let _ = std::process::Command::new("/bin/kill")
+        .arg("-KILL")
+        .arg(format!("-{pid}"))
+        .status();
+}
+
+#[cfg(not(unix))]
+fn kill_process_group(_pid: Option<u32>) {}
 
 // ---------------------------------------------------------------------------
 // read_file

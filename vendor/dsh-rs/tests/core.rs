@@ -326,6 +326,28 @@ async fn agents_registry_tracks_live_agents() {
 }
 
 #[tokio::test]
+async fn disposing_with_queued_work_unblocks_idle_waiters() {
+    let ctx = Context::new();
+    compose(&ctx).await;
+    let agents = ctx.require::<dsh_rs::api::services::AgentRegistryService>("agents").unwrap();
+    let agent = agents
+        .create(Some("agent-dispose".into()), AgentOptions::mock("mock-1"), None, None)
+        .unwrap();
+
+    // Inject without waking driver, then let waiter block on settle channel.
+    // Disposal must clear pending count and notify that existing waiter.
+    agent.inject(user_message_with_text("u-dispose", "never run"));
+    let waiting = agent.clone();
+    let waiter = tokio::spawn(async move { waiting.when_idle().await });
+    tokio::task::yield_now().await;
+    agents.dispose(&agent);
+    tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+        .await
+        .expect("dispose must notify blocked when_idle waiter")
+        .expect("idle waiter task must not panic");
+}
+
+#[tokio::test]
 async fn seed_prompt_enters_the_log() {
     let ctx = Context::new();
     compose(&ctx).await;

@@ -123,8 +123,18 @@ impl Agent {
             token.cancel();
         }
         if !keep_inbox {
-            self.inbox.lock().unwrap().next_turn.clear();
-            self.inbox.lock().unwrap().next_step.clear();
+            let mut inbox = self.inbox.lock().unwrap();
+            inbox.next_turn.clear();
+            inbox.next_step.clear();
+            // `when_idle` reads this atomic rather than locking the inbox.
+            // Leaving it non-zero after disposal makes every waiter hang even
+            // though no queued message remains for the driver to claim.
+            self.pending.store(0, Ordering::SeqCst);
+            // Wake waiters already blocked on `settle_rx.changed()`. If a turn
+            // is active they re-check `driver_busy` and wait for `end_turn`;
+            // otherwise disposal becomes immediately observable.
+            let version = self.settle_tx.borrow().wrapping_add(1);
+            let _ = self.settle_tx.send(version);
         }
         let _ = cause;
     }
