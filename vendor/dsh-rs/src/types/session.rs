@@ -101,6 +101,12 @@ pub enum SessionEventData {
     ToolResult { turn: u64, step: u64, message: Message },
     /// Whole-list snapshot; latest write wins on replay.
     TodoWrite { todos: Vec<TodoItem> },
+    /// Replaces the model-visible history prefix with a durable summary.
+    ///
+    /// The original events remain in the append-only log for UI/audit replay;
+    /// Session::derive_messages treats the latest compaction as the model
+    /// context boundary.
+    Compaction { summary: String },
     /// Full header for the next request, appended inside its step.
     RequestHeader { header: EpochHeader },
     /// Marks the end of a constructor seed (resume/fork/replay).
@@ -130,6 +136,7 @@ impl SessionEventData {
             SessionEventData::ToolCall { .. } => "tool/call",
             SessionEventData::ToolResult { .. } => "tool/result",
             SessionEventData::TodoWrite { .. } => "todo/write",
+            SessionEventData::Compaction { .. } => "session/compact",
             SessionEventData::RequestHeader { .. } => "request/header",
             SessionEventData::SessionEndSeed => "session/end-seed",
         }

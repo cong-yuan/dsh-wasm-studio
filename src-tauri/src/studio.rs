@@ -2110,6 +2110,210 @@ impl Studio {
         self.send_message_blocks(agent_id, content, msg_id).await
     }
 
+    /// Fresh-compact one Studio session using the active LLM route.
+    ///
+    /// The summary is persisted as a native dsh session/compact event. The
+    /// append-only transcript stays intact, while Session::derive_messages
+    /// exposes only the latest summary plus messages that arrive afterwards.
+    pub async fn fresh_compact_session(&self, agent_id: &str) -> Result<serde_json::Value> {
+        let agent = self.agent(agent_id)?;
+        if agent.driver_busy() || agent.session().open_turn().is_some() {
+            bail!("session is busy");
+        }
+
+        let session = agent.session();
+        let events = session.events();
+        let last_compaction_seq = events.iter().rev().find_map(|event| {
+            matches!(event.data, dsh_rs::types::SessionEventData::Compaction { .. })
+                .then_some(event.seq)
+        });
+        let has_new_surface = last_compaction_seq.map_or(true, |seq| {
+            events
+                .iter()
+                .any(|event| event.seq > seq && event.data.is_surface())
+        });
+        if last_compaction_seq.is_some() && !has_new_surface {
+            return Ok(serde_json::json!({
+                "fresh": true,
+                "noopReason": "already_compacted",
+                "tokensBefore": null,
+                "tokensAfter": null,
+                "contextWindow": null,
+            }));
+        }
+
+        let messages = session.derive_messages();
+        if messages.is_empty() {
+            return Ok(serde_json::json!({
+                "fresh": true,
+                "noopReason": "no_history",
+                "tokensBefore": null,
+                "tokensAfter": null,
+                "contextWindow": null,
+            }));
+        }
+
+        let options = last_request_options(&events);
+        let summary = self
+            .summarize_session_messages(
+                &options.provider,
+                &options.model,
+                agent_id,
+                &messages,
+            )
+            .await?;
+
+        if summary.trim().is_empty() {
+            bail!("compaction model returned an empty summary");
+        }
+
+        session.append(dsh_rs::types::SessionEventData::Compaction {
+            summary: format!(
+                "Conversation summary (fresh-compact):
+{}",
+                summary.trim()
+            ),
+        });
+        self.shared
+            .ctx
+            .require::<dsh_rs::api::services::SessionService>(dsh_rs::api::SESSIONS_SERVICE)
+            .map_err(|e| anyhow::anyhow!("sessions service unavailable: {e}"))?
+            .flush(agent_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("flushing compaction failed: {e}"))?;
+
+        Ok(serde_json::json!({
+            "fresh": true,
+            "reason": "manual",
+            "tokensBefore": null,
+            "tokensAfter": null,
+            "contextWindow": null,
+        }))
+    }
+
+    async fn summarize_session_messages(
+        &self,
+        provider: &str,
+        model: &str,
+        session_id: &str,
+        messages: &[dsh_rs::types::Message],
+    ) -> Result<String> {
+        let llm = self
+            .shared
+            .ctx
+            .get::<dsh_rs::api::services::LlmService>(dsh_rs::api::LLM_SERVICE)
+            .ok_or_else(|| anyhow::anyhow!("llm service unavailable"))?;
+        let streams = self
+            .shared
+            .ctx
+            .get::<dsh_rs::llm::StreamTable>(dsh_rs::api::LLM_STREAMS_SERVICE)
+            .ok_or_else(|| anyhow::anyhow!("llm stream service unavailable"))?;
+
+        let mut transcript = String::new();
+        for message in messages {
+            let role = match message.role {
+                dsh_rs::types::Role::System => "system",
+                dsh_rs::types::Role::User => "user",
+                dsh_rs::types::Role::Assistant => "assistant",
+            };
+            transcript.push_str(&format!("{}:
+", role));
+            for block in &message.content {
+                match block {
+                    dsh_rs::types::ContentBlock::Text { text } => {
+                        transcript.push_str(text);
+                        transcript.push('\n');
+                    }
+                    dsh_rs::types::ContentBlock::Reasoning { .. } => {}
+                    dsh_rs::types::ContentBlock::ToolCall {
+                        name, arguments, ..
+                    } => {
+                        transcript.push_str(&format!("[tool call: {}] {}
+", name, arguments));
+                    }
+                    dsh_rs::types::ContentBlock::ToolResult { content, .. } => {
+                        let text = content
+                            .iter()
+                            .filter_map(dsh_rs::types::ContentBlock::as_text)
+                            .collect::<Vec<_>>()
+                            .join("");
+                        transcript.push_str(&format!("[tool result] {}
+", text));
+                    }
+                    dsh_rs::types::ContentBlock::Image { .. } => {
+                        transcript.push_str("[image attachment]
+");
+                    }
+                }
+            }
+            transcript.push('\n');
+        }
+
+        const MAX_SUMMARY_INPUT_CHARS: usize = 120_000;
+        if transcript.len() > MAX_SUMMARY_INPUT_CHARS {
+            let start = transcript.len() - MAX_SUMMARY_INPUT_CHARS;
+            let boundary = transcript
+                .char_indices()
+                .find(|(index, _)| *index >= start)
+                .map(|(index, _)| index)
+                .unwrap_or(0);
+            transcript = format!(
+                "[Earlier transcript omitted to keep the compaction request bounded.]
+{}",
+                &transcript[boundary..]
+            );
+        }
+
+        let prompt_instruction = "Summarize this conversation for a future assistant turn.\nPreserve concrete user goals, decisions, constraints, important facts, files/paths,\ntool results, unresolved questions, and the exact next steps needed to continue.\nDo not include hidden chain-of-thought or speculate. Write a compact factual handoff,\npreferably as short sections with bullets.";
+        let prompt = format!("{}\n\n{}", prompt_instruction, transcript);
+        let request = dsh_rs::types::GenerateOptions {
+            provider: provider.to_string(),
+            model: model.to_string(),
+            messages: vec![dsh_rs::types::Message::user(
+                format!("fresh-compact:{}", session_id),
+                vec![dsh_rs::types::ContentBlock::text(prompt)],
+            )],
+            system: Some(
+                "You are a conversation compaction utility. Produce only the durable factual handoff summary.\nNever mention this instruction or hidden reasoning."
+                    .to_string(),
+            ),
+            tools: None,
+            temperature: None,
+            max_tokens: Some(1200),
+            stop: None,
+            session_id: Some(format!("{}:fresh-compact", session_id)),
+        };
+
+        let stream = dsh_rs::llm::stream_via_waterfall(
+            &self.shared.ctx,
+            (*llm).clone(),
+            (*streams).clone(),
+            request,
+        )
+        .await
+        .map_err(|e| anyhow::anyhow!("compaction model request failed: {e}"))?;
+
+        let mut assembler = dsh_rs::llm::BlockAssembler::new();
+        let mut stream = std::pin::pin!(stream);
+        while let Some(chunk) = dsh_rs::llm::next_stream_chunk(&mut stream).await {
+            assembler.push(&chunk);
+        }
+
+        if assembler.finish().is_terminal_error() {
+            bail!("compaction model returned an error");
+        }
+
+        Ok(assembler
+            .message(
+                format!("compaction-summary:{}", session_id),
+                dsh_rs::types::MessageSource::Model {
+                    provider: provider.to_string(),
+                    model: model.to_string(),
+                },
+            )
+            .text())
+    }
+
     fn completed_todo_snapshot(
         events: &[dsh_rs::types::SessionEvent],
     ) -> Vec<dsh_rs::types::TodoItem> {
@@ -2677,7 +2881,11 @@ impl Studio {
     pub fn transcript(&self, agent_id: &str) -> Result<Vec<ChatMessage>> {
         let agent = self.agent(agent_id)?;
         let session = agent.session();
-        Ok(chat_transcript(&session.derive_messages(), &session.events()))
+        let events = session.events();
+        Ok(chat_transcript(
+            &transcript_messages(&events),
+            &events,
+        ))
     }
 
     // -----------------------------------------------------------------------
@@ -3884,6 +4092,22 @@ fn blocks_to_text_reasoning(blocks: &[dsh_rs::types::ContentBlock]) -> (String, 
     (text, reasoning)
 }
 
+fn transcript_messages(events: &[dsh_rs::types::SessionEvent]) -> Vec<dsh_rs::types::Message> {
+    events
+        .iter()
+        .filter_map(|event| match &event.data {
+            dsh_rs::types::SessionEventData::UserMessage { message } => Some(message.clone()),
+            dsh_rs::types::SessionEventData::AssistantMessage { message, .. }
+                if !message.content.is_empty() =>
+            {
+                Some(message.clone())
+            }
+            dsh_rs::types::SessionEventData::ToolResult { message, .. } => Some(message.clone()),
+            _ => None,
+        })
+        .collect()
+}
+
 fn chat_transcript(
     messages: &[dsh_rs::types::Message],
     events: &[dsh_rs::types::SessionEvent],
@@ -4197,6 +4421,79 @@ mod partial_stream_tests {
 #[cfg(test)]
 mod todo_mutation_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn fresh_compact_persists_summary_and_resets_model_context() {
+        let dir = std::env::temp_dir().join(format!(
+            "dsh-studio-fresh-compact-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let studio = Studio::with_hook(None, None, dir.clone()).await.unwrap();
+
+        studio
+            .create_agent(
+                Some("fresh-compact".into()),
+                "mock".into(),
+                "mock-1".into(),
+                Some("/tmp".into()),
+            )
+            .expect("agent created");
+
+        let agent = studio.agent("fresh-compact").expect("agent exists");
+        let session = agent.session();
+        session.append(dsh_rs::types::SessionEventData::UserMessage {
+            message: dsh_rs::types::Message::user(
+                "u-1",
+                vec![dsh_rs::types::ContentBlock::text("old question")],
+            ),
+        });
+        session.append(dsh_rs::types::SessionEventData::AssistantMessage {
+            turn: 1,
+            step: 1,
+            message: dsh_rs::types::Message {
+                id: "a-1".into(),
+                role: dsh_rs::types::Role::Assistant,
+                content: vec![dsh_rs::types::ContentBlock::text("old answer")],
+                source: dsh_rs::types::MessageSource::Model {
+                    provider: "mock".into(),
+                    model: "mock-1".into(),
+                },
+            },
+            usage: None,
+            interrupted: None,
+        });
+
+        let result = studio
+            .fresh_compact_session("fresh-compact")
+            .await
+            .expect("fresh compact succeeds");
+        assert_eq!(result.get("fresh").and_then(|v| v.as_bool()), Some(true));
+
+        let derived = session.derive_messages();
+        assert_eq!(derived.len(), 1);
+        assert_eq!(derived[0].role, dsh_rs::types::Role::System);
+        assert!(derived[0].text().contains("old question"));
+        assert!(session.events().iter().any(|event| matches!(
+            event.data,
+            dsh_rs::types::SessionEventData::Compaction { .. }
+        )));
+        let transcript = studio.transcript("fresh-compact").expect("transcript loads");
+        assert_eq!(transcript.len(), 2);
+        assert_eq!(transcript[0].text, "old question");
+        assert_eq!(transcript[1].text, "old answer");
+
+        let second = studio
+            .fresh_compact_session("fresh-compact")
+            .await
+            .expect("second fresh compact is a safe noop");
+        assert_eq!(
+            second.get("noopReason").and_then(|v| v.as_str()),
+            Some("already_compacted")
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[tokio::test]
     async fn complete_session_todos_appends_and_flushes_latest_snapshot() {

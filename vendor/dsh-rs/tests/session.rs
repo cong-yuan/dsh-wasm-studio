@@ -84,6 +84,51 @@ fn empty_assistant_message_is_skipped_in_derivation() {
 }
 
 #[test]
+fn compaction_replaces_model_visible_prefix_but_keeps_log() {
+    let ctx = cordis::Context::new();
+    let store = SessionStore::new(ctx);
+    let session = seed_session(&store, "compact-1");
+
+    session.append(SessionEventData::UserMessage {
+        message: user_message("u-1", "old question"),
+    });
+    session.append(SessionEventData::AssistantMessage {
+        turn: 1,
+        step: 1,
+        message: dsh_rs::llm::Message {
+            id: "a-1".into(),
+            role: dsh_rs::llm::Role::Assistant,
+            content: vec![ContentBlock::text("old answer")],
+            source: MessageSource::Model {
+                provider: "mock".into(),
+                model: "mock-1".into(),
+            },
+        },
+        usage: None,
+        interrupted: None,
+    });
+    session.append(SessionEventData::Compaction {
+        summary: "Conversation summary: user asked about the old topic and the assistant answered.".into(),
+    });
+    session.append(SessionEventData::UserMessage {
+        message: user_message("u-2", "continue from there"),
+    });
+
+    let derived = session.derive_messages();
+    assert_eq!(derived.len(), 2);
+    assert_eq!(derived[0].role, dsh_rs::llm::Role::System);
+    assert!(derived[0].text().contains("Conversation summary"));
+    assert_eq!(derived[1].text(), "continue from there");
+
+    let events = session.events();
+    assert_eq!(events.len(), 4);
+    assert!(matches!(
+        events[2].data,
+        SessionEventData::Compaction { .. }
+    ));
+}
+
+#[test]
 fn request_header_folds_latest_snapshot() {
     let ctx = cordis::Context::new();
     let store = SessionStore::new(ctx);

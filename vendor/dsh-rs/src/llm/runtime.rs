@@ -37,6 +37,10 @@ pub fn stream_from_chunks(chunks: Vec<StreamChunk>) -> BoxStream<StreamChunk> {
 }
 
 /// `tokio::sync::mpsc::Receiver` as a `futures::Stream` (no tokio-stream dep).
+pub async fn next_stream_chunk(stream: &mut BoxStream<StreamChunk>) -> Option<StreamChunk> {
+    futures::StreamExt::next(stream).await
+}
+
 pub struct ReceiverStream<T> {
     rx: mpsc::Receiver<T>,
 }

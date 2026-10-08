@@ -131,6 +131,7 @@ pub fn run() {
             commands::send_message,
             commands::send_message_with_images,
             commands::complete_session_todos,
+            commands::fresh_compact_session,
             commands::steer_agent,
             commands::cancel_agent,
             commands::dispose_agent,

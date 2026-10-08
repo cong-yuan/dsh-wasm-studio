@@ -9,7 +9,7 @@ pub mod types;
 
 pub use assembler::BlockAssembler;
 pub use cancel::CancelToken;
-pub use runtime::{BoxStream, LlmAdapter, LlmRuntime, StreamTable, llm_plugin, stream_via_waterfall};
+pub use runtime::{BoxStream, LlmAdapter, LlmRuntime, StreamTable, llm_plugin, next_stream_chunk, stream_via_waterfall};
 pub use types::*;
 
 /// The `llm` service key registered by [`llm_plugin`].

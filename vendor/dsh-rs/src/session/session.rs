@@ -4,7 +4,7 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use crate::llm::{Message, Role};
+use crate::llm::{ContentBlock, ContextForm, Message, MessageSource, Role};
 use serde_json::Value;
 
 use crate::session::event::{
@@ -114,19 +114,30 @@ impl Session {
         *self.request_header_state.lock().unwrap() = latest;
     }
 
-    /// Derive the LLM message history by walking the surface nodes.
+    /// Derive the LLM message history by walking the event log.
     ///
-    /// Projection rules (mirroring the reference harness):
-    /// - `user/message` → a user message carrying its content verbatim;
-    /// - `assistant/message` → the assistant message, skipping empty content;
-    /// - `tool/result` → the user-role message carrying the tool-result block.
+    /// The latest session/compact event becomes a durable system-role summary
+    /// and resets the model-visible prefix. The original event log is kept
+    /// intact for UI/audit replay.
     pub fn derive_messages(&self) -> Vec<Message> {
         let events = self.events.lock().unwrap().clone();
-        let surface = self.surface.lock().unwrap().clone();
         let mut messages = Vec::new();
-        for seq in surface {
-            let Some(event) = events.iter().find(|e| e.seq == seq) else { continue };
+        for event in events {
             match &event.data {
+                SessionEventData::Compaction { summary } => {
+                    messages.clear();
+                    messages.push(Message {
+                        id: format!("compaction:{}", event.seq),
+                        role: Role::System,
+                        content: vec![ContentBlock::text(summary.clone())],
+                        source: MessageSource::Plugin {
+                            plugin: "dsh-session".to_string(),
+                            form: Some(ContextForm::Notice {
+                                summary: summary.clone(),
+                            }),
+                        },
+                    });
+                }
                 SessionEventData::UserMessage { message } => {
                     messages.push(message.clone());
                 }
@@ -208,6 +219,7 @@ impl Session {
                 format!("[assistant/chunk] {chunk:?}")
             }
             SessionEventData::TodoWrite { todos } => format!("[todo/write] {todos:?}"),
+            SessionEventData::Compaction { summary } => format!("[session/compact] {summary}"),
             SessionEventData::RequestHeader { .. } => "[request/header]".to_string(),
             SessionEventData::SessionEndSeed => "[session/end-seed]".to_string(),
         }
