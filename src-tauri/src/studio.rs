@@ -2110,6 +2110,103 @@ impl Studio {
         self.send_message_blocks(agent_id, content, msg_id).await
     }
 
+    /// Continue a stored, no-longer-live session in a new Studio agent.
+    ///
+    /// Studio does not have OpenHanako's deleted-agent tombstone/primary-agent
+    /// ownership graph, so a session that is no longer live is the bridge equivalent
+    /// of a deleted-agent history. The source remains read-only.
+    pub async fn continue_deleted_agent_session(&self, source_id: &str) -> Result<serde_json::Value> {
+        if self.agent(source_id).is_ok() {
+            bail!("agent_not_deleted");
+        }
+
+        let backend = self
+            .persistence()
+            .ok_or_else(|| anyhow::anyhow!("no session store configured"))?;
+        let mut events = backend
+            .load(source_id)
+            .map_err(|_| anyhow::anyhow!("session_not_found"))?;
+        if events.is_empty() {
+            bail!("session_not_found");
+        }
+        dsh_rs::session::repair_crash_turns(&mut events);
+
+        let transcript = transcript_messages(&events);
+        if transcript.is_empty() {
+            bail!("session_transcript_empty");
+        }
+
+        let options = last_request_options(&events);
+        let new_id = self.create_agent(None, options.provider, options.model, None)?;
+        let target = self.agent(&new_id)?;
+        let session = target.session();
+
+        for event in &events {
+            match &event.data {
+                dsh_rs::types::SessionEventData::UserMessage { message } => {
+                    session.append(dsh_rs::types::SessionEventData::UserMessage {
+                        message: message.clone(),
+                    });
+                }
+                dsh_rs::types::SessionEventData::AssistantMessage {
+                    turn,
+                    step,
+                    message,
+                    usage,
+                    interrupted,
+                } => {
+                    session.append(dsh_rs::types::SessionEventData::AssistantMessage {
+                        turn: *turn,
+                        step: *step,
+                        message: message.clone(),
+                        usage: *usage,
+                        interrupted: *interrupted,
+                    });
+                }
+                dsh_rs::types::SessionEventData::ToolResult {
+                    turn,
+                    step,
+                    message,
+                } => {
+                    session.append(dsh_rs::types::SessionEventData::ToolResult {
+                        turn: *turn,
+                        step: *step,
+                        message: message.clone(),
+                    });
+                }
+                _ => {}
+            }
+        }
+
+        self.shared
+            .ctx
+            .require::<dsh_rs::api::services::SessionService>(dsh_rs::api::SESSIONS_SERVICE)
+            .map_err(|e| anyhow::anyhow!("sessions service unavailable: {e}"))?
+            .flush(&new_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("flushing continuation failed: {e}"))?;
+
+        let mut compacted = false;
+        let mut compaction_error = None;
+        match self.fresh_compact_session(&new_id).await {
+            Ok(_) => compacted = true,
+            Err(error) => compaction_error = Some(error.to_string()),
+        }
+
+        Ok(serde_json::json!({
+            "ok": true,
+            "sessionId": new_id,
+            "agentId": new_id,
+            "path": format!("studio://{}", new_id),
+            "cwd": null,
+            "workspaceFolders": [],
+            "authorizedFolders": [],
+            "compacted": compacted,
+            "compactionError": compaction_error,
+            "sourceSessionId": source_id,
+        }))
+    }
+
     /// Fresh-compact one Studio session using the active LLM route.
     ///
     /// The summary is persisted as a native dsh session/compact event. The
@@ -4421,6 +4518,77 @@ mod partial_stream_tests {
 #[cfg(test)]
 mod todo_mutation_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn continue_deleted_agent_creates_a_compacted_new_session() {
+        let dir = std::env::temp_dir().join(format!(
+            "dsh-studio-deleted-agent-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let studio = Studio::with_hook(None, None, dir.clone()).await.unwrap();
+
+        studio
+            .create_agent(
+                Some("deleted-source".into()),
+                "mock".into(),
+                "mock-1".into(),
+                Some("/tmp".into()),
+            )
+            .expect("source agent created");
+        let source = studio.agent("deleted-source").expect("source exists");
+        let source_session = source.session();
+        source_session.append(dsh_rs::types::SessionEventData::UserMessage {
+            message: dsh_rs::types::Message::user(
+                "u-1",
+                vec![dsh_rs::types::ContentBlock::text("continue this old work")],
+            ),
+        });
+        source_session.append(dsh_rs::types::SessionEventData::AssistantMessage {
+            turn: 1,
+            step: 1,
+            message: dsh_rs::types::Message {
+                id: "a-1".into(),
+                role: dsh_rs::types::Role::Assistant,
+                content: vec![dsh_rs::types::ContentBlock::text("old answer")],
+                source: dsh_rs::types::MessageSource::Model {
+                    provider: "mock".into(),
+                    model: "mock-1".into(),
+                },
+            },
+            usage: None,
+            interrupted: None,
+        });
+        studio
+            .shared
+            .ctx
+            .require::<dsh_rs::api::services::SessionService>(dsh_rs::api::SESSIONS_SERVICE)
+            .unwrap()
+            .flush("deleted-source")
+            .await
+            .unwrap();
+
+        studio.soft_unbind_agent("deleted-source").unwrap();
+
+        let result = studio
+            .continue_deleted_agent_session("deleted-source")
+            .await
+            .expect("continuation succeeds");
+        let new_id = result
+            .get("agentId")
+            .and_then(|v| v.as_str())
+            .expect("new agent id");
+        assert_ne!(new_id, "deleted-source");
+        assert_eq!(result.get("compacted").and_then(|v| v.as_bool()), Some(true));
+
+        let new_agent = studio.agent(new_id).expect("new agent exists");
+        let derived = new_agent.session().derive_messages();
+        assert_eq!(derived.len(), 1);
+        assert_eq!(derived[0].role, dsh_rs::types::Role::System);
+        assert!(derived[0].text().contains("continue this old work"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     #[tokio::test]
     async fn fresh_compact_persists_summary_and_resets_model_context() {

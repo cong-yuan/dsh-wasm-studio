@@ -621,6 +621,17 @@ pub async fn fresh_compact_session(
     studio.fresh_compact_session(&agent_id).await.map_err(err)
 }
 
+#[tauri::command]
+pub async fn continue_deleted_agent_session(
+    studio: State<'_, Studio>,
+    agent_id: String,
+) -> Result<serde_json::Value, String> {
+    studio
+        .continue_deleted_agent_session(&agent_id)
+        .await
+        .map_err(err)
+}
+
 /// Queue a steer message (delivered at the next step boundary).
 #[tauri::command]
 pub fn steer_agent(
