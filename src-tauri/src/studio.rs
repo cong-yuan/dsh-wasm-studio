@@ -2110,6 +2110,66 @@ impl Studio {
         self.send_message_blocks(agent_id, content, msg_id).await
     }
 
+    fn completed_todo_snapshot(
+        events: &[dsh_rs::types::SessionEvent],
+    ) -> Vec<dsh_rs::types::TodoItem> {
+        let todos = events
+            .iter()
+            .rev()
+            .find_map(|event| match &event.data {
+                dsh_rs::types::SessionEventData::TodoWrite { todos } => Some(todos.clone()),
+                _ => None,
+            })
+            .unwrap_or_default();
+
+        todos
+            .into_iter()
+            .map(|mut todo| {
+                todo.status = dsh_rs::types::TodoStatus::Completed;
+                todo
+            })
+            .collect()
+    }
+
+    /// Mark the latest persisted todo snapshot as completed.
+    ///
+    /// This uses dsh's native todo/write event rather than the old
+    /// OpenHanako custom-message compatibility format, so replay/hydration
+    /// stays inside the Studio session event vocabulary.
+    pub async fn complete_session_todos(
+        &self,
+        agent_id: &str,
+    ) -> Result<Vec<dsh_rs::types::TodoItem>> {
+        let sessions = self
+            .shared
+            .ctx
+            .require::<dsh_rs::api::services::SessionService>(dsh_rs::api::SESSIONS_SERVICE)
+            .map_err(|e| anyhow::anyhow!("sessions service unavailable: {e}"))?;
+        let session = sessions
+            .get(agent_id)
+            .ok_or_else(|| anyhow::anyhow!("session unavailable"))?;
+
+        if session.open_turn().is_some() {
+            bail!("session is busy");
+        }
+
+        let events = session.events();
+        let completed = Self::completed_todo_snapshot(&events);
+        if completed.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        session.append(dsh_rs::types::SessionEventData::TodoWrite {
+            todos: completed.clone(),
+        });
+        sessions
+            .flush(agent_id)
+            .await
+            .map_err(|e| anyhow::anyhow!("flushing todo update failed: {e}"))?;
+
+        Ok(completed)
+    }
+
     fn image_block(
         &self,
         image: StudioImageAttachment,
@@ -4131,5 +4191,115 @@ mod partial_stream_tests {
         assert_eq!(text, "done");
         // Finish chunk alone should not invent text without deltas.
         let _ = FinishReason::Stop;
+    }
+}
+
+#[cfg(test)]
+mod todo_mutation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn complete_session_todos_appends_and_flushes_latest_snapshot() {
+        let dir = std::env::temp_dir().join(format!(
+            "dsh-studio-todo-test-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let studio = Studio::with_hook(None, None, dir.clone()).await.unwrap();
+
+        studio
+            .create_agent(
+                Some("todo-persist".into()),
+                "mock".into(),
+                "mock-1".into(),
+                Some("/tmp".into()),
+            )
+            .expect("agent created");
+
+        let sessions = studio
+            .shared
+            .ctx
+            .require::<dsh_rs::api::services::SessionService>(
+                dsh_rs::api::SESSIONS_SERVICE,
+            )
+            .unwrap();
+        let session = sessions.get("todo-persist").expect("session exists");
+        session.append(dsh_rs::types::SessionEventData::TodoWrite {
+            todos: vec![
+                dsh_rs::types::TodoItem {
+                    content: "read".into(),
+                    status: dsh_rs::types::TodoStatus::InProgress,
+                },
+                dsh_rs::types::TodoItem {
+                    content: "write".into(),
+                    status: dsh_rs::types::TodoStatus::Pending,
+                },
+            ],
+        });
+        sessions.flush("todo-persist").await.unwrap();
+
+        let completed = studio
+            .complete_session_todos("todo-persist")
+            .await
+            .unwrap();
+        assert_eq!(completed.len(), 2);
+        assert!(completed
+            .iter()
+            .all(|todo| todo.status == dsh_rs::types::TodoStatus::Completed));
+
+        let latest = session
+            .events()
+            .into_iter()
+            .rev()
+            .find_map(|event| match event.data {
+                dsh_rs::types::SessionEventData::TodoWrite { todos } => Some(todos),
+                _ => None,
+            })
+            .unwrap();
+        assert!(latest
+            .iter()
+            .all(|todo| todo.status == dsh_rs::types::TodoStatus::Completed));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn completed_todo_snapshot_uses_latest_todo_write_event() {
+        let events = vec![
+            dsh_rs::types::SessionEvent {
+                seq: 1,
+                time: 1,
+                data: dsh_rs::types::SessionEventData::TodoWrite {
+                    todos: vec![dsh_rs::types::TodoItem {
+                        content: "old".into(),
+                        status: dsh_rs::types::TodoStatus::Pending,
+                    }],
+                },
+            },
+            dsh_rs::types::SessionEvent {
+                seq: 2,
+                time: 2,
+                data: dsh_rs::types::SessionEventData::TodoWrite {
+                    todos: vec![
+                        dsh_rs::types::TodoItem {
+                            content: "read".into(),
+                            status: dsh_rs::types::TodoStatus::InProgress,
+                        },
+                        dsh_rs::types::TodoItem {
+                            content: "write".into(),
+                            status: dsh_rs::types::TodoStatus::Pending,
+                        },
+                    ],
+                },
+            },
+        ];
+
+        let completed = Studio::completed_todo_snapshot(&events);
+        assert_eq!(completed.len(), 2);
+        assert_eq!(completed[0].content, "read");
+        assert_eq!(completed[1].content, "write");
+        assert!(completed
+            .iter()
+            .all(|todo| todo.status == dsh_rs::types::TodoStatus::Completed));
     }
 }

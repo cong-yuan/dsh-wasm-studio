@@ -635,6 +635,28 @@ async fn disabling_the_cache_in_config_turns_it_off() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
+async fn completing_todos_on_a_session_without_todos_is_a_noop() {
+    let dir = tmpdir("agent-todo-empty");
+    let studio = Studio::with_hook(None, None, dir.clone()).await.unwrap();
+
+    studio
+        .create_agent(
+            Some("todo-empty".into()),
+            "mock".into(),
+            "mock-1".into(),
+            Some("/tmp".into()),
+        )
+        .expect("agent created");
+
+    let completed = studio
+        .complete_session_todos("todo-empty")
+        .await
+        .expect("todo completion succeeds");
+
+    assert!(completed.is_empty());
+}
+
+#[tokio::test]
 async fn an_agent_persists_native_image_content_blocks() {
     let dir = tmpdir("agent-image");
     let studio = Studio::with_hook(None, None, dir.clone()).await.unwrap();

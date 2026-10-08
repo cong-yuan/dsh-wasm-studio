@@ -605,6 +605,14 @@ pub async fn send_message_with_images(
         .map_err(err)
 }
 
+#[tauri::command]
+pub async fn complete_session_todos(
+    studio: State<'_, Studio>,
+    agent_id: String,
+) -> Result<Vec<dsh_rs::types::TodoItem>, String> {
+    studio.complete_session_todos(&agent_id).await.map_err(err)
+}
+
 /// Queue a steer message (delivered at the next step boundary).
 #[tauri::command]
 pub fn steer_agent(

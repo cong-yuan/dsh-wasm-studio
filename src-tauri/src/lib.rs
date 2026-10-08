@@ -130,6 +130,7 @@ pub fn run() {
             commands::retry_session_turn,
             commands::send_message,
             commands::send_message_with_images,
+            commands::complete_session_todos,
             commands::steer_agent,
             commands::cancel_agent,
             commands::dispose_agent,
