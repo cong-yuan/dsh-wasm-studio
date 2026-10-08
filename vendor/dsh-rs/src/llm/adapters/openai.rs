@@ -122,21 +122,38 @@ fn openai_message(message: &Message, include_reasoning: bool) -> Vec<Value> {
     let mut out = Vec::new();
     let mut text: Vec<String> = Vec::new();
     let mut reasoning: Vec<String> = Vec::new();
+    let mut images: Vec<Value> = Vec::new();
     let mut tool_calls: Vec<Value> = Vec::new();
+
     for block in &message.content {
         match block {
             ContentBlock::Text { text: t } => text.push(t.clone()),
             ContentBlock::Reasoning { text: t } => reasoning.push(t.clone()),
+            ContentBlock::Image { url, detail } => {
+                let mut image_url = json!({ "url": url });
+                if let Some(detail) = detail {
+                    image_url["detail"] = json!(detail);
+                }
+                images.push(json!({
+                    "type": "image_url",
+                    "image_url": image_url,
+                }));
+            }
             ContentBlock::ToolCall { id, name, arguments } => tool_calls.push(json!({
                 "id": id,
                 "type": "function",
                 "function": { "name": name, "arguments": arguments },
             })),
             ContentBlock::ToolResult { tool_call_id, content, .. } => {
-                if !text.is_empty() || !tool_calls.is_empty() || !reasoning.is_empty() {
+                if !text.is_empty()
+                    || !images.is_empty()
+                    || !tool_calls.is_empty()
+                    || !reasoning.is_empty()
+                {
                     out.push(role_message(
                         message.role,
                         text.drain(..).collect(),
+                        std::mem::take(&mut images),
                         std::mem::take(&mut tool_calls),
                         if include_reasoning {
                             std::mem::take(&mut reasoning).join("")
@@ -158,14 +175,17 @@ fn openai_message(message: &Message, include_reasoning: bool) -> Vec<Value> {
             }
         }
     }
-    if !text.is_empty() || !tool_calls.is_empty() || !reasoning.is_empty() {
+
+    if !text.is_empty() || !images.is_empty() || !tool_calls.is_empty() || !reasoning.is_empty() {
         out.push(role_message(
             message.role,
             text.join(""),
+            images,
             tool_calls,
             if include_reasoning { reasoning.join("") } else { String::new() },
         ));
     }
+
     if out.is_empty() {
         out.push(json!({ "role": role_str(message.role), "content": "" }));
     }
@@ -184,10 +204,24 @@ fn role_str(role: crate::types::Role) -> &'static str {
 /// implementation hardcoded `assistant`, which mislabels user messages).
 fn role_message(
     role: crate::types::Role,
-    content: String,
+    text: String,
+    images: Vec<Value>,
     tool_calls: Vec<Value>,
     reasoning_content: String,
 ) -> Value {
+    let content = if images.is_empty() {
+        Value::String(text)
+    } else {
+        let mut blocks = Vec::with_capacity(images.len() + usize::from(!text.is_empty()));
+        if !text.is_empty() {
+            blocks.push(json!({
+                "type": "text",
+                "text": text,
+            }));
+        }
+        blocks.extend(images);
+        Value::Array(blocks)
+    };
     let mut message = json!({
         "role": role_str(role),
         "content": content,
@@ -399,5 +433,85 @@ fn parse_event(event: &Value) -> StreamChunk {
     StreamChunk::TextDelta {
         index: 0,
         text: String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::{GenerateOptions, Message, MessageSource, Role};
+
+    fn options(message: Message) -> GenerateOptions {
+        GenerateOptions {
+            provider: "openai".into(),
+            model: "gpt-4o-mini".into(),
+            messages: vec![message],
+            system: None,
+            tools: None,
+            temperature: None,
+            max_tokens: None,
+            stop: None,
+            session_id: None,
+        }
+    }
+
+    #[test]
+    fn image_content_maps_to_openai_image_url_block() {
+        let adapter = OpenAiAdapter::new(json!({
+            "base_url": "https://api.openai.com/v1",
+            "model": "gpt-4o-mini"
+        }))
+        .unwrap();
+        let message = Message::user(
+            "u-image",
+            vec![
+                ContentBlock::text("What is in this image?"),
+                ContentBlock::Image {
+                    url: "data:image/png;base64,aGVsbG8=".into(),
+                    detail: Some("auto".into()),
+                },
+            ],
+        );
+        let body = adapter.build_body(&options(message));
+        let content = &body["messages"][0]["content"];
+        assert_eq!(content[0]["type"], "text");
+        assert_eq!(content[0]["text"], "What is in this image?");
+        assert_eq!(content[1]["type"], "image_url");
+        assert_eq!(
+            content[1]["image_url"]["url"],
+            "data:image/png;base64,aGVsbG8="
+        );
+        assert_eq!(content[1]["image_url"]["detail"], "auto");
+    }
+
+    #[test]
+    fn text_only_messages_keep_legacy_string_content() {
+        let adapter = OpenAiAdapter::new(json!({
+            "base_url": "https://api.openai.com/v1",
+            "model": "gpt-4o-mini"
+        }))
+        .unwrap();
+        let message = Message::user("u-text", vec![ContentBlock::text("hello")]);
+        let body = adapter.build_body(&options(message));
+        assert_eq!(body["messages"][0]["content"], "hello");
+    }
+
+    #[test]
+    fn image_message_serializes_as_user_role() {
+        let message = Message {
+            id: "u-image".into(),
+            role: Role::User,
+            content: vec![ContentBlock::image_url(
+                "data:image/jpeg;base64,YWJj",
+                None,
+            )],
+            source: MessageSource::User,
+        };
+        let wire = openai_message(&message, false);
+        assert_eq!(wire[0]["role"], "user");
+        assert_eq!(
+            wire[0]["content"][0]["image_url"]["url"],
+            "data:image/jpeg;base64,YWJj"
+        );
     }
 }

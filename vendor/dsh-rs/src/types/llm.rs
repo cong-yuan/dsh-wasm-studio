@@ -34,6 +34,16 @@ pub enum ContentBlock {
         name: String,
         arguments: String,
     },
+    /// An image supplied by the user to a multimodal model.
+    ///
+    /// The URL is provider-neutral and may be a normal URL or a data URL.
+    /// Studio currently uses data URLs so the persisted session is
+    /// self-contained and does not depend on a machine-local file path.
+    Image {
+        url: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
+    },
     /// A completed tool call's model-facing result.
     ToolResult {
         tool_call_id: CallId,
@@ -46,6 +56,13 @@ pub enum ContentBlock {
 impl ContentBlock {
     pub fn text(text: impl Into<String>) -> Self {
         ContentBlock::Text { text: text.into() }
+    }
+
+    pub fn image_url(url: impl Into<String>, detail: Option<String>) -> Self {
+        ContentBlock::Image {
+            url: url.into(),
+            detail,
+        }
     }
 
     pub fn as_text(&self) -> Option<&str> {

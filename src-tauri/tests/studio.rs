@@ -6,7 +6,7 @@
 
 use std::path::PathBuf;
 
-use dsh_wasm_studio_lib::studio::Studio;
+use dsh_wasm_studio_lib::studio::{Studio, StudioImageAttachment};
 use serde_json::json;
 
 const RESULT: &str = r#"{"kind":"success","content":"ran","value":{"ok":true}}"#;
@@ -633,6 +633,46 @@ async fn disabling_the_cache_in_config_turns_it_off() {
 // ---------------------------------------------------------------------------
 // Agents / chat
 // ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn an_agent_persists_native_image_content_blocks() {
+    let dir = tmpdir("agent-image");
+    let studio = Studio::with_hook(None, None, dir.clone()).await.unwrap();
+
+    studio
+        .create_agent(
+            Some("image-1".into()),
+            "mock".into(),
+            "mock-1".into(),
+            Some("/tmp".into()),
+        )
+        .expect("agent created");
+
+    studio
+        .send_message_with_images(
+            "image-1",
+            "describe this".into(),
+            "u-image".into(),
+            vec![StudioImageAttachment {
+                data: "aGVsbG8=".into(),
+                mime_type: "image/png".into(),
+                detail: Some("auto".into()),
+            }],
+        )
+        .await
+        .expect("image turn completes");
+
+    let session_file = dir.join("sessions").join("image-1.jsonl");
+    let persisted = std::fs::read_to_string(session_file).expect("session persisted");
+    assert!(
+        persisted.contains("image"),
+        "native image content block must be persisted: {persisted}"
+    );
+    assert!(
+        persisted.contains("data:image/png;base64,aGVsbG8="),
+        "image must be persisted as a self-contained data URL"
+    );
+}
 
 #[tokio::test]
 async fn an_agent_runs_a_turn_over_the_mock_provider() {

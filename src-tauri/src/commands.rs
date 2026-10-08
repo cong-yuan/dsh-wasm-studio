@@ -12,7 +12,7 @@ use serde::Serialize;
 use serde_json::Value;
 use tauri::State;
 
-use crate::studio::{Studio, StudioStatus};
+use crate::studio::{Studio, StudioImageAttachment, StudioStatus};
 
 /// Build the command error type from any displayable error.
 fn err(e: impl std::fmt::Display) -> String {
@@ -589,6 +589,20 @@ pub async fn send_message(
     msg_id: String,
 ) -> Result<(), String> {
     studio.send_message(&agent_id, text, msg_id).await.map_err(err)
+}
+
+#[tauri::command]
+pub async fn send_message_with_images(
+    studio: State<'_, Studio>,
+    agent_id: String,
+    text: String,
+    msg_id: String,
+    images: Vec<StudioImageAttachment>,
+) -> Result<(), String> {
+    studio
+        .send_message_with_images(&agent_id, text, msg_id, images)
+        .await
+        .map_err(err)
 }
 
 /// Queue a steer message (delivered at the next step boundary).

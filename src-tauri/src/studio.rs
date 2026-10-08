@@ -59,7 +59,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{bail, Context as _, Result};
 use base64::Engine as _;
 use dsh_wasm_host::{FlowBridgePlugin, WasmHost, WasmSlotPlugin};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{AppHandle, Emitter};
 use wasm_plugin_host::{Config, PluginEntry};
@@ -68,6 +68,17 @@ use wasm_plugin_host::{Config, PluginEntry};
 /// and the watcher can report what it did. Boxed so the Tauri layer can forward
 /// to the frontend while tests can just record.
 pub type ChangeHook = Arc<dyn Fn(StudioEvent) + Send + Sync>;
+
+/// Browser-provided image payload forwarded to the multimodal LLM seam.
+#[derive(Debug, Clone, Deserialize)]
+pub struct StudioImageAttachment {
+    pub data: String,
+    #[serde(rename = "mimeType")]
+    pub mime_type: String,
+    #[serde(default)]
+    pub detail: Option<String>,
+}
+
 
 /// Events the studio emits to its [`ChangeHook`].
 #[derive(Debug, Clone, Serialize)]
@@ -2067,15 +2078,87 @@ impl Studio {
         text: String,
         msg_id: String,
     ) -> Result<()> {
+        self.send_message_blocks(
+            agent_id,
+            vec![text_block(text)],
+            msg_id,
+        )
+        .await
+    }
+
+    /// Send a user message with native image content blocks.
+    pub async fn send_message_with_images(
+        &self,
+        agent_id: &str,
+        text: String,
+        msg_id: String,
+        images: Vec<StudioImageAttachment>,
+    ) -> Result<()> {
+        if images.len() > 10 {
+            bail!("too many images: {} (max 10)", images.len());
+        }
+        let mut content = Vec::with_capacity(images.len() + 1);
+        if !text.is_empty() {
+            content.push(text_block(text));
+        }
+        for image in images {
+            content.push(self.image_block(image)?);
+        }
+        if content.is_empty() {
+            content.push(text_block(String::new()));
+        }
+        self.send_message_blocks(agent_id, content, msg_id).await
+    }
+
+    fn image_block(
+        &self,
+        image: StudioImageAttachment,
+    ) -> Result<dsh_rs::types::ContentBlock> {
+        let mime = image.mime_type.trim().to_ascii_lowercase();
+        if !matches!(
+            mime.as_str(),
+            "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+        ) {
+            bail!("unsupported image MIME type: {}", mime);
+        }
+        if image.data.is_empty() {
+            bail!("image payload is empty");
+        }
+        const MAX_BASE64_CHARS: usize = 20 * 1024 * 1024;
+        if image.data.len() > MAX_BASE64_CHARS {
+            bail!("image payload too large");
+        }
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(&image.data)
+            .context("invalid image base64")?;
+        if bytes.is_empty() {
+            bail!("image payload is empty");
+        }
+        let detail = image
+            .detail
+            .filter(|value| matches!(value.as_str(), "low" | "high" | "auto"));
+        Ok(dsh_rs::types::ContentBlock::Image {
+            url: format!(
+                "data:{};base64,{}",
+                mime,
+                base64::engine::general_purpose::STANDARD.encode(bytes)
+            ),
+            detail: Some(detail.unwrap_or_else(|| "auto".to_string())),
+        })
+    }
+
+    async fn send_message_blocks(
+        &self,
+        agent_id: &str,
+        content: Vec<dsh_rs::types::ContentBlock>,
+        msg_id: String,
+    ) -> Result<()> {
         // Snapshot length *before* followup so the poller never treats the
         // previous assistant message as the new turn's stream seed.
         let baseline_len = self.transcript(agent_id).map(|m| m.len()).unwrap_or(0);
 
         let agent = self.agent(agent_id)?;
-        agent.followup(dsh_rs::types::Message::user(
-            msg_id,
-            vec![text_block(text)],
-        ));
+        agent.followup(dsh_rs::types::Message::user(msg_id, content));
 
         let stop = std::sync::Arc::new(AtomicBool::new(false));
         let stop_flag = stop.clone();
@@ -3799,6 +3882,7 @@ fn chat_message(m: &dsh_rs::types::Message) -> ChatMessage {
         match block {
             ContentBlock::Text { text: t } => text.push_str(t),
             ContentBlock::Reasoning { text: t } => reasoning.push_str(t),
+            ContentBlock::Image { .. } => {}
             ContentBlock::ToolCall { id, name, arguments } => tool_calls.push(ChatToolCall {
                 id: id.clone(),
                 name: name.clone(),
