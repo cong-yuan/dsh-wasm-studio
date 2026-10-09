@@ -306,8 +306,9 @@ impl Studio {
         // control records, so legacy sessions cannot accidentally run with
         // a different permission policy than the native UI reports.
         for row in studio.list_sessions() {
-            let effective = studio.shared.agent_controls.lock().unwrap().agents
-                .get(&row.id).map(|record| record.config.live())
+            let controls = studio.shared.agent_controls.lock().unwrap();
+            let effective = controls.agents.get(&row.id)
+                .map(|record| controls.runtime_for(&record.config))
                 .unwrap_or_else(|| AgentSettings::default().live());
             dsh_rs::runtime_controls::set(&row.id, effective);
         }
@@ -2022,9 +2023,11 @@ impl Studio {
             };
             let agent = reg.create(id, options.clone(), cwd, None).map_err(anyhow::Error::msg)?;
             self.invalidate_stored_cache();
-            let runtime = self.shared.agent_controls.lock().unwrap().agents
-                .get(agent.id()).map(|record| record.config.live())
+            let controls = self.shared.agent_controls.lock().unwrap();
+            let runtime = controls.agents.get(agent.id())
+                .map(|record| controls.runtime_for(&record.config))
                 .unwrap_or_else(|| AgentSettings::default().live());
+            drop(controls);
             dsh_rs::runtime_controls::set(agent.id(), runtime);
             self.register_control_agent(agent.id(), &options.provider, &options.model)?;
             Ok(agent.id().to_string())
@@ -2676,6 +2679,11 @@ impl Studio {
         let baseline_len = self.transcript(agent_id).map(|m| m.len()).unwrap_or(0);
 
         let agent = self.agent(agent_id)?;
+        // Capture only an explicit human memory command, before dispatching
+        // the message. A persistence failure must not masquerade as remembered.
+        if let Some(text) = content.iter().find_map(dsh_rs::types::ContentBlock::as_text) {
+            self.capture_directed_memory(agent_id, text)?;
+        }
         agent.followup(dsh_rs::types::Message::user(msg_id, content));
 
         let stop = std::sync::Arc::new(AtomicBool::new(false));

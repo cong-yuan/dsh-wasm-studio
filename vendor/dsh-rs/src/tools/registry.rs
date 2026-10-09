@@ -13,9 +13,9 @@ use std::sync::{Arc, Mutex};
 use cordis::{plugin, Context, Plugin};
 use serde_json::{json, Value};
 
-use cordis::plugin::BoxFuture;
 use crate::llm::ToolSchema;
 use crate::types::{ToolCallArgs, ToolExecutionResult, ToolRunContext};
+use cordis::plugin::BoxFuture;
 
 /// The `tools` service key.
 pub const TOOLS_SERVICE: &str = "tools";
@@ -26,11 +26,8 @@ pub struct ToolDefinition {
     pub description: String,
     /// JSON Schema object for the arguments.
     pub parameters: Value,
-    pub execute: Arc<
-        dyn Fn(ToolCallArgs, ToolRunContext) -> BoxFuture<ToolExecutionResult>
-            + Send
-            + Sync,
-    >,
+    pub execute:
+        Arc<dyn Fn(ToolCallArgs, ToolRunContext) -> BoxFuture<ToolExecutionResult> + Send + Sync>,
     pub is_concurrency_safe: bool,
 }
 
@@ -160,11 +157,26 @@ impl ToolRegistry {
             );
         };
 
-        // Host-enforced per-agent rule is evaluated before *all* tool hooks.
-        // Plugins and permissive waterfalled listeners cannot override it.
+        // Host-enforced rule precedes every tool hook; ask waits on an exact
+        // one-use approval. Never promote the entire Agent to operate/auto.
+        let mut was_approved = false;
         if let Some(agent_id) = run_ctx.agent_id.as_deref() {
             if let Some((code, reason)) = crate::runtime_controls::tool_denial(agent_id, &name) {
-                return ToolExecutionResult::error(code, reason);
+                if code != "APPROVAL" {
+                    return ToolExecutionResult::error(code, reason);
+                }
+                if let Err(why) = crate::runtime_controls::request_approval(
+                    agent_id,
+                    &args.call_id,
+                    &name,
+                    &args.arguments,
+                    &run_ctx.signal,
+                )
+                .await
+                {
+                    return ToolExecutionResult::error("APPROVAL", why);
+                }
+                was_approved = true;
             }
         }
 
@@ -211,13 +223,28 @@ impl ToolRegistry {
         let tool_for_exec = tool.clone();
         let run_ctx_for_body = run_ctx.clone();
         let execute_payload = json!({ "name": name, "arguments": args.arguments.clone() });
+        let approved_arguments = if was_approved {
+            Some(args.arguments.clone())
+        } else {
+            None
+        };
         let ctx = self.inner.ctx.clone();
         let raw_result = ctx
             .waterfall("tools/execute", execute_payload, move |payload| {
                 let tool = tool_for_exec.clone();
                 let args = args.clone();
                 let run_ctx = run_ctx_for_body.clone();
+                let approved_arguments = approved_arguments.clone();
                 Box::pin(async move {
+                    if let Some(expected) = approved_arguments.as_ref() {
+                        if payload.get("arguments") != Some(expected) {
+                            return serde_json::to_value(ToolExecutionResult::error(
+                                "DENIED",
+                                "approved tool arguments changed after confirmation",
+                            ))
+                            .map_err(|err| cordis::Error::msg(err.to_string()));
+                        }
+                    }
                     let result = (tool.execute)(
                         ToolCallArgs {
                             call_id: args.call_id,
@@ -253,10 +280,13 @@ impl ToolRegistry {
             })
             .await
         {
-            Ok(payload) => match serde_json::from_value(payload.get("result").cloned().unwrap_or(Value::Null)) {
-                Ok(result) => result,
-                Err(err) => ToolExecutionResult::error("BAD_RESULT", err.to_string()),
-            },
+            Ok(payload) => {
+                match serde_json::from_value(payload.get("result").cloned().unwrap_or(Value::Null))
+                {
+                    Ok(result) => result,
+                    Err(err) => ToolExecutionResult::error("BAD_RESULT", err.to_string()),
+                }
+            }
             Err(err) => ToolExecutionResult::error("POST_EXECUTE", err.to_string()),
         }
     }
@@ -273,7 +303,6 @@ pub fn tools_plugin() -> Arc<dyn Plugin> {
         Ok(())
     })
 }
-
 
 impl crate::api::services::ToolRegistryApi for ToolRegistry {
     fn schemas(&self) -> Vec<crate::llm::ToolSchema> {
@@ -296,11 +325,7 @@ impl crate::api::services::ToolRegistryApi for ToolRegistry {
         run_ctx: crate::types::ToolRunContext,
     ) -> crate::api::services::BoxFuture<crate::types::ToolExecutionResult> {
         let registry = self.clone();
-        Box::pin(async move {
-            registry
-                .execute(call_id, name, arguments, run_ctx)
-                .await
-        })
+        Box::pin(async move { registry.execute(call_id, name, arguments, run_ctx).await })
     }
 
     fn register_dynamic_tool(&self, spec: crate::api::services::DynamicToolSpec) {
@@ -328,5 +353,93 @@ impl crate::api::services::ToolRegistryApi for ToolRegistry {
 
     fn unregister_dynamic_tool(&self, name: &str) {
         self.unregister(name)
+    }
+}
+
+#[cfg(test)]
+mod approval_pipeline_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[tokio::test]
+    async fn write_tool_waits_for_exact_one_time_approval_before_body() {
+        let ctx = Context::new();
+        let registry = ToolRegistry::new(ctx.clone());
+        let called = Arc::new(AtomicUsize::new(0));
+        let hit = called.clone();
+        registry.register(Arc::new(ToolDefinition::new(
+            "write_file",
+            "write test",
+            json!({}),
+            move |_args, _run_ctx| {
+                let hit = hit.clone();
+                Box::pin(async move {
+                    hit.fetch_add(1, Ordering::SeqCst);
+                    ToolExecutionResult::success_value(json!({"didWrite": true}))
+                })
+            },
+        )));
+        let agent = "approval-registry-real-execution";
+        crate::runtime_controls::set(
+            agent,
+            crate::runtime_controls::RuntimeControls {
+                permission_mode: "ask".into(),
+                ..Default::default()
+            },
+        );
+        let ctx_for_tool = ctx.clone();
+        let registry_for_tool = registry.clone();
+        let invocation = tokio::spawn(async move {
+            registry_for_tool
+                .execute(
+                    "once".into(),
+                    "write_file".into(),
+                    json!({"path":"reviewed-target"}),
+                    ToolRunContext {
+                        ctx: ctx_for_tool,
+                        signal: crate::types::CancelToken::new(),
+                        agent_id: Some(agent.into()),
+                        cwd: None,
+                        allowed_roots: vec![],
+                    },
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
+        let pending = crate::runtime_controls::pending_approvals()
+            .into_iter()
+            .find(|row| row.call_id == "once")
+            .expect("exact call waiting");
+        assert_eq!(
+            called.load(Ordering::SeqCst),
+            0,
+            "must not write before approval"
+        );
+        assert_eq!(pending.arguments["path"], "reviewed-target");
+        crate::runtime_controls::decide_approval(agent, &pending.id, true).unwrap();
+        assert!(!invocation.await.unwrap().is_error());
+        assert_eq!(called.load(Ordering::SeqCst), 1);
+        assert!(crate::runtime_controls::decide_approval(agent, &pending.id, true).is_err());
+        // A distinct write must ask again: the approval was not a mode switch.
+        let no_approval = registry
+            .execute(
+                "cancelled".into(),
+                "write_file".into(),
+                json!({"path":"other-target"}),
+                ToolRunContext {
+                    ctx,
+                    signal: {
+                        let token = crate::types::CancelToken::new();
+                        token.cancel();
+                        token
+                    },
+                    agent_id: Some(agent.into()),
+                    cwd: None,
+                    allowed_roots: vec![],
+                },
+            )
+            .await;
+        assert!(no_approval.is_error());
+        assert_eq!(called.load(Ordering::SeqCst), 1);
     }
 }

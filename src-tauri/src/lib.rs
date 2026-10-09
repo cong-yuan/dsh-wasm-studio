@@ -157,6 +157,10 @@ pub fn run() {
             commands::switch_primary_agent,
             commands::get_agent_config,
             commands::patch_agent_config,
+            commands::pending_tool_approvals,
+            commands::decide_tool_approval,
+            commands::list_shared_memory,
+            commands::delete_shared_memory,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

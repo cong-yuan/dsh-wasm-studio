@@ -857,3 +857,23 @@ pub async fn patch_agent_config(studio: State<'_, Studio>, agent_id: String,
     patch: Value, revision: String) -> Result<Value, String> {
     studio.patch_agent_config(&agent_id, patch, &revision).await.map_err(err)
 }
+
+#[tauri::command]
+pub fn pending_tool_approvals(studio: State<'_, Studio>, agent_id: String) -> Result<Value, String> {
+    studio.pending_tool_approvals(&agent_id).map_err(err)
+}
+#[tauri::command]
+pub fn decide_tool_approval(studio: State<'_, Studio>, agent_id: String,
+    approval_id: String, approved: bool) -> Result<Value, String> {
+    studio.decide_tool_approval(&agent_id, &approval_id, approved).map_err(err)
+}
+
+#[tauri::command]
+pub fn list_shared_memory(studio: State<'_, Studio>, agent_id: String) -> Result<Value, String> {
+    studio.list_shared_memory(&agent_id).map_err(err)
+}
+#[tauri::command]
+pub fn delete_shared_memory(studio: State<'_, Studio>, agent_id: String,
+    fact_id: String) -> Result<Value, String> {
+    studio.delete_shared_memory(&agent_id, &fact_id).map_err(err)
+}
