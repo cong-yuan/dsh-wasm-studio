@@ -137,7 +137,7 @@ pub(crate) struct Shared {
     pub(crate) sessions_dir: PathBuf,
     /// Handed out to auto-created sessions so their ids cannot collide with
     /// sessions already on disk (see [`Studio::new_session_id`]).
-    id_seq: std::sync::atomic::AtomicU64,
+    pub(crate) id_seq: std::sync::atomic::AtomicU64,
     /// A registry used **only** to dispose resumed agents.
     ///
     /// Disposal needs to flip an agent's private `disposed` flag, and the only
@@ -158,9 +158,11 @@ pub(crate) struct Shared {
     pub(crate) agent_controls: Mutex<ControlStore>,
     pub(crate) stage_b_path: PathBuf,
     pub(crate) stage_b: Mutex<StageBStore>,
+    /// Prevent overlapping manual and scheduled executions for one job.
+    pub(crate) running_automations: Mutex<std::collections::HashSet<String>>,
     booted: bool,
     // --- auto-reload watcher ---
-    watch_stop: AtomicBool,
+    pub(crate) watch_stop: AtomicBool,
     watch_handle: Mutex<Option<JoinHandle<()>>>,
     hook: Mutex<Option<ChangeHook>>,
 }
@@ -302,6 +304,7 @@ impl Studio {
                 agent_controls: Mutex::new(controls),
                 stage_b_path,
                 stage_b: Mutex::new(stage_b),
+                running_automations: Mutex::new(std::collections::HashSet::new()),
                 booted: true,
                 watch_stop: AtomicBool::new(false),
                 watch_handle: Mutex::new(None),

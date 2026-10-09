@@ -27,6 +27,9 @@ pub struct ScheduledJob {
     pub last_run_at: Option<String>,
     #[serde(default)]
     pub last_error: Option<String>,
+    /// Persist before dispatch so an interrupted run is visible after restart.
+    #[serde(default)]
+    pub last_attempt_at: Option<String>,
     pub created_at: String,
     #[serde(default)]
     pub utc_offset_minutes: i32,
@@ -61,9 +64,16 @@ impl StageBStore {
         Ok(value)
     }
     pub fn save(&self, path: &Path) -> Result<()> {
+        use std::io::Write;
         let tmp = path.with_extension("json.new");
-        std::fs::write(&tmp, serde_json::to_vec_pretty(self)?)?;
+        let mut file = std::fs::File::create(&tmp)?;
+        file.write_all(&serde_json::to_vec_pretty(self)?)?;
+        file.sync_all()?;
         std::fs::rename(&tmp, path)?;
+        if let Some(parent) = path.parent() {
+            // Directory flush helps the rename survive an abrupt host restart.
+            let _ = std::fs::File::open(parent).and_then(|dir| dir.sync_all());
+        }
         Ok(())
     }
 }
@@ -261,7 +271,33 @@ fn next_job_time_offset(
         _ => bail!("unsupported automation schedule type"),
     }
 }
+/// A one-job execution lease. Released on success, failure, cancellation or panic.
+struct AutomationPermit {
+    studio: Studio,
+    id: String,
+}
+impl Drop for AutomationPermit {
+    fn drop(&mut self) {
+        self.studio
+            .shared
+            .running_automations
+            .lock()
+            .unwrap()
+            .remove(&self.id);
+    }
+}
 impl Studio {
+    fn acquire_automation(&self, id: &str) -> Result<AutomationPermit> {
+        let mut running = self.shared.running_automations.lock().unwrap();
+        ensure!(
+            running.insert(id.to_owned()),
+            "automation is already running"
+        );
+        Ok(AutomationPermit {
+            studio: self.clone(),
+            id: id.into(),
+        })
+    }
     pub fn project_catalog(&self) -> Value {
         let guard = self.shared.stage_b.lock().unwrap();
         json!({"ok":true,"revision":format!("r{}",guard.revision),
@@ -332,7 +368,16 @@ impl Studio {
                 } else {
                     &payload
                 };
-                let id = format!("automation-{now}-{}", next.jobs.len() + 1);
+                let id = loop {
+                    let seq = self
+                        .shared
+                        .id_seq
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let candidate = format!("automation-{now}-{seq}");
+                    if next.jobs.iter().all(|job| job.id != candidate) {
+                        break candidate;
+                    }
+                };
                 let mut job = ScheduledJob {
                     id: id.clone(),
                     kind: item
@@ -363,6 +408,7 @@ impl Studio {
                     next_run_at: None,
                     last_run_at: None,
                     last_error: None,
+                    last_attempt_at: None,
                     created_at: timestamp_iso(now)?,
                     utc_offset_minutes: item
                         .get("utcOffsetMinutes")
@@ -439,7 +485,12 @@ impl Studio {
         *state = next;
         Ok(result)
     }
+    /// Send a real turn exactly once per invocation. The attempt is persisted
+    /// before dispatch; success/error is persisted afterward. On process death
+    /// a pending attempt remains explicitly marked interrupted, not "success".
     pub async fn run_automation_job(&self, id: &str) -> Result<Value> {
+        let _lease = self.acquire_automation(id)?;
+        let attempt = timestamp_iso(now_ms())?;
         let job = {
             let mut state = self.shared.stage_b.lock().unwrap();
             let mut next = state.clone();
@@ -449,35 +500,74 @@ impl Studio {
                 .find(|job| job.id == id)
                 .context("automation job not found")?;
             ensure!(!row.prompt.trim().is_empty(), "automation prompt required");
-            row.last_run_at = Some(timestamp_iso(now_ms())?);
-            let job = row.clone();
+            row.last_attempt_at = Some(attempt);
+            row.last_error = Some("execution interrupted before completion".into());
+            let snapshot = row.clone();
             next.save(&self.shared.stage_b_path)?;
             *state = next;
-            job
+            snapshot
         };
-        let agent_id = match job.actor_agent_id.clone() {
-            Some(id) => id,
-            None => self
-                .get_primary_agent()?
-                .get("agentId")
-                .and_then(Value::as_str)
-                .context("native primary Agent missing")?
-                .to_string(),
-        };
-        self.send_message(
-            &agent_id,
-            job.prompt.clone(),
-            format!("scheduled-{}-{}", job.id, now_ms()),
-        )
-        .await?;
+        let outcome: Result<String> = async {
+            let agent_id = match job.actor_agent_id {
+                Some(id) => id,
+                None => {
+                    // Persisted primary may be cold after an application restart.
+                    let pinned = self.shared.agent_controls.lock().unwrap().primary.clone();
+                    match pinned {
+                        Some(id) if self.session_on_disk(&id) || self.agent(&id).is_ok() => id,
+                        _ => self
+                            .get_primary_agent()?
+                            .get("agentId")
+                            .and_then(Value::as_str)
+                            .context("native primary Agent missing")?
+                            .to_owned(),
+                    }
+                }
+            };
+            // Scheduled jobs may target a stored session. Resume it without
+            // inventing a new Agent, but never duplicate an already-live one.
+            if self.agent(&agent_id).is_err() {
+                self.resume_session(&agent_id)?;
+            }
+            self.send_message(
+                &agent_id,
+                job.prompt,
+                format!("scheduled-{}-{}", job.id, now_ms()),
+            )
+            .await?;
+            Ok(agent_id)
+        }
+        .await;
+        {
+            let mut state = self.shared.stage_b.lock().unwrap();
+            let mut next = state.clone();
+            if let Some(row) = next.jobs.iter_mut().find(|row| row.id == id) {
+                match &outcome {
+                    Ok(_) => {
+                        row.last_run_at = Some(timestamp_iso(now_ms())?);
+                        row.last_error = None;
+                    }
+                    Err(error) => {
+                        row.last_error = Some(error.to_string());
+                    }
+                }
+                next.save(&self.shared.stage_b_path)?;
+                *state = next;
+            }
+        }
+        let agent_id = outcome?;
         Ok(json!({"ok":true,"status":"success","jobId":id,"agentId":agent_id}))
     }
+    /// Atomically claim due jobs and advance their schedules before dispatch.
+    /// An at-job has no future occurrence: execute once and disable it. Invalid
+    /// schedules are quarantined independently and cannot stall other jobs.
     pub async fn tick_automations(&self) -> Result<usize> {
         let now = now_ms();
         let due = {
             let mut guard = self.shared.stage_b.lock().unwrap();
             let mut next = guard.clone();
             let mut ids = Vec::new();
+            let mut changed = false;
             for job in &mut next.jobs {
                 if !job.enabled {
                     continue;
@@ -487,22 +577,43 @@ impl Studio {
                     .as_deref()
                     .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
                     .map(|dt| dt.timestamp_millis());
-                if deadline.is_some_and(|millis| millis <= now) {
-                    ids.push(job.id.clone());
-                    let next_time = next_job_time_offset(
-                        &job.kind,
-                        &job.schedule,
-                        now,
-                        job.utc_offset_minutes,
-                    )?;
-                    ensure!(next_time.is_some(), "expired one-shot cannot be enabled");
-                    job.next_run_at = next_time.map(timestamp_iso).transpose()?;
-                    if job.kind == "at" {
+                let Some(deadline) = deadline else {
+                    job.enabled = false;
+                    job.last_error = Some("missing or malformed next run; disabled".into());
+                    job.next_run_at = None;
+                    changed = true;
+                    continue;
+                };
+                if deadline > now {
+                    continue;
+                }
+                // A running manual turn can overlap the clock. Defer without
+                // advancing the due date, so it is still due at the next tick.
+                if self
+                    .shared
+                    .running_automations
+                    .lock()
+                    .unwrap()
+                    .contains(&job.id)
+                {
+                    continue;
+                }
+                match next_job_time_offset(&job.kind, &job.schedule, now, job.utc_offset_minutes) {
+                    Ok(upcoming) => {
+                        job.enabled = upcoming.is_some();
+                        job.next_run_at = upcoming.map(timestamp_iso).transpose()?;
+                        changed = true;
+                        ids.push(job.id.clone());
+                    }
+                    Err(error) => {
                         job.enabled = false;
+                        job.next_run_at = None;
+                        job.last_error = Some(format!("invalid schedule: {error}"));
+                        changed = true;
                     }
                 }
             }
-            if !ids.is_empty() {
+            if changed {
                 next.save(&self.shared.stage_b_path)?;
                 *guard = next;
             }
@@ -512,16 +623,7 @@ impl Studio {
             let studio = self.clone();
             let id = id.clone();
             tauri::async_runtime::spawn(async move {
-                if let Err(error) = studio.run_automation_job(&id).await {
-                    let mut guard = studio.shared.stage_b.lock().unwrap();
-                    let mut next = guard.clone();
-                    if let Some(job) = next.jobs.iter_mut().find(|job| job.id == id) {
-                        job.last_error = Some(error.to_string());
-                    }
-                    if next.save(&studio.shared.stage_b_path).is_ok() {
-                        *guard = next;
-                    }
-                }
+                let _ = studio.run_automation_job(&id).await;
             });
         }
         Ok(due.len())
@@ -532,6 +634,13 @@ impl Studio {
             let mut interval = tokio::time::interval(std::time::Duration::from_secs(20));
             loop {
                 interval.tick().await;
+                if studio
+                    .shared
+                    .watch_stop
+                    .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    break;
+                }
                 let _ = studio.tick_automations().await;
             }
         });
@@ -724,6 +833,139 @@ mod tests {
         assert!(!stored.jobs[0].enabled);
         let _ = std::fs::remove_dir_all(path);
     }
+    #[tokio::test]
+    async fn phase_c_due_one_shots_and_invalid_jobs_do_not_stall_the_scheduler() {
+        let path = std::env::temp_dir().join(format!("stage-c-due-{}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        let studio = Studio::with_hook(None, None, path.clone()).await.unwrap();
+        let soon = timestamp_iso(now_ms() + 120_000).unwrap();
+        let once = studio
+            .mutate_automation(json!({"action":"add","type":"at",
+            "schedule":soon,"prompt":"Send once","enabled":true}))
+            .unwrap();
+        let periodic = studio
+            .mutate_automation(json!({"action":"add","type":"every",
+            "schedule":60000,"prompt":"Keep checking","enabled":true}))
+            .unwrap();
+        let once_id = once["job"]["id"].as_str().unwrap().to_owned();
+        let interval_id = periodic["job"]["id"].as_str().unwrap().to_owned();
+        {
+            let mut state = studio.shared.stage_b.lock().unwrap();
+            state
+                .jobs
+                .iter_mut()
+                .find(|row| row.id == once_id)
+                .unwrap()
+                .schedule = json!(timestamp_iso(now_ms() - 60_000).unwrap());
+            state
+                .jobs
+                .iter_mut()
+                .find(|row| row.id == once_id)
+                .unwrap()
+                .next_run_at = Some(timestamp_iso(now_ms() - 60_000).unwrap());
+            state
+                .jobs
+                .iter_mut()
+                .find(|row| row.id == interval_id)
+                .unwrap()
+                .next_run_at = Some(timestamp_iso(now_ms() - 60_000).unwrap());
+            state.jobs.push(ScheduledJob {
+                id: "invalid-stage-c".into(),
+                kind: "cron".into(),
+                schedule: json!("98 * * * *"),
+                enabled: true,
+                label: "bad".into(),
+                prompt: "never".into(),
+                actor_agent_id: None,
+                next_run_at: Some(timestamp_iso(now_ms() - 60_000).unwrap()),
+                last_run_at: None,
+                last_error: None,
+                last_attempt_at: None,
+                created_at: timestamp_iso(now_ms()).unwrap(),
+                utc_offset_minutes: 0,
+            });
+            state.save(&studio.shared.stage_b_path).unwrap();
+        }
+        assert_eq!(studio.tick_automations().await.unwrap(), 2);
+        assert_eq!(studio.tick_automations().await.unwrap(), 0);
+        let state = studio.shared.stage_b.lock().unwrap().clone();
+        let at = state.jobs.iter().find(|row| row.id == once_id).unwrap();
+        assert!(!at.enabled && at.next_run_at.is_none());
+        let every = state.jobs.iter().find(|row| row.id == interval_id).unwrap();
+        assert!(every.enabled && every.next_run_at.is_some());
+        let bad = state
+            .jobs
+            .iter()
+            .find(|row| row.id == "invalid-stage-c")
+            .unwrap();
+        assert!(
+            !bad.enabled
+                && bad
+                    .last_error
+                    .as_ref()
+                    .unwrap()
+                    .contains("invalid schedule")
+        );
+        // Reopen persisted state independently: due-once claim survives restart.
+        let recovered = StageBStore::load(&studio.shared.stage_b_path).unwrap();
+        assert!(
+            !recovered
+                .jobs
+                .iter()
+                .find(|row| row.id == once_id)
+                .unwrap()
+                .enabled
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
+    async fn phase_c_run_lease_and_failed_manual_dispatch_report_real_status() {
+        let path = std::env::temp_dir().join(format!("stage-c-lease-{}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        let studio = Studio::with_hook(None, None, path.clone()).await.unwrap();
+        let created = studio
+            .mutate_automation(json!({"action":"add","type":"every",
+            "schedule":60000,"prompt":"No primary Agent", "enabled":false}))
+            .unwrap();
+        let id = created["job"]["id"].as_str().unwrap();
+        let lease = studio.acquire_automation(id).unwrap();
+        assert!(studio
+            .run_automation_job(id)
+            .await
+            .unwrap_err()
+            .to_string()
+            .contains("already running"));
+        drop(lease);
+        assert!(studio.run_automation_job(id).await.is_err());
+        let state = StageBStore::load(&studio.shared.stage_b_path).unwrap();
+        let job = state.jobs.iter().find(|row| row.id == id).unwrap();
+        assert!(
+            job.last_run_at.is_none(),
+            "failed dispatch is not a successful run"
+        );
+        assert!(job.last_attempt_at.is_some());
+        assert!(job
+            .last_error
+            .as_ref()
+            .is_some_and(|error| error.contains("primary Agent")));
+        // A final file without a committed rename must never overwrite state.
+        std::fs::write(
+            studio.shared.stage_b_path.with_extension("json.new"),
+            b"partial",
+        )
+        .unwrap();
+        assert_eq!(
+            StageBStore::load(&studio.shared.stage_b_path)
+                .unwrap()
+                .jobs
+                .len(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(path);
+    }
+
     #[tokio::test]
     async fn managed_attachments_restrict_identity_and_symlinks() {
         use base64::Engine;
