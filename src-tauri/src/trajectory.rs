@@ -372,7 +372,46 @@ pub(crate) fn trajectory_projection(
     json!({"ok":true,"records":page,"total":total,"hasMore":start>0,"nextBefore":next_before})
 }
 
+/// Latest durable TodoWrite snapshot, including an intentional empty list.
+/// Historical UI reconstruction from tool call args cannot recover this event
+/// when a dsh tool writes todos without an assistant ToolCall block.
+pub(crate) fn session_todo_projection(events: &[SessionEvent]) -> Value {
+    let snapshot = events.iter().rev().find_map(|event| match &event.data {
+        SessionEventData::TodoWrite { todos } => Some((event.seq, todos)),
+        _ => None,
+    });
+    match snapshot {
+        Some((seq, todos)) => json!({"ok":true,"source":"session-event", "revision":seq,
+            "todos":todos.iter().map(|item|json!({
+                "content":item.content,
+                "activeForm":item.content,
+                "status":match item.status {
+                    dsh_rs::types::TodoStatus::Pending=>"pending",
+                    dsh_rs::types::TodoStatus::InProgress=>"in_progress",
+                    dsh_rs::types::TodoStatus::Completed=>"completed",
+                }
+            })).collect::<Vec<Value>>() }),
+        None => json!({"ok":true,"source":"no-event","revision":Value::Null,"todos":[]}),
+    }
+}
+
 impl Studio {
+    pub fn session_todos(&self, agent_id: &str) -> Result<Value> {
+        ensure!(
+            !agent_id.is_empty()
+                && agent_id.len() <= 160
+                && agent_id
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'),
+            "invalid todo session ID"
+        );
+        let events = match self.agent(agent_id) {
+            Ok(agent) => agent.session().events(),
+            Err(_) => self.stored_events(agent_id)?,
+        };
+        Ok(session_todo_projection(&events))
+    }
+
     pub fn session_trajectory(
         &self,
         agent_id: &str,
@@ -452,6 +491,54 @@ mod tests {
         assert_eq!(prior["records"][1]["seq"], 1);
         assert_eq!(prior["hasMore"], false);
     }
+    #[test]
+    fn native_todo_snapshot_is_authoritative_even_when_cleared() {
+        use dsh_rs::types::{TodoItem, TodoStatus};
+        let events = vec![
+            SessionEvent::new(
+                1,
+                100,
+                Data::TodoWrite {
+                    todos: vec![
+                        TodoItem {
+                            content: "Read source".into(),
+                            status: TodoStatus::InProgress,
+                        },
+                        TodoItem {
+                            content: "Write tests".into(),
+                            status: TodoStatus::Pending,
+                        },
+                    ],
+                },
+            ),
+            SessionEvent::new(
+                2,
+                150,
+                Data::TodoWrite {
+                    todos: vec![TodoItem {
+                        content: "Read source".into(),
+                        status: TodoStatus::Completed,
+                    }],
+                },
+            ),
+        ];
+        let projected = session_todo_projection(&events);
+        assert_eq!(projected["source"], "session-event");
+        assert_eq!(projected["revision"], 2);
+        assert_eq!(projected["todos"][0]["status"], "completed");
+        assert_eq!(projected["todos"].as_array().unwrap().len(), 1);
+        let cleared = vec![
+            events[0].clone(),
+            SessionEvent::new(3, 200, Data::TodoWrite { todos: vec![] }),
+        ];
+        assert!(session_todo_projection(&cleared)["todos"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        assert_eq!(session_todo_projection(&cleared)["source"], "session-event");
+        assert_eq!(session_todo_projection(&[])["source"], "no-event");
+    }
+
     #[test]
     fn no_duration_is_fabricated_for_open_steps() {
         let events = vec![SessionEvent::new(

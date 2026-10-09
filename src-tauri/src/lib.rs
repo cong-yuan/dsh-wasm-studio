@@ -151,6 +151,7 @@ pub fn run() {
             commands::upload_blob,
             commands::transcript,
             commands::session_trajectory,
+            commands::session_todos,
             commands::chat_partial,
             commands::capabilities,
             commands::get_agent_control_capabilities,

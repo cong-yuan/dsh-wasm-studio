@@ -5054,6 +5054,10 @@ mod todo_mutation_tests {
             ],
         });
         sessions.flush("todo-persist").await.unwrap();
+        let before = studio.session_todos("todo-persist").unwrap();
+        assert_eq!(before["source"],"session-event");
+        assert_eq!(before["todos"].as_array().unwrap().len(),2);
+        assert_eq!(before["todos"][0]["status"],"in_progress");
 
         let completed = studio
             .complete_session_todos("todo-persist")
@@ -5063,6 +5067,9 @@ mod todo_mutation_tests {
         assert!(completed
             .iter()
             .all(|todo| todo.status == dsh_rs::types::TodoStatus::Completed));
+
+        let after = studio.session_todos("todo-persist").unwrap();
+        assert!(after["todos"].as_array().unwrap().iter().all(|t|t["status"]=="completed"));
 
         let latest = session
             .events()

@@ -707,6 +707,12 @@ pub fn transcript(
     studio.transcript(&agent_id).map_err(err)
 }
 
+/// The last persisted native todo/write event for this session, even when empty.
+#[tauri::command]
+pub fn session_todos(studio: State<'_, Studio>, agent_id: String) -> Result<Value,String> {
+    studio.session_todos(&agent_id).map_err(err)
+}
+
 /// A paged, read-only ledger of actual session events, suitable for the
 /// Input/Model/Tools timing overview and role-colored trajectory inspector.
 #[tauri::command]
