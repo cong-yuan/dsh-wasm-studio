@@ -848,6 +848,11 @@ async fn an_agent_calls_a_wasm_tool_in_a_real_turn() {
         calls.iter().any(|c| c.name == "alpha_tool"),
         "the model's tool call should be in the transcript, got {transcript:?}"
     );
+    let tool_message = transcript.iter().find(|row| row.tool_calls.iter()
+        .any(|call| call.id == "call-1")).expect("tool-message row exists");
+    assert!(tool_message.stream_timeline.iter().any(|part|
+        part.kind == "tool" && part.id.as_deref() == Some("call-1")),
+        "native transcript reload must preserve tool call position");
     let call = calls.iter().find(|c| c.id == "call-1").expect("call is projected");
     assert!(call.started_at.is_some(), "tool/call event time must reach transcript");
     // …and its result came back from the WASM guest.

@@ -4101,6 +4101,19 @@ pub struct ChatMessage {
     pub tool_calls: Vec<ChatToolCall>,
     /// Tool results delivered back to the model.
     pub tool_results: Vec<ChatToolResult>,
+    /// Block-order transcript projection; unlike concatenated `text`, this
+    /// survives session reload and preserves text/tool/text interleaving.
+    #[serde(rename = "streamTimeline")]
+    pub stream_timeline: Vec<ChatTranscriptSegment>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct ChatTranscriptSegment {
+    pub kind: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -4452,18 +4465,48 @@ fn chat_message(m: &dsh_rs::types::Message) -> ChatMessage {
     let mut reasoning = String::new();
     let mut tool_calls = Vec::new();
     let mut tool_results = Vec::new();
+    let mut stream_timeline: Vec<ChatTranscriptSegment> = Vec::new();
 
     for block in &m.content {
         match block {
-            ContentBlock::Text { text: t } => text.push_str(t),
-            ContentBlock::Reasoning { text: t } => reasoning.push_str(t),
+            ContentBlock::Text { text: t } => {
+                text.push_str(t);
+                if let Some(last) = stream_timeline.last_mut() {
+                    if last.kind == "text" {
+                        last.text.as_mut().expect("text timeline").push_str(t);
+                        continue;
+                    }
+                }
+                stream_timeline.push(ChatTranscriptSegment {
+                    kind: "text",
+                    text: Some(t.clone()),
+                    id: None,
+                });
+            }
+            ContentBlock::Reasoning { text: t } => {
+                reasoning.push_str(t);
+                stream_timeline.push(ChatTranscriptSegment {
+                    kind: "reasoning", text: Some(t.clone()), id: None,
+                });
+            },
             ContentBlock::Image { .. } => {}
-            ContentBlock::ToolCall { id, name, arguments } => tool_calls.push(ChatToolCall {
-                id: id.clone(),
-                name: name.clone(),
-                arguments: arguments.clone(),
-                started_at: None,
-            }),
+            ContentBlock::ToolCall {
+                id,
+                name,
+                arguments,
+            } => {
+                stream_timeline.push(ChatTranscriptSegment {
+                    kind: "tool",
+                    text: None,
+                    id: Some(id.clone()),
+                });
+                tool_calls.push(ChatToolCall {
+                    id: id.clone(),
+                    name: name.clone(),
+                    arguments: arguments.clone(),
+                    started_at: None,
+                });
+            }
             ContentBlock::ToolResult {
                 tool_call_id,
                 content,
@@ -4490,6 +4533,7 @@ fn chat_message(m: &dsh_rs::types::Message) -> ChatMessage {
         reasoning,
         tool_calls,
         tool_results,
+        stream_timeline,
     }
 }
 
@@ -4658,10 +4702,44 @@ mod partial_stream_tests {
             reasoning: String::new(),
             tool_calls: vec![],
             tool_results: vec![],
+            stream_timeline: vec![],
         }];
         let (text, reasoning) = partial_from_events_and_rows(&events, &rows, 0).unwrap();
         assert_eq!(text, "Hello");
         assert!(reasoning.is_empty());
+    }
+
+    #[test]
+    fn durable_transcript_preserves_text_tool_text_content_block_order() {
+        use dsh_rs::types::{ContentBlock, Message, MessageSource, Role};
+        let message = Message {
+            id: "block-order".into(),role:Role::Assistant,
+            content: vec![
+                ContentBlock::Text {text:"Before ".into()},
+                ContentBlock::Reasoning {text:"why".into()},
+                ContentBlock::Text {text:"tool".into()},
+                ContentBlock::ToolCall {id:"call-1".into(), name:"read_file".into(),
+                    arguments:"{\"path\":\"hello.txt\"}".into()},
+                ContentBlock::Text {text:"After tool".into()},
+            ],
+            source:MessageSource::Model {provider:"mock".into(),model:"mock-1".into()},
+        };
+        let result = super::chat_message(&message);
+        assert_eq!(result.text,"Before toolAfter tool");
+        assert_eq!(result.reasoning,"why");
+        assert_eq!(result.stream_timeline.len(),5);
+        assert_eq!(result.stream_timeline[0].kind,"text");
+        assert_eq!(result.stream_timeline[0].text.as_deref(),Some("Before "));
+        assert_eq!(result.stream_timeline[1].kind,"reasoning");
+        assert_eq!(result.stream_timeline[1].text.as_deref(),Some("why"));
+        assert_eq!(result.stream_timeline[2].text.as_deref(),Some("tool"));
+        assert_eq!(result.stream_timeline[3].kind,"tool");
+        assert_eq!(result.stream_timeline[3].id.as_deref(),Some("call-1"));
+        assert_eq!(result.stream_timeline[4].text.as_deref(),Some("After tool"));
+        let json = serde_json::to_value(&result).unwrap();
+        assert_eq!(json["streamTimeline"][1]["kind"],"reasoning");
+        assert_eq!(json["streamTimeline"][3]["id"],"call-1");
+        assert_eq!(json["streamTimeline"][4]["text"],"After tool");
     }
 
     #[test]
@@ -4693,6 +4771,7 @@ mod partial_stream_tests {
                 reasoning: String::new(),
                 tool_calls: vec![],
                 tool_results: vec![],
+            stream_timeline: vec![],
             },
             ChatMessage {
                 role: "assistant".into(),
@@ -4700,6 +4779,7 @@ mod partial_stream_tests {
                 reasoning: String::new(),
                 tool_calls: vec![],
                 tool_results: vec![],
+            stream_timeline: vec![],
             },
         ];
         let (text, _) = partial_from_events_and_rows(&events, &rows, 1).unwrap();
