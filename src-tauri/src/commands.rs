@@ -877,3 +877,34 @@ pub fn delete_shared_memory(studio: State<'_, Studio>, agent_id: String,
     fact_id: String) -> Result<Value, String> {
     studio.delete_shared_memory(&agent_id, &fact_id).map_err(err)
 }
+
+// Phase B: native project catalog, scheduler and managed session attachments.
+#[tauri::command]
+pub fn get_project_catalog(studio: State<'_, Studio>) -> Value { studio.project_catalog() }
+#[tauri::command]
+pub fn put_project_catalog(studio: State<'_, Studio>, revision: String,
+    catalog: Value, assignments: std::collections::HashMap<String,String>) -> Result<Value,String> {
+    studio.put_project_catalog(&revision,catalog,assignments).map_err(err)
+}
+#[tauri::command]
+pub fn get_automation_jobs(studio: State<'_, Studio>) -> Value {studio.automation_jobs()}
+#[tauri::command]
+pub fn mutate_automation_job(studio: State<'_, Studio>, request: Value) -> Result<Value,String> {
+    studio.mutate_automation(request).map_err(err)
+}
+#[tauri::command]
+pub async fn run_automation_job(studio: State<'_, Studio>, id: String) -> Result<Value,String> {
+    studio.run_automation_job(&id).await.map_err(err)
+}
+#[tauri::command]
+pub fn list_session_attachments(studio: State<'_, Studio>, agent_id: String) -> Result<Value,String> {
+    studio.list_session_attachments(&agent_id).map_err(err)
+}
+#[tauri::command]
+pub fn read_session_attachment(studio: State<'_, Studio>, agent_id: String, file_id: String) -> Result<Value,String> {
+    studio.attachment_operation(&agent_id,&file_id,"read").map_err(err)
+}
+#[tauri::command]
+pub fn delete_session_attachment(studio: State<'_, Studio>, agent_id: String, file_id: String) -> Result<Value,String> {
+    studio.attachment_operation(&agent_id,&file_id,"delete").map_err(err)
+}

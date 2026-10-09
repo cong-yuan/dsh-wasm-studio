@@ -64,6 +64,7 @@ use serde_json::Value;
 use tauri::{AppHandle, Emitter};
 use wasm_plugin_host::{Config, PluginEntry};
 use crate::agent_controls::{ControlStore, AgentSettings};
+use crate::stage_b::StageBStore;
 
 /// A callback the studio fires when something changes, so the UI can refresh
 /// and the watcher can report what it did. Boxed so the Tauri layer can forward
@@ -133,7 +134,7 @@ pub(crate) struct Shared {
     /// `<app-data>/sessions` — JSONL files listed by [`Studio::list_sessions`].
     /// Kept so [`Studio::dispose_agent`] can delete the file (archive/delete),
     /// not only stop the in-memory driver.
-    sessions_dir: PathBuf,
+    pub(crate) sessions_dir: PathBuf,
     /// Handed out to auto-created sessions so their ids cannot collide with
     /// sessions already on disk (see [`Studio::new_session_id`]).
     id_seq: std::sync::atomic::AtomicU64,
@@ -155,6 +156,8 @@ pub(crate) struct Shared {
     config: Mutex<Config>,
     pub(crate) agent_controls_path: PathBuf,
     pub(crate) agent_controls: Mutex<ControlStore>,
+    pub(crate) stage_b_path: PathBuf,
+    pub(crate) stage_b: Mutex<StageBStore>,
     booted: bool,
     // --- auto-reload watcher ---
     watch_stop: AtomicBool,
@@ -275,6 +278,8 @@ impl Studio {
         let controls_path = app_data_dir.join("agent-controls.json");
         let controls = ControlStore::load(&controls_path)?;
         controls.hydrate();
+        let stage_b_path = app_data_dir.join("stage-b.json");
+        let stage_b = StageBStore::load(&stage_b_path)?;
         let studio = Studio {
             shared: Arc::new(Shared {
                 ctx,
@@ -295,6 +300,8 @@ impl Studio {
                 config: Mutex::new(config),
                 agent_controls_path: controls_path,
                 agent_controls: Mutex::new(controls),
+                stage_b_path,
+                stage_b: Mutex::new(stage_b),
                 booted: true,
                 watch_stop: AtomicBool::new(false),
                 watch_handle: Mutex::new(None),
@@ -355,6 +362,7 @@ impl Studio {
 
         // Start the filesystem watcher (best-effort; the app works without it).
         studio.start_watch();
+        studio.start_automation_scheduler();
         Ok(studio)
     }
 

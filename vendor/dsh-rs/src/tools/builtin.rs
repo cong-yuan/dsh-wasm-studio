@@ -116,8 +116,9 @@ fn resolve_path(run_ctx: &ToolRunContext, raw: &str) -> PathBuf {
 }
 
 fn path_is_allowed(run_ctx: &ToolRunContext, path: &Path, for_write: bool) -> bool {
+    // Absence of an approved root does not mean access to the whole disk.
     if run_ctx.allowed_roots.is_empty() {
-        return true;
+        return false;
     }
 
     let candidate = if path.exists() {
@@ -157,7 +158,10 @@ fn path_is_allowed(run_ctx: &ToolRunContext, path: &Path, for_write: bool) -> bo
 fn denied_path(path: &Path) -> ToolExecutionResult {
     ToolExecutionResult::error(
         "PATH_DENIED",
-        format!("path is outside the session authorized folders: {}", path.display()),
+        format!(
+            "path is outside the session authorized folders: {}",
+            path.display()
+        ),
     )
 }
 
@@ -172,6 +176,64 @@ struct BashArgs {
     timeout_ms: Option<u64>,
     #[serde(default)]
     cwd: Option<String>,
+}
+
+/// A shell cannot be confined by changing cwd: absolute paths, symlinks,
+/// redirections and subprocesses bypass it. On macOS use an inherited kernel
+/// sandbox for the whole process tree. Other OSes fail closed until they have
+/// an equivalent confinement implementation.
+#[cfg(target_os = "macos")]
+fn confined_shell(
+    run_ctx: &ToolRunContext,
+    workdir: &Path,
+    shell: &str,
+) -> Result<tokio::process::Command, &'static str> {
+    if !Path::new("/usr/bin/sandbox-exec").is_file() {
+        return Err("macOS sandbox-exec is unavailable");
+    }
+    if run_ctx.allowed_roots.is_empty() {
+        return Err("no authorized workspace roots for shell");
+    }
+    if !path_is_allowed(run_ctx, workdir, false) {
+        return Err("shell cwd is outside authorized folders");
+    }
+    let mut profile = String::from("(version 1)\n(deny default)\n(allow process*)\n(allow sysctl-read)\n(allow file-read* (subpath \"/usr\") (subpath \"/bin\") (subpath \"/sbin\") (subpath \"/System\") (subpath \"/Library\") (subpath \"/private/etc\") (subpath \"/dev\")");
+    let mut roots = Vec::new();
+    for raw in &run_ctx.allowed_roots {
+        let root =
+            std::fs::canonicalize(raw).map_err(|_| "authorized shell root does not exist")?;
+        if !root.is_dir() || root == Path::new("/") {
+            return Err("unsafe shell root");
+        }
+        roots.push(
+            serde_json::to_string(&root.to_string_lossy().to_string())
+                .map_err(|_| "invalid shell root")?,
+        );
+    }
+    for root in &roots {
+        profile.push_str(&format!(" (subpath {root})"));
+    }
+    profile.push_str(")\n(allow file-write*");
+    for root in &roots {
+        profile.push_str(&format!(" (subpath {root})"));
+    }
+    profile.push_str(")\n");
+    let mut command = tokio::process::Command::new("/usr/bin/sandbox-exec");
+    command
+        .arg("-p")
+        .arg(profile)
+        .arg("/bin/sh")
+        .arg("-c")
+        .arg(shell);
+    Ok(command)
+}
+#[cfg(not(target_os = "macos"))]
+fn confined_shell(
+    _run_ctx: &ToolRunContext,
+    _workdir: &Path,
+    _shell: &str,
+) -> Result<tokio::process::Command, &'static str> {
+    Err("OS-enforced shell confinement is unavailable on this platform")
 }
 
 fn bash_tool() -> Arc<ToolDefinition> {
@@ -199,11 +261,18 @@ fn bash_tool() -> Arc<ToolDefinition> {
                     .clone()
                     .map(|c| resolve_path(&run_ctx, &c))
                     .or_else(|| run_ctx.cwd.clone().map(PathBuf::from));
-                let mut command = tokio::process::Command::new("sh");
-                command.arg("-c").arg(&parsed.command);
-                if let Some(dir) = &workdir {
-                    command.current_dir(dir);
-                }
+                let Some(workdir) = workdir.as_ref() else {
+                    return ToolExecutionResult::error("SHELL_SANDBOX", "shell requires a workspace working directory");
+                };
+                let workdir = match std::fs::canonicalize(workdir) {
+                    Ok(path) if path.is_dir() => path,
+                    _ => return ToolExecutionResult::error("SHELL_SANDBOX", "shell working directory unavailable"),
+                };
+                let mut command = match confined_shell(&run_ctx, &workdir, &parsed.command) {
+                    Ok(command) => command,
+                    Err(reason) => return ToolExecutionResult::error("SHELL_SANDBOX", reason),
+                };
+                command.current_dir(&workdir);
                 command.stdout(std::process::Stdio::piped());
                 command.stderr(std::process::Stdio::piped());
                 command.kill_on_drop(true);
@@ -328,33 +397,39 @@ fn read_file_tool() -> Arc<ToolDefinition> {
         "properties": { "path": { "type": "string", "description": "Path of the file to read." } },
         "required": ["path"]
     });
-    Arc::new(ToolDefinition::new(
-        "read_file",
-        "Read a text file and return its full contents.",
-        parameters,
-        |args: ToolCallArgs, run_ctx: ToolRunContext| {
-            Box::pin(async move {
-                let parsed: ReadArgs = match serde_json::from_value(args.arguments) {
-                    Ok(parsed) => parsed,
-                    Err(err) => return ToolExecutionResult::error("INVALID_ARGS", err.to_string()),
-                };
-                let path = resolve_path(&run_ctx, &parsed.path);
-                if !path_is_allowed(&run_ctx, &path, false) {
-                    return denied_path(&path);
-                }
-                match tokio::fs::read_to_string(&path).await {
-                    Ok(content) => {
-                        let value = json!({ "path": path.display().to_string(), "content": content });
-                        ToolExecutionResult::success_text(content, value)
+    Arc::new(
+        ToolDefinition::new(
+            "read_file",
+            "Read a text file and return its full contents.",
+            parameters,
+            |args: ToolCallArgs, run_ctx: ToolRunContext| {
+                Box::pin(async move {
+                    let parsed: ReadArgs = match serde_json::from_value(args.arguments) {
+                        Ok(parsed) => parsed,
+                        Err(err) => {
+                            return ToolExecutionResult::error("INVALID_ARGS", err.to_string())
+                        }
+                    };
+                    let path = resolve_path(&run_ctx, &parsed.path);
+                    if !path_is_allowed(&run_ctx, &path, false) {
+                        return denied_path(&path);
                     }
-                    Err(err) => ToolExecutionResult::error(
-                        "READ_FAILED",
-                        format!("cannot read {}: {err}", path.display()),
-                    ),
-                }
-            })
-        },
-    ).concurrency_safe())
+                    match tokio::fs::read_to_string(&path).await {
+                        Ok(content) => {
+                            let value =
+                                json!({ "path": path.display().to_string(), "content": content });
+                            ToolExecutionResult::success_text(content, value)
+                        }
+                        Err(err) => ToolExecutionResult::error(
+                            "READ_FAILED",
+                            format!("cannot read {}: {err}", path.display()),
+                        ),
+                    }
+                })
+            },
+        )
+        .concurrency_safe(),
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -484,7 +559,8 @@ fn edit_file_tool() -> Arc<ToolDefinition> {
                 };
                 match tokio::fs::write(&path, &updated).await {
                     Ok(()) => {
-                        let value = json!({ "path": path.display().to_string(), "bytes": updated.len() });
+                        let value =
+                            json!({ "path": path.display().to_string(), "bytes": updated.len() });
                         ToolExecutionResult::success_text(
                             format!("edited {}", path.display()),
                             value,
@@ -523,55 +599,62 @@ fn glob_tool() -> Arc<ToolDefinition> {
         },
         "required": ["pattern"]
     });
-    Arc::new(ToolDefinition::new(
-        "glob",
-        "List files matching a glob pattern under a directory.",
-        parameters,
-        |args: ToolCallArgs, run_ctx: ToolRunContext| {
-            Box::pin(async move {
-                let parsed: GlobArgs = match serde_json::from_value(args.arguments) {
-                    Ok(parsed) => parsed,
-                    Err(err) => return ToolExecutionResult::error("INVALID_ARGS", err.to_string()),
-                };
-                let base = parsed
-                    .path
-                    .map(|p| resolve_path(&run_ctx, &p))
-                    .or_else(|| run_ctx.cwd.clone().map(PathBuf::from))
-                    .unwrap_or_else(|| PathBuf::from("."));
-                if !path_is_allowed(&run_ctx, &base, false) {
-                    return denied_path(&base);
-                }
-                let pattern = parsed.pattern.clone();
-                let matches = walk_and_match(&base, &pattern).await;
-                let relative: Vec<String> = matches
-                    .iter()
-                    .map(|m| {
-                        let rel = m.strip_prefix(&base).unwrap_or(m);
-                        let rel = rel.to_string_lossy().replace('\\', "/");
-                        rel.trim_start_matches('/').to_string()
+    Arc::new(
+        ToolDefinition::new(
+            "glob",
+            "List files matching a glob pattern under a directory.",
+            parameters,
+            |args: ToolCallArgs, run_ctx: ToolRunContext| {
+                Box::pin(async move {
+                    let parsed: GlobArgs = match serde_json::from_value(args.arguments) {
+                        Ok(parsed) => parsed,
+                        Err(err) => {
+                            return ToolExecutionResult::error("INVALID_ARGS", err.to_string())
+                        }
+                    };
+                    let base = parsed
+                        .path
+                        .map(|p| resolve_path(&run_ctx, &p))
+                        .or_else(|| run_ctx.cwd.clone().map(PathBuf::from))
+                        .unwrap_or_else(|| PathBuf::from("."));
+                    if !path_is_allowed(&run_ctx, &base, false) {
+                        return denied_path(&base);
+                    }
+                    let pattern = parsed.pattern.clone();
+                    let matches = walk_and_match(&base, &pattern).await;
+                    let relative: Vec<String> = matches
+                        .iter()
+                        .map(|m| {
+                            let rel = m.strip_prefix(&base).unwrap_or(m);
+                            let rel = rel.to_string_lossy().replace('\\', "/");
+                            rel.trim_start_matches('/').to_string()
+                        })
+                        .collect();
+                    let value = serde_json::to_value(&GlobResult {
+                        count: relative.len(),
+                        matches: relative.clone(),
                     })
-                    .collect();
-                let value = serde_json::to_value(&GlobResult {
-                    count: relative.len(),
-                    matches: relative.clone(),
+                    .unwrap_or(Value::Null);
+                    let text = if relative.is_empty() {
+                        format!("no files match {pattern}")
+                    } else {
+                        relative.join("\n")
+                    };
+                    ToolExecutionResult::success_text(text, value)
                 })
-                .unwrap_or(Value::Null);
-                let text = if relative.is_empty() {
-                    format!("no files match {pattern}")
-                } else {
-                    relative.join("\n")
-                };
-                ToolExecutionResult::success_text(text, value)
-            })
-        },
-    ).concurrency_safe())
+            },
+        )
+        .concurrency_safe(),
+    )
 }
 
 async fn walk_and_match(base: &Path, pattern: &str) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![base.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(mut entries) = tokio::fs::read_dir(&dir).await else { continue };
+        let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+            continue;
+        };
         let mut collected = Vec::new();
         while let Ok(Some(entry)) = entries.next_entry().await {
             collected.push(entry);
@@ -580,7 +663,9 @@ async fn walk_and_match(base: &Path, pattern: &str) -> Vec<PathBuf> {
         collected.sort_by_key(|e| e.file_name());
         for entry in collected {
             let path = entry.path();
-            let Ok(meta) = tokio::fs::symlink_metadata(&path).await else { continue };
+            let Ok(meta) = tokio::fs::symlink_metadata(&path).await else {
+                continue;
+            };
             if meta.file_type().is_symlink() {
                 continue;
             }
@@ -702,7 +787,9 @@ async fn collect_files(base: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
     let mut stack = vec![base.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let Ok(mut entries) = tokio::fs::read_dir(&dir).await else { continue };
+        let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+            continue;
+        };
         let mut collected = Vec::new();
         while let Ok(Some(entry)) = entries.next_entry().await {
             collected.push(entry);
@@ -710,7 +797,9 @@ async fn collect_files(base: &Path) -> Vec<PathBuf> {
         collected.sort_by_key(|e| e.file_name());
         for entry in collected {
             let path = entry.path();
-            let Ok(meta) = tokio::fs::symlink_metadata(&path).await else { continue };
+            let Ok(meta) = tokio::fs::symlink_metadata(&path).await else {
+                continue;
+            };
             if meta.file_type().is_symlink() {
                 continue;
             }
@@ -723,4 +812,35 @@ async fn collect_files(base: &Path) -> Vec<PathBuf> {
     }
     out.sort();
     out
+}
+
+#[cfg(test)]
+mod sandbox_boundary_tests {
+    use super::*;
+    #[tokio::test]
+    async fn no_authorized_roots_never_executes_shell_or_unrestricted_paths() {
+        let ctx = cordis::Context::new();
+        let run = ToolRunContext {
+            ctx,
+            signal: crate::types::CancelToken::new(),
+            agent_id: None,
+            cwd: Some(std::env::temp_dir().to_string_lossy().into()),
+            allowed_roots: vec![],
+        };
+        assert!(!path_is_allowed(&run, &std::env::temp_dir(), false));
+        let tool = bash_tool();
+        let result = (tool.execute)(
+            ToolCallArgs {
+                call_id: "sandbox-boundary".into(),
+                name: "bash".into(),
+                arguments: json!({"command":"echo should-not-run"}),
+            },
+            run,
+        )
+        .await;
+        assert!(
+            result.is_error(),
+            "shell without scoped roots must fail closed"
+        );
+    }
 }

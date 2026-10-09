@@ -14,6 +14,7 @@
 pub mod commands;
 mod agent_controls;
 mod stage_a_impl;
+mod stage_b;
 pub mod studio;
 
 use studio::Studio;
@@ -161,6 +162,14 @@ pub fn run() {
             commands::decide_tool_approval,
             commands::list_shared_memory,
             commands::delete_shared_memory,
+            commands::get_project_catalog,
+            commands::put_project_catalog,
+            commands::get_automation_jobs,
+            commands::mutate_automation_job,
+            commands::run_automation_job,
+            commands::list_session_attachments,
+            commands::read_session_attachment,
+            commands::delete_session_attachment,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
