@@ -3119,16 +3119,29 @@ impl Studio {
             .sessions_dir
             .parent()
             .ok_or_else(|| anyhow::anyhow!("missing attachment data directory"))?;
-        let dir = crate::stage_b::managed_attachment_directory(base, namespace, true)?;
-        let dest = dir.join(format!("{}-{}", file_id, safe_name));
-        use tokio::io::AsyncWriteExt;
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&dest)
-            .await?;
-        file.write_all(&bytes).await?;
-        file.sync_all().await?;
+        #[cfg(unix)]
+        let dest = {
+            let folder = crate::managed_attachments::ManagedFolder::open(base, namespace, true)?
+                .ok_or_else(|| anyhow::anyhow!("attachment directory not created"))?;
+            let filename = format!("{}-{}", file_id, safe_name);
+            folder.create(&filename, &bytes)?;
+            base.join("session-files").join(namespace).join(filename)
+        };
+        #[cfg(not(unix))]
+        let dest = {
+            let dir = crate::stage_b::managed_attachment_directory(base, namespace, true)?;
+            let dest = dir.join(format!("{}-{}", file_id, safe_name));
+            use tokio::io::AsyncWriteExt;
+            let mut file = tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&dest)
+                .await?;
+            file.write_all(&bytes).await?;
+            file.sync_all().await?;
+
+            dest
+        };
 
         let mime = mime_type.unwrap_or("application/octet-stream").trim();
         let kind = upload_kind(mime);

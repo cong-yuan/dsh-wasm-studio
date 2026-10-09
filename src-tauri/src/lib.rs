@@ -15,6 +15,8 @@ pub mod commands;
 mod agent_controls;
 mod stage_a_impl;
 mod stage_b;
+#[cfg(unix)]
+mod managed_attachments;
 pub mod studio;
 
 use studio::Studio;

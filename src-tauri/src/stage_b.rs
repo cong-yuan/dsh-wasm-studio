@@ -30,6 +30,10 @@ pub struct ScheduledJob {
     /// Persist before dispatch so an interrupted run is visible after restart.
     #[serde(default)]
     pub last_attempt_at: Option<String>,
+    /// Delivery acknowledgement: dispatching, dispatched, failed or interrupted.
+    /// This does not claim the Agent's model/tool turn was completed.
+    #[serde(default)]
+    pub last_dispatch_state: Option<String>,
     pub created_at: String,
     #[serde(default)]
     pub utc_offset_minutes: i32,
@@ -58,9 +62,23 @@ impl StageBStore {
         if !path.exists() {
             return Ok(Self::default());
         }
-        let value: Self = serde_json::from_slice(&std::fs::read(path)?)?;
+        let mut value: Self = serde_json::from_slice(&std::fs::read(path)?)?;
         validate_project_state(&value.catalog, &value.assignments)?;
         ensure!(value.jobs.len() <= 300, "too many automation jobs");
+        let mut recovered = false;
+        for job in &mut value.jobs {
+            if job.last_dispatch_state.as_deref() == Some("dispatching") {
+                job.last_dispatch_state = Some("interrupted".into());
+                job.last_error =
+                    Some("Studio restarted before delivery was confirmed; outcome unknown".into());
+                recovered = true;
+            }
+        }
+        // Crash recovery is durable too: don't repeatedly claim it was still
+        // running in this process on every subsequent restart.
+        if recovered {
+            value.save(path)?;
+        }
         Ok(value)
     }
     pub fn save(&self, path: &Path) -> Result<()> {
@@ -396,9 +414,11 @@ impl Studio {
                 } else {
                     &payload
                 };
-                ensure!(!item.get("model").is_some_and(|value| !value.is_null())
-                    && !item.get("executor").is_some_and(|value| !value.is_null()),
-                    "native scheduler does not support per-job model or executor overrides");
+                ensure!(
+                    !item.get("model").is_some_and(|value| !value.is_null())
+                        && !item.get("executor").is_some_and(|value| !value.is_null()),
+                    "native scheduler does not support per-job model or executor overrides"
+                );
                 let id = loop {
                     let seq = self
                         .shared
@@ -440,6 +460,7 @@ impl Studio {
                     last_run_at: None,
                     last_error: None,
                     last_attempt_at: None,
+                    last_dispatch_state: None,
                     created_at: timestamp_iso(now)?,
                     utc_offset_minutes: item
                         .get("utcOffsetMinutes")
@@ -539,7 +560,8 @@ impl Studio {
                 .context("automation job not found")?;
             ensure!(!row.prompt.trim().is_empty(), "automation prompt required");
             row.last_attempt_at = Some(attempt);
-            row.last_error = Some("execution interrupted before completion".into());
+            row.last_dispatch_state = Some("dispatching".into());
+            row.last_error = Some("Studio is dispatching this task".into());
             let snapshot = row.clone();
             next.save(&self.shared.stage_b_path)?;
             *state = next;
@@ -583,9 +605,11 @@ impl Studio {
                 match &outcome {
                     Ok(_) => {
                         row.last_run_at = Some(timestamp_iso(now_ms())?);
+                        row.last_dispatch_state = Some("dispatched".into());
                         row.last_error = None;
                     }
                     Err(error) => {
+                        row.last_dispatch_state = Some("failed".into());
                         row.last_error = Some(error.to_string());
                     }
                 }
@@ -719,6 +743,7 @@ fn validate_job(job: &ScheduledJob) -> Result<()> {
 /// Verify the *directories* as well as individual file paths. Checking only
 /// the file's canonical parent was insufficient if session-files/<agent> was
 /// itself a symlink to a directory outside Studio's managed app-data area.
+#[cfg(not(unix))]
 fn checked_managed_child(path: &Path, canonical_parent: &Path, create: bool) -> Result<bool> {
     match std::fs::symlink_metadata(path) {
         Ok(meta) => ensure!(
@@ -739,6 +764,7 @@ fn checked_managed_child(path: &Path, canonical_parent: &Path, create: bool) -> 
     );
     Ok(true)
 }
+#[cfg(not(unix))]
 pub(crate) fn managed_attachment_directory(
     base: &Path,
     namespace: &str,
@@ -761,6 +787,7 @@ pub(crate) fn managed_attachment_directory(
     let _ = checked_managed_child(&dir, &canonical_root, create)?;
     Ok(dir)
 }
+#[cfg(not(unix))]
 fn attachment_namespace(studio: &Studio, agent_id: &str) -> Result<std::path::PathBuf> {
     ensure!(validate_id(agent_id), "invalid attachment Agent ID");
     ensure!(
@@ -793,6 +820,75 @@ fn attachment_id_and_name(filename: &str) -> Option<(String, String)> {
     ))
 }
 impl Studio {
+    #[cfg(unix)]
+    pub fn list_session_attachments(&self, id: &str) -> Result<Value> {
+        ensure!(
+            validate_id(id) && (self.session_on_disk(id) || self.agent(id).is_ok()),
+            "invalid or unknown attachment session"
+        );
+        let base = self
+            .shared
+            .sessions_dir
+            .parent()
+            .context("sessions parent missing")?;
+        let folder = crate::managed_attachments::ManagedFolder::open(base, id, false)?;
+        let mut files = Vec::new();
+        if let Some(folder) = folder {
+            for (filename, size) in folder.entries()? {
+                if let Some((file_id, name)) = attachment_id_and_name(&filename) {
+                    files.push(json!({"id":file_id,"name":name,"size":size,
+                        "sessionId":id,"stored":true}));
+                }
+            }
+        }
+        files.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
+        Ok(json!({"ok":true,"sessionId":id,"files":files}))
+    }
+    #[cfg(unix)]
+    pub fn attachment_operation(&self, id: &str, file_id: &str, action: &str) -> Result<Value> {
+        ensure!(
+            validate_id(id) && (self.session_on_disk(id) || self.agent(id).is_ok()),
+            "invalid or unknown attachment session"
+        );
+        ensure!(
+            validate_id(file_id) && file_id.starts_with("studio-file-"),
+            "invalid managed file ID"
+        );
+        let base = self
+            .shared
+            .sessions_dir
+            .parent()
+            .context("sessions parent missing")?;
+        let folder = crate::managed_attachments::ManagedFolder::open(base, id, false)?
+            .context("managed attachment directory missing")?;
+        let mut filename = None;
+        for (candidate, _) in folder.entries()? {
+            if attachment_id_and_name(&candidate)
+                .as_ref()
+                .is_some_and(|(found, _)| found == file_id)
+            {
+                ensure!(filename.is_none(), "ambiguous managed file identity");
+                filename = Some(candidate);
+            }
+        }
+        let filename = filename.context("managed attachment not found")?;
+        let filename_parts = attachment_id_and_name(&filename).context("invalid filename")?;
+        match action {
+            "read" => {
+                use base64::Engine;
+                let bytes = folder.read(&filename)?;
+                Ok(json!({"ok":true,"sessionId":id,"id":file_id,
+                    "name":filename_parts.1,"size":bytes.len(),
+                    "base64":base64::engine::general_purpose::STANDARD.encode(bytes)}))
+            }
+            "delete" => {
+                folder.remove(&filename)?;
+                Ok(json!({"ok":true,"sessionId":id,"id":file_id,"deleted":true}))
+            }
+            _ => bail!("unsupported managed attachment operation"),
+        }
+    }
+    #[cfg(not(unix))]
     pub fn list_session_attachments(&self, id: &str) -> Result<Value> {
         let dir = attachment_namespace(self, id)?;
         let mut files = Vec::new();
@@ -813,6 +909,7 @@ impl Studio {
         files.sort_by(|a, b| a["id"].as_str().cmp(&b["id"].as_str()));
         Ok(json!({"ok":true,"sessionId":id,"files":files}))
     }
+    #[cfg(not(unix))]
     pub fn attachment_operation(&self, id: &str, file_id: &str, action: &str) -> Result<Value> {
         ensure!(
             validate_id(file_id) && file_id.starts_with("studio-file-"),
@@ -925,6 +1022,52 @@ mod tests {
             None
         );
     }
+    #[test]
+    fn restart_converts_incomplete_native_dispatch_to_durable_unknown_outcome() {
+        let path =
+            std::env::temp_dir().join(format!("stage-c-crash-state-{}.json", std::process::id()));
+        let mut state = StageBStore::default();
+        state.jobs.push(ScheduledJob {
+            id: "automation-crash".into(),
+            kind: "every".into(),
+            schedule: json!(60000),
+            enabled: true,
+            label: "Check".into(),
+            prompt: "Do task".into(),
+            actor_agent_id: None,
+            next_run_at: Some(timestamp_iso(now_ms() + 60000).unwrap()),
+            last_run_at: None,
+            last_attempt_at: Some(timestamp_iso(now_ms() - 1000).unwrap()),
+            last_error: Some("Studio is dispatching this task".into()),
+            last_dispatch_state: Some("dispatching".into()),
+            created_at: timestamp_iso(now_ms() - 60000).unwrap(),
+            utc_offset_minutes: 0,
+        });
+        state.save(&path).unwrap();
+        let recovered = StageBStore::load(&path).unwrap();
+        assert_eq!(
+            recovered.jobs[0].last_dispatch_state.as_deref(),
+            Some("interrupted")
+        );
+        assert!(recovered.jobs[0]
+            .last_error
+            .as_ref()
+            .unwrap()
+            .contains("outcome unknown"));
+        assert!(recovered.jobs[0].last_run_at.is_none());
+        // Repeating a real process boot should not rewrite/re-report an old run.
+        let again = StageBStore::load(&path).unwrap();
+        assert_eq!(
+            again.jobs[0].last_dispatch_state.as_deref(),
+            Some("interrupted")
+        );
+        assert_eq!(
+            again.jobs[0].last_attempt_at,
+            recovered.jobs[0].last_attempt_at
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
     #[tokio::test]
     async fn native_scheduler_disabled_drafts_can_be_saved_but_not_executed() {
         let path = std::env::temp_dir().join(format!("studio-draft-{}", std::process::id()));
@@ -1058,6 +1201,7 @@ mod tests {
                 last_run_at: None,
                 last_error: None,
                 last_attempt_at: None,
+                last_dispatch_state: None,
                 created_at: timestamp_iso(now_ms()).unwrap(),
                 utc_offset_minutes: 0,
             });
@@ -1275,7 +1419,7 @@ mod tests {
             .attachment_operation(&agent, "studio-file-ab-cd", "read")
             .unwrap_err()
             .to_string()
-            .contains("oversized"));
+            .contains("size limit"));
         std::fs::remove_file(oversized).unwrap();
         #[cfg(unix)]
         {
