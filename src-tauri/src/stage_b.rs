@@ -489,7 +489,14 @@ impl Studio {
     /// before dispatch; success/error is persisted afterward. On process death
     /// a pending attempt remains explicitly marked interrupted, not "success".
     pub async fn run_automation_job(&self, id: &str) -> Result<Value> {
-        let _lease = self.acquire_automation(id)?;
+        let permit = self.acquire_automation(id)?;
+        self.run_automation_with_permit(id, permit).await
+    }
+    async fn run_automation_with_permit(
+        &self,
+        id: &str,
+        _permit: AutomationPermit,
+    ) -> Result<Value> {
         let attempt = timestamp_iso(now_ms())?;
         let job = {
             let mut state = self.shared.stage_b.lock().unwrap();
@@ -556,77 +563,85 @@ impl Studio {
             }
         }
         let agent_id = outcome?;
-        Ok(json!({"ok":true,"status":"success","jobId":id,"agentId":agent_id}))
+        // send_message acknowledges dispatch into Agent processing, not the
+        // completed model/tool turn; never report final task success here.
+        Ok(json!({"ok":true,"status":"dispatched","jobId":id,"agentId":agent_id}))
     }
     /// Atomically claim due jobs and advance their schedules before dispatch.
     /// An at-job has no future occurrence: execute once and disable it. Invalid
     /// schedules are quarantined independently and cannot stall other jobs.
-    pub async fn tick_automations(&self) -> Result<usize> {
-        let now = now_ms();
-        let due = {
-            let mut guard = self.shared.stage_b.lock().unwrap();
-            let mut next = guard.clone();
-            let mut ids = Vec::new();
-            let mut changed = false;
-            for job in &mut next.jobs {
-                if !job.enabled {
-                    continue;
-                }
-                let deadline = job
-                    .next_run_at
-                    .as_deref()
-                    .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
-                    .map(|dt| dt.timestamp_millis());
-                let Some(deadline) = deadline else {
-                    job.enabled = false;
-                    job.last_error = Some("missing or malformed next run; disabled".into());
-                    job.next_run_at = None;
+    /// Reserve due jobs while holding the execution lock. The previous code
+    /// advanced the persisted timestamp and then spawned a future which had to
+    /// acquire its lock; a simultaneous manual run could steal it and cause a
+    /// silently lost scheduled occurrence. Reservation closes that gap.
+    fn reserve_due_automations(&self, now: i64) -> Result<Vec<AutomationPermit>> {
+        // All callers that need both locks acquire running -> state in order.
+        let mut running = self.shared.running_automations.lock().unwrap();
+        let mut state = self.shared.stage_b.lock().unwrap();
+        let mut next = state.clone();
+        let mut due = Vec::new();
+        let mut changed = false;
+        for job in &mut next.jobs {
+            if !job.enabled {
+                continue;
+            }
+            let deadline = job
+                .next_run_at
+                .as_deref()
+                .and_then(|value| chrono::DateTime::parse_from_rfc3339(value).ok())
+                .map(|dt| dt.timestamp_millis());
+            let Some(deadline) = deadline else {
+                job.enabled = false;
+                job.last_error = Some("missing or malformed next run; disabled".into());
+                job.next_run_at = None;
+                changed = true;
+                continue;
+            };
+            if deadline > now || running.contains(&job.id) {
+                continue;
+            }
+            match next_job_time_offset(&job.kind, &job.schedule, now, job.utc_offset_minutes) {
+                Ok(next_time) => {
+                    job.enabled = next_time.is_some();
+                    job.next_run_at = next_time.map(timestamp_iso).transpose()?;
+                    due.push(job.id.clone());
                     changed = true;
-                    continue;
-                };
-                if deadline > now {
-                    continue;
                 }
-                // A running manual turn can overlap the clock. Defer without
-                // advancing the due date, so it is still due at the next tick.
-                if self
-                    .shared
-                    .running_automations
-                    .lock()
-                    .unwrap()
-                    .contains(&job.id)
-                {
-                    continue;
-                }
-                match next_job_time_offset(&job.kind, &job.schedule, now, job.utc_offset_minutes) {
-                    Ok(upcoming) => {
-                        job.enabled = upcoming.is_some();
-                        job.next_run_at = upcoming.map(timestamp_iso).transpose()?;
-                        changed = true;
-                        ids.push(job.id.clone());
-                    }
-                    Err(error) => {
-                        job.enabled = false;
-                        job.next_run_at = None;
-                        job.last_error = Some(format!("invalid schedule: {error}"));
-                        changed = true;
-                    }
+                Err(error) => {
+                    job.enabled = false;
+                    job.next_run_at = None;
+                    job.last_error = Some(format!("invalid schedule: {error}"));
+                    changed = true;
                 }
             }
-            if changed {
-                next.save(&self.shared.stage_b_path)?;
-                *guard = next;
-            }
-            ids
-        };
+        }
+        if changed {
+            // The reservation is only visible after the durable claim commits.
+            next.save(&self.shared.stage_b_path)?;
+            *state = next;
+        }
         for id in &due {
+            running.insert(id.clone());
+        }
+        Ok(due
+            .into_iter()
+            .map(|id| AutomationPermit {
+                studio: self.clone(),
+                id,
+            })
+            .collect())
+    }
+    pub async fn tick_automations(&self) -> Result<usize> {
+        let permits = self.reserve_due_automations(now_ms())?;
+        let count = permits.len();
+        for permit in permits {
             let studio = self.clone();
-            let id = id.clone();
+            let id = permit.id.clone();
             tauri::async_runtime::spawn(async move {
-                let _ = studio.run_automation_job(&id).await;
+                let _ = studio.run_automation_with_permit(&id, permit).await;
             });
         }
-        Ok(due.len())
+        Ok(count)
     }
     pub(crate) fn start_automation_scheduler(&self) {
         let studio = self.clone();
@@ -662,19 +677,63 @@ fn validate_job(job: &ScheduledJob) -> Result<()> {
     Ok(())
 }
 
+/// Verify the *directories* as well as individual file paths. Checking only
+/// the file's canonical parent was insufficient if session-files/<agent> was
+/// itself a symlink to a directory outside Studio's managed app-data area.
+fn checked_managed_child(path: &Path, canonical_parent: &Path, create: bool) -> Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) => ensure!(
+            meta.is_dir() && !meta.file_type().is_symlink(),
+            "managed attachment directory must not be a symlink"
+        ),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            if !create {
+                return Ok(false);
+            }
+            std::fs::create_dir(path)?;
+        }
+        Err(error) => return Err(error.into()),
+    }
+    ensure!(
+        std::fs::canonicalize(path)?.parent() == Some(canonical_parent),
+        "managed attachment directory escaped app-data root"
+    );
+    Ok(true)
+}
+pub(crate) fn managed_attachment_directory(
+    base: &Path,
+    namespace: &str,
+    create: bool,
+) -> Result<std::path::PathBuf> {
+    ensure!(
+        validate_id(namespace),
+        "invalid managed attachment namespace"
+    );
+    let root = base.join("session-files");
+    let dir = root.join(namespace);
+    if create {
+        std::fs::create_dir_all(base)?;
+    }
+    let canonical_base = std::fs::canonicalize(base).context("managed data directory missing")?;
+    if !checked_managed_child(&root, &canonical_base, create)? {
+        return Ok(dir);
+    }
+    let canonical_root = std::fs::canonicalize(&root)?;
+    let _ = checked_managed_child(&dir, &canonical_root, create)?;
+    Ok(dir)
+}
 fn attachment_namespace(studio: &Studio, agent_id: &str) -> Result<std::path::PathBuf> {
     ensure!(validate_id(agent_id), "invalid attachment Agent ID");
     ensure!(
         studio.session_on_disk(agent_id) || studio.agent(agent_id).is_ok(),
         "session not found"
     );
-    Ok(studio
+    let base = studio
         .shared
         .sessions_dir
         .parent()
-        .context("sessions parent missing")?
-        .join("session-files")
-        .join(agent_id))
+        .context("sessions parent missing")?;
+    managed_attachment_directory(base, agent_id, false)
 }
 fn attachment_id_and_name(filename: &str) -> Option<(String, String)> {
     let segments = filename.splitn(5, '-').collect::<Vec<_>>();
@@ -967,6 +1026,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scheduler_due_reservation_blocks_manual_steal_before_spawn() {
+        let path = std::env::temp_dir().join(format!("stage-c-reservation-{}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        let studio = Studio::with_hook(None, None, path.clone()).await.unwrap();
+        let added = studio
+            .mutate_automation(json!({"action":"add", "type":"every",
+            "schedule":60000, "prompt":"do one task", "enabled":true}))
+            .unwrap();
+        let id = added["job"]["id"].as_str().unwrap().to_owned();
+        let now = now_ms();
+        {
+            let mut store = studio.shared.stage_b.lock().unwrap();
+            store.jobs[0].next_run_at = Some(timestamp_iso(now - 10_000).unwrap());
+            store.save(&studio.shared.stage_b_path).unwrap();
+        }
+        let reserved = studio.reserve_due_automations(now).unwrap();
+        assert_eq!(reserved.len(), 1);
+        assert_eq!(reserved[0].id, id);
+        assert!(
+            studio
+                .run_automation_job(&id)
+                .await
+                .unwrap_err()
+                .to_string()
+                .contains("already running"),
+            "manual call must not steal claimed run"
+        );
+        assert!(
+            studio.reserve_due_automations(now).unwrap().is_empty(),
+            "a claimed run cannot get a second reservation"
+        );
+        let persisted = StageBStore::load(&studio.shared.stage_b_path).unwrap();
+        assert!(persisted.jobs[0].next_run_at.as_ref().unwrap() > &timestamp_iso(now).unwrap());
+        drop(reserved);
+        assert!(!studio
+            .shared
+            .running_automations
+            .lock()
+            .unwrap()
+            .contains(&id));
+        let _ = std::fs::remove_dir_all(&path);
+    }
+
+    #[tokio::test]
     async fn managed_attachments_restrict_identity_and_symlinks() {
         use base64::Engine;
         let path = std::env::temp_dir().join(format!("stage-b-files-{}", std::process::id()));
@@ -1006,6 +1109,44 @@ mod tests {
         assert!(studio
             .attachment_operation(&agent, file_id, "read")
             .is_err());
+        // A whole per-session directory symlink must not turn a namespace
+        // check into arbitrary file access (even when the file itself is real).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let root = path.join("session-files");
+            let dir = root.join(&agent);
+            let saved_dir = root.join("safe-copy");
+            std::fs::rename(&dir, &saved_dir).unwrap();
+            let outside = path.join("unmanaged-target");
+            std::fs::create_dir(&outside).unwrap();
+            symlink(&outside, &dir).unwrap();
+            assert!(studio.list_session_attachments(&agent).is_err());
+            assert!(studio
+                .attachment_operation(&agent, file_id, "read")
+                .is_err());
+            assert!(studio
+                .upload_blob(Some(&agent), "unsafe.txt", &payload, None)
+                .await
+                .is_err());
+            std::fs::remove_file(&dir).unwrap();
+            std::fs::rename(&saved_dir, &dir).unwrap();
+            // Even the shared managed root is not trusted when replaced.
+            let saved_root = path.join("managed-root-backup");
+            std::fs::rename(&root, &saved_root).unwrap();
+            symlink(&outside, &root).unwrap();
+            assert!(studio.list_session_attachments(&agent).is_err());
+            assert!(studio
+                .upload_blob(Some(&agent), "unsafe-root.txt", &payload, None)
+                .await
+                .is_err());
+            std::fs::remove_file(&root).unwrap();
+            std::fs::rename(&saved_root, &root).unwrap();
+            assert!(studio.list_session_attachments(&agent).unwrap()["files"]
+                .as_array()
+                .unwrap()
+                .is_empty());
+        }
         let _ = studio.dispose_agent(&agent);
         let _ = std::fs::remove_dir_all(path);
     }

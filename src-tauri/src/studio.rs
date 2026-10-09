@@ -3114,16 +3114,21 @@ impl Studio {
             .id_seq
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let file_id = format!("studio-file-{:x}-{:x}", stamp, seq);
-        let dir = self
+        let base = self
             .shared
             .sessions_dir
             .parent()
-            .unwrap_or(&self.shared.sessions_dir)
-            .join("session-files")
-            .join(namespace);
-        tokio::fs::create_dir_all(&dir).await?;
+            .ok_or_else(|| anyhow::anyhow!("missing attachment data directory"))?;
+        let dir = crate::stage_b::managed_attachment_directory(base, namespace, true)?;
         let dest = dir.join(format!("{}-{}", file_id, safe_name));
-        tokio::fs::write(&dest, &bytes).await?;
+        use tokio::io::AsyncWriteExt;
+        let mut file = tokio::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&dest)
+            .await?;
+        file.write_all(&bytes).await?;
+        file.sync_all().await?;
 
         let mime = mime_type.unwrap_or("application/octet-stream").trim();
         let kind = upload_kind(mime);
