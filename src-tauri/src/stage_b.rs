@@ -1227,8 +1227,12 @@ mod tests {
                     .unwrap()
                     .contains("invalid schedule")
         );
-        // Reopen persisted state independently: due-once claim survives restart.
-        let recovered = StageBStore::load(&studio.shared.stage_b_path).unwrap();
+        // Check the durable bytes while a live dispatch may still be writing.
+        // StageBStore::load performs *cold restart reconciliation and save*;
+        // it must never be invoked concurrently against a live store because
+        // that would race the native writer's atomic temporary rename.
+        let recovered:StageBStore=serde_json::from_slice(
+            &std::fs::read(&studio.shared.stage_b_path).unwrap()).unwrap();
         assert!(
             !recovered
                 .jobs

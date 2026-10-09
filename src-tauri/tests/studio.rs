@@ -873,6 +873,18 @@ async fn an_agent_calls_a_wasm_tool_in_a_real_turn() {
         result.finished_at >= call.started_at,
         "tool/result event time must follow its call: {call:?} {result:?}"
     );
+    // Trajectory is backed by the very same native Session Event ledger,
+    // not a browser approximation or a synthetic mock timeline.
+    let trajectory=studio.session_trajectory("a1",None,Some(200)).unwrap();
+    let rows=trajectory["records"].as_array().unwrap();
+    assert!(rows.iter().any(|row|row["kind"]=="user/message" && row["role"]=="user"));
+    assert!(rows.iter().any(|row|row["kind"]=="tool/call" && row["label"]=="alpha_tool"
+        && row["callId"]=="call-1"));
+    assert!(rows.iter().any(|row|row["kind"]=="tool/result"
+        && row["output"].as_str().unwrap_or_default().contains("ran")));
+    assert!(rows.iter().any(|row|row["kind"]=="assistant/message"));
+    assert!(rows.windows(2).all(|pair|pair[0]["seq"].as_u64()<pair[1]["seq"].as_u64()),
+        "trajectory rows must keep original event order");
     // The turn closed with the model's final text.
     assert_eq!(transcript.last().unwrap().text, "done");
 }

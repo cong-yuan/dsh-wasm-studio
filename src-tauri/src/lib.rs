@@ -15,6 +15,7 @@ pub mod commands;
 mod agent_controls;
 mod stage_a_impl;
 mod stage_b;
+mod trajectory;
 #[cfg(unix)]
 mod managed_attachments;
 pub mod studio;
@@ -149,6 +150,7 @@ pub fn run() {
             commands::list_models,
             commands::upload_blob,
             commands::transcript,
+            commands::session_trajectory,
             commands::chat_partial,
             commands::capabilities,
             commands::get_agent_control_capabilities,

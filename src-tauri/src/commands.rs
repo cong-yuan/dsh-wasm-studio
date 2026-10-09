@@ -707,6 +707,14 @@ pub fn transcript(
     studio.transcript(&agent_id).map_err(err)
 }
 
+/// A paged, read-only ledger of actual session events, suitable for the
+/// Input/Model/Tools timing overview and role-colored trajectory inspector.
+#[tauri::command]
+pub fn session_trajectory(studio: State<'_, Studio>, agent_id: String,
+    before: Option<u64>, limit: Option<usize>) -> Result<Value,String> {
+    studio.session_trajectory(&agent_id,before,limit).map_err(err)
+}
+
 // ---------------------------------------------------------------------------
 // Capabilities / introspection
 // ---------------------------------------------------------------------------
