@@ -28,4 +28,5 @@ pub mod core;
 pub mod llm;
 pub mod session;
 pub mod tools;
+pub mod runtime_controls;
 pub mod types;

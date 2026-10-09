@@ -258,3 +258,13 @@ for the reasoning, and note the **Capabilities page** restates this in-app.
   only *deactivates* the slot in the registry — it does not destroy the guest
   instance. That separation is what makes a hot reload possible (dispose the
   fiber → swap the code → remount); the studio unloads the guest explicitly.
+
+## Native Stage A Agent controls (2026-10-09)
+
+Studio now exposes authenticated Tauri commands for per-session thinking, permission, Memory, primary Agent selection and versioned per-Agent configuration. The settings are stored atomically at `<app-data>/agent-controls.json`; pre-existing JSONL transcripts are never rewritten by config edits. The plugin command bridge must require an explicit `ok: true` acknowledgement for every mutation, including matching target ID and revision.
+
+The vendored `dsh-rs` consumes controls at **execution time**: supported OpenAI reasoning models receive `reasoning_effort` (with `extra-high` mapped to `xhigh`); the tool registry checks the session policy before every tool hook or dispatch; enabled, explicitly configured `memoryNotes` are appended only to that Agent's request system context. `read_only` rejects side-effect/unknown tools, `ask` returns `APPROVAL` for them, and `operate`/`auto` permit normal tool execution. There is **no interactive approval grant flow** yet: `ask` errs closed until explicitly changed to an executable mode. Memory is a gated durable **per-Agent note**, not a claim to provide cross-chat automatic memory indexing or dreaming. The Memory toggle is meaningful when memory notes exist; default notes are empty. Reasoning effort is only available for models known to support it; generic models are locked rather than receiving unsupported API parameters.
+
+New, resumed, and forked Agents receive their own session-scoped control snapshots. `get_agent_config` returns `revision` and configuration; `patch_agent_config` rejects stale revision writes and unsupported settings. Provider/model updates go through Studio's existing live model rebind (never just setting the UI field). `switch_primary_agent` only accepts a live Agent and persists the selected ID; the plugin uses that choice when selecting the current Agent. Existing Studio installations with no control file start from conservative `ask`, empty Memory and `off` Thinking.
+
+Known limitations: the standalone upstream agent identity/Settings UI includes fields not implemented by the Studio Agent runtime; those unrelated PUT fields fail closed. Approval workflow and automated memory extraction are separate future work. This is not a security boundary for *direct, user-initiated* Tauri calls outside an Agent's tool execution context.

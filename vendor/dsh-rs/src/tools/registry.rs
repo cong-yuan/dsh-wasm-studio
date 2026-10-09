@@ -160,6 +160,14 @@ impl ToolRegistry {
             );
         };
 
+        // Host-enforced per-agent rule is evaluated before *all* tool hooks.
+        // Plugins and permissive waterfalled listeners cannot override it.
+        if let Some(agent_id) = run_ctx.agent_id.as_deref() {
+            if let Some((code, reason)) = crate::runtime_controls::tool_denial(agent_id, &name) {
+                return ToolExecutionResult::error(code, reason);
+            }
+        }
+
         // 1. tools/pre-execute: allow/deny/ask decision waterfall.
         let pre_payload = json!({ "name": name, "arguments": args.arguments.clone() });
         let pre_decision = match self

@@ -12,6 +12,8 @@
 //! in [`commands`]: list/mutate plugins, tools and services, and stream logs.
 
 pub mod commands;
+mod agent_controls;
+mod stage_a_impl;
 pub mod studio;
 
 use studio::Studio;
@@ -146,6 +148,15 @@ pub fn run() {
             commands::transcript,
             commands::chat_partial,
             commands::capabilities,
+            commands::get_agent_control_capabilities,
+            commands::get_session_runtime_controls,
+            commands::set_session_thinking_level,
+            commands::set_session_permission_mode,
+            commands::set_session_memory_enabled,
+            commands::get_primary_agent,
+            commands::switch_primary_agent,
+            commands::get_agent_config,
+            commands::patch_agent_config,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

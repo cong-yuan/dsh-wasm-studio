@@ -184,6 +184,15 @@ async fn run_turn(agent: &Arc<Agent>, claimed: Vec<Message>) -> Result<(), crate
             session_id: Some(agent.id.clone()),
         };
 
+        // Agent memory is injected into the model request only when enabled.
+        // A disabled session must not receive durable memory notes.
+        let controls = crate::runtime_controls::get(&agent.id);
+        let mut options = options;
+        if controls.memory_enabled && !controls.memory_notes.is_empty() {
+            let prior = options.system.take().unwrap_or_default();
+            options.system = Some(format!("{prior}\n\n[Agent memory]\n{}", controls.memory_notes));
+        }
+
         let header = EpochHeader {
             config: config.clone(),
             system: options.system.clone(),

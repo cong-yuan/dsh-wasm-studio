@@ -99,6 +99,12 @@ impl OpenAiAdapter {
             body["tools"] = Value::Array(mapped);
             body["parallel_tool_calls"] = json!(true);
         }
+        if let Some(agent_id) = options.session_id.as_deref() {
+            let controls = crate::runtime_controls::get(agent_id);
+            if controls.thinking_level != "off" && crate::runtime_controls::supports_reasoning(&options.model) {
+                body["reasoning_effort"] = json!(if controls.thinking_level == "extra-high" { "xhigh" } else { &controls.thinking_level });
+            }
+        }
         if let Some(temperature) = options.temperature {
             body["temperature"] = json!(temperature);
         }
@@ -453,6 +459,20 @@ mod tests {
             stop: None,
             session_id: None,
         }
+    }
+
+    #[test]
+    fn thinking_effort_reaches_supported_model_wire_only() {
+        let adapter = OpenAiAdapter::new(json!({"base_url": "https://api.openai.com/v1"})).unwrap();
+        let mut request = options(Message::user("reasoning", vec![ContentBlock::text("solve") ]));
+        request.session_id = Some("reasoning-probe".into());
+        crate::runtime_controls::set("reasoning-probe", crate::runtime_controls::RuntimeControls {
+            thinking_level: "extra-high".into(), ..Default::default()
+        });
+        request.model = "gpt-5".into();
+        assert_eq!(adapter.build_body(&request)["reasoning_effort"], "xhigh");
+        request.model = "gpt-4o-mini".into();
+        assert!(adapter.build_body(&request).get("reasoning_effort").is_none());
     }
 
     #[test]

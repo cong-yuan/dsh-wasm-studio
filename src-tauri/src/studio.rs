@@ -63,6 +63,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{AppHandle, Emitter};
 use wasm_plugin_host::{Config, PluginEntry};
+use crate::agent_controls::{ControlStore, AgentSettings};
 
 /// A callback the studio fires when something changes, so the UI can refresh
 /// and the watcher can report what it did. Boxed so the Tauri layer can forward
@@ -92,7 +93,7 @@ pub enum StudioEvent {
     Changed,
 }
 
-struct Shared {
+pub(crate) struct Shared {
     ctx: cordis::Context,
     host: WasmHost,
     /// The Tauri app handle, kept so the studio can open/close plugin windows
@@ -152,6 +153,8 @@ struct Shared {
     config_path: PathBuf,
     /// The desired state, mirrored to `config_path`.
     config: Mutex<Config>,
+    pub(crate) agent_controls_path: PathBuf,
+    pub(crate) agent_controls: Mutex<ControlStore>,
     booted: bool,
     // --- auto-reload watcher ---
     watch_stop: AtomicBool,
@@ -163,7 +166,7 @@ struct Shared {
 /// through here, so the watcher thread can hold its own clone.
 #[derive(Clone)]
 pub struct Studio {
-    shared: Arc<Shared>,
+    pub(crate) shared: Arc<Shared>,
 }
 
 type FiberHandle = cordis::FiberHandle;
@@ -269,6 +272,9 @@ impl Studio {
             .context("sessions service — is the dsh base bundle installed?")?;
         let agent_owner = dsh_rs::core::AgentRegistry::new(ctx.clone(), (*sessions).clone());
 
+        let controls_path = app_data_dir.join("agent-controls.json");
+        let controls = ControlStore::load(&controls_path)?;
+        controls.hydrate();
         let studio = Studio {
             shared: Arc::new(Shared {
                 ctx,
@@ -287,12 +293,24 @@ impl Studio {
                 plugins_dir,
                 config_path,
                 config: Mutex::new(config),
+                agent_controls_path: controls_path,
+                agent_controls: Mutex::new(controls),
                 booted: true,
                 watch_stop: AtomicBool::new(false),
                 watch_handle: Mutex::new(None),
                 hook: Mutex::new(change_hook),
             }),
         };
+
+        // Hydrate all stored sessions too, not only those with explicit
+        // control records, so legacy sessions cannot accidentally run with
+        // a different permission policy than the native UI reports.
+        for row in studio.list_sessions() {
+            let effective = studio.shared.agent_controls.lock().unwrap().agents
+                .get(&row.id).map(|record| record.config.live())
+                .unwrap_or_else(|| AgentSettings::default().live());
+            dsh_rs::runtime_controls::set(&row.id, effective);
+        }
 
         // Load the persisted desired state.
         studio.autoload().await;
@@ -1589,6 +1607,8 @@ impl Studio {
         // (provider, model). Falling back to a default instead would silently
         // move a restored conversation onto a different model.
         let options = last_request_options(&events);
+        let control_provider = options.provider.clone();
+        let control_model = options.model.clone();
 
         // The working directory is **not** recoverable: dsh keeps `cwd` in the
         // `SessionHeader`, and the JSONL backend writes only events, never the
@@ -1629,6 +1649,7 @@ impl Studio {
             .insert(session_id.to_string(), agent);
         // It is live now, so it must not also be listed as a stored row.
         self.invalidate_stored_cache();
+        self.register_control_agent(session_id, &control_provider, &control_model)?;
         Ok(session_id.to_string())
     }
 
@@ -1773,6 +1794,7 @@ impl Studio {
             .unwrap()
             .insert(child_id.clone(), child_agent);
         self.invalidate_stored_cache();
+        self.inherit_control_agent(&child_id, session_id)?;
 
         Ok(serde_json::json!({
             "sessionId": child_id,
@@ -1998,8 +2020,13 @@ impl Studio {
                 model,
                 max_tokens: None,
             };
-            let agent = reg.create(id, options, cwd, None).map_err(anyhow::Error::msg)?;
+            let agent = reg.create(id, options.clone(), cwd, None).map_err(anyhow::Error::msg)?;
             self.invalidate_stored_cache();
+            let runtime = self.shared.agent_controls.lock().unwrap().agents
+                .get(agent.id()).map(|record| record.config.live())
+                .unwrap_or_else(|| AgentSettings::default().live());
+            dsh_rs::runtime_controls::set(agent.id(), runtime);
+            self.register_control_agent(agent.id(), &options.provider, &options.model)?;
             Ok(agent.id().to_string())
         })
     }
@@ -2030,13 +2057,13 @@ impl Studio {
     }
 
     /// Whether a session with this id is already stored on disk.
-    fn session_on_disk(&self, id: &str) -> bool {
+    pub(crate) fn session_on_disk(&self, id: &str) -> bool {
         self.persistence()
             .map(|b| b.list().iter().any(|s| s == id))
             .unwrap_or(false)
     }
 
-    fn agent(&self, id: &str) -> Result<Arc<dyn dsh_rs::api::services::AgentView>> {
+    pub(crate) fn agent(&self, id: &str) -> Result<Arc<dyn dsh_rs::api::services::AgentView>> {
         // Resumed agents are held by us, not by the registry (see `Shared::resumed`).
         if let Some(agent) = self.shared.resumed.lock().unwrap().get(id) {
             return Ok(agent.clone() as Arc<dyn dsh_rs::api::services::AgentView>);
@@ -4147,7 +4174,7 @@ fn turn_bounds_for_event(
 /// or hand-truncated session). `mock` is dsh's own default and is always
 /// registered, so the agent is still constructible; it will refuse real work,
 /// which is the honest outcome for a log that does not say what it used.
-fn last_request_options(events: &[dsh_rs::types::SessionEvent]) -> dsh_rs::types::AgentOptions {
+pub(crate) fn last_request_options(events: &[dsh_rs::types::SessionEvent]) -> dsh_rs::types::AgentOptions {
     use dsh_rs::types::SessionEventData;
     let config = events.iter().rev().find_map(|e| match &e.data {
         SessionEventData::RequestHeader { header } => Some(&header.config),

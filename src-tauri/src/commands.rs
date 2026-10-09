@@ -816,3 +816,44 @@ pub fn capabilities(studio: State<'_, Studio>) -> Capabilities {
             .unwrap_or(false),
     }
 }
+
+// ---------------------------------------------------------------------------
+// Phase A: authenticated Studio-owned Agent controls (never JS-only overlays).
+// ---------------------------------------------------------------------------
+#[tauri::command]
+pub fn get_agent_control_capabilities(studio: State<'_, Studio>) -> Value {
+    studio.get_agent_control_capabilities()
+}
+#[tauri::command]
+pub fn get_session_runtime_controls(studio: State<'_, Studio>, agent_id: String) -> Result<Value, String> {
+    studio.get_session_runtime_controls(&agent_id).map_err(err)
+}
+#[tauri::command]
+pub fn set_session_thinking_level(studio: State<'_, Studio>, agent_id: String, level: String) -> Result<Value, String> {
+    studio.set_session_thinking_level(&agent_id, &level).map_err(err)
+}
+#[tauri::command]
+pub fn set_session_permission_mode(studio: State<'_, Studio>, agent_id: String, mode: String) -> Result<Value, String> {
+    studio.set_session_permission_mode(&agent_id, &mode).map_err(err)
+}
+#[tauri::command]
+pub fn set_session_memory_enabled(studio: State<'_, Studio>, agent_id: String, enabled: bool) -> Result<Value, String> {
+    studio.set_session_memory_enabled(&agent_id, enabled).map_err(err)
+}
+#[tauri::command]
+pub fn get_primary_agent(studio: State<'_, Studio>) -> Result<Value, String> {
+    studio.get_primary_agent().map_err(err)
+}
+#[tauri::command]
+pub fn switch_primary_agent(studio: State<'_, Studio>, agent_id: String) -> Result<Value, String> {
+    studio.switch_primary_agent(&agent_id).map_err(err)
+}
+#[tauri::command]
+pub fn get_agent_config(studio: State<'_, Studio>, agent_id: String) -> Result<Value, String> {
+    studio.get_agent_config(&agent_id).map_err(err)
+}
+#[tauri::command]
+pub async fn patch_agent_config(studio: State<'_, Studio>, agent_id: String,
+    patch: Value, revision: String) -> Result<Value, String> {
+    studio.patch_agent_config(&agent_id, patch, &revision).await.map_err(err)
+}
