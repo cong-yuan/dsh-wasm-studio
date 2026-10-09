@@ -325,8 +325,18 @@ impl Studio {
             "catalog":guard.catalog,"assignments":guard.assignments}))
     }
     pub fn automation_jobs(&self) -> Value {
+        let active = self.shared.running_automations.lock().unwrap();
         let state = self.shared.stage_b.lock().unwrap();
-        json!({"ok":true,"jobs":state.jobs,"schedulerAvailable":true,"editableDrafts":false})
+        let jobs = state
+            .jobs
+            .iter()
+            .map(|job| {
+                let mut row = serde_json::to_value(job).expect("serializable automation");
+                row["running"] = json!(active.contains(&job.id));
+                row
+            })
+            .collect::<Vec<_>>();
+        json!({"ok":true,"jobs":jobs,"schedulerAvailable":true,"editableDrafts":false})
     }
     pub fn mutate_automation(&self, payload: Value) -> Result<Value> {
         let action = payload
@@ -336,12 +346,21 @@ impl Studio {
         if action == "run" {
             bail!("use native run_automation_job for execution");
         }
+        // Maintain one lock order (running, then persisted jobs) in every path.
+        let running = self.shared.running_automations.lock().unwrap();
         let mut state = self.shared.stage_b.lock().unwrap();
         let mut next = state.clone();
         let index = payload
             .get("id")
             .and_then(Value::as_str)
             .and_then(|id| next.jobs.iter().position(|row| row.id == id));
+        if matches!(action, "remove" | "toggle" | "update") {
+            let i = index.context("automation job not found")?;
+            ensure!(
+                !running.contains(&next.jobs[i].id),
+                "automation is currently running; edit after dispatch completes"
+            );
+        }
         let now = now_ms();
         let result = match action {
             "add" | "apply_suggestion" => {
@@ -810,7 +829,44 @@ impl Studio {
         match action {
             "read" => {
                 use base64::Engine;
-                let data = std::fs::read(entry.path())?;
+                use std::io::Read;
+                // Re-verify the open descriptor and bound the number of bytes
+                // actually read. A concurrent append cannot allocate arbitrarily
+                // even if its pre-open metadata was below the 20 MiB limit.
+                let path = entry.path();
+                let mut options = std::fs::OpenOptions::new();
+                options.read(true);
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::OpenOptionsExt;
+                    #[cfg(target_os = "macos")]
+                    const NOFOLLOW: i32 = 0x100;
+                    #[cfg(target_os = "linux")]
+                    const NOFOLLOW: i32 = 0o400000;
+                    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+                    const NOFOLLOW: i32 = 0;
+                    options.custom_flags(NOFOLLOW);
+                }
+                let file = options.open(&path)?;
+                let opened = file.metadata()?;
+                ensure!(
+                    opened.is_file() && opened.len() <= 20 * 1024 * 1024,
+                    "unsafe or oversized attachment after opening"
+                );
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    ensure!(
+                        opened.dev() == metadata.dev() && opened.ino() == metadata.ino(),
+                        "attachment identity changed during opening"
+                    );
+                }
+                let mut data = Vec::new();
+                file.take(20 * 1024 * 1024 + 1).read_to_end(&mut data)?;
+                ensure!(
+                    data.len() <= 20 * 1024 * 1024,
+                    "attachment grew beyond maximum read size"
+                );
                 Ok(
                     json!({"ok":true,"sessionId":id,"id":file_id,"name":name,"size":data.len(),
                     "base64":base64::engine::general_purpose::STANDARD.encode(data)}),
@@ -1026,6 +1082,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn automation_status_and_mutations_respect_active_run_lock() {
+        let path =
+            std::env::temp_dir().join(format!("stage-c-cross-window-{}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        let studio = Studio::with_hook(None, None, path.clone()).await.unwrap();
+        let created = studio
+            .mutate_automation(json!({"action":"add","type":"every",
+            "schedule":60000,"prompt":"Run once","enabled":true}))
+            .unwrap();
+        let id = created["job"]["id"].as_str().unwrap().to_owned();
+        let permit = studio.acquire_automation(&id).unwrap();
+        let listed = studio.automation_jobs();
+        assert_eq!(listed["jobs"][0]["running"], true);
+        for action in ["update", "toggle", "remove"] {
+            assert!(studio
+                .mutate_automation(json!({"action":action,"id":id,
+                "prompt":"not yet"}))
+                .unwrap_err()
+                .to_string()
+                .contains("currently running"));
+        }
+        assert_eq!(
+            StageBStore::load(&studio.shared.stage_b_path)
+                .unwrap()
+                .jobs
+                .len(),
+            1
+        );
+        drop(permit);
+        assert_eq!(studio.automation_jobs()["jobs"][0]["running"], false);
+        assert_eq!(
+            studio
+                .mutate_automation(json!({"action":"update","id":id,
+            "prompt":"Allowed after dispatch"}))
+                .unwrap()["job"]["prompt"],
+            "Allowed after dispatch"
+        );
+        assert_eq!(
+            studio
+                .mutate_automation(json!({"action":"remove","id":id}))
+                .unwrap()["removed"]["id"],
+            id
+        );
+        assert!(studio.automation_jobs()["jobs"]
+            .as_array()
+            .unwrap()
+            .is_empty());
+        let _ = std::fs::remove_dir_all(path);
+    }
+
+    #[tokio::test]
     async fn scheduler_due_reservation_blocks_manual_steal_before_spawn() {
         let path = std::env::temp_dir().join(format!("stage-c-reservation-{}", std::process::id()));
         std::fs::create_dir_all(&path).unwrap();
@@ -1095,6 +1202,31 @@ mod tests {
             .attachment_operation(&agent, file_id, "read")
             .unwrap();
         assert_eq!(read["base64"], payload);
+        // A sparse file with a trusted-looking name must not be loaded when
+        // it exceeds the managed attachment size limit.
+        let managed = path.join("session-files").join(&agent);
+        let oversized = managed.join("studio-file-ab-cd-oversized.bin");
+        let big = std::fs::File::create(&oversized).unwrap();
+        big.set_len(20 * 1024 * 1024 + 1).unwrap();
+        drop(big);
+        assert!(studio
+            .attachment_operation(&agent, "studio-file-ab-cd", "read")
+            .unwrap_err()
+            .to_string()
+            .contains("oversized"));
+        std::fs::remove_file(oversized).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            let external = path.join("outside-attachment.txt");
+            std::fs::write(&external, "outside data").unwrap();
+            let link = managed.join("studio-file-ff-ee-misleading.txt");
+            symlink(&external, &link).unwrap();
+            assert!(studio
+                .attachment_operation(&agent, "studio-file-ff-ee", "read")
+                .is_err());
+            std::fs::remove_file(link).unwrap();
+        }
         assert!(studio
             .attachment_operation(&agent, "../../unsafe", "read")
             .is_err());
