@@ -11,3 +11,6 @@ vite.config.ts.timestamp-*
 
 # ECC session memory (tool-local, not part of the project)
 .ecc-memory/
+
+# Locally built vendored Rust runtime artifacts
+/vendor/dsh-rs/target/

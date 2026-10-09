@@ -1,7 +1,8 @@
 //! Backend integration tests: boot the studio headlessly and drive it.
 //!
 //! These run without a Tauri window, so the boot path, plugin mounting and the
-//! command logic are all exercised in CI. Plugins are tiny WAT modules compiled
+//! command logic are exercised by local `cargo test --test studio`.
+//! GitHub Actions is intentionally not used by this project. Plugins are tiny WAT modules compiled
 //! in-process, so no `cargo build` of a wasm plugin is needed.
 
 use std::path::PathBuf;
@@ -723,6 +724,55 @@ async fn an_agent_runs_a_turn_over_the_mock_provider() {
 }
 
 #[tokio::test]
+async fn denied_wasm_tool_approval_cannot_execute_guest_code() {
+    use dsh_rs::api::services::LlmService;
+    use std::sync::Arc;
+    let dir = tmpdir("denied-agent-tool");
+    let wasm = dir.join("alpha.wasm");
+    std::fs::write(&wasm, wasm_tool("alpha")).unwrap();
+    let studio = Studio::with_hook(None, None, dir).await.unwrap();
+    studio.mount_slot("alpha", &wasm.display().to_string(), json!(null))
+        .await.unwrap();
+    let runtime = studio.ctx().require::<LlmService>(dsh_rs::api::LLM_SERVICE).unwrap();
+    runtime.unregister_adapter(&["mock"]);
+    runtime.register_adapter(&["mock"], Arc::new(
+        dsh_rs::llm::adapters::mock::MockAdapter::scripted(vec![
+            dsh_rs::llm::adapters::mock::MockAdapter::tool_call_response(
+                "deny-call", "alpha_tool", json!({})),
+            dsh_rs::llm::adapters::mock::MockAdapter::text_response("done"),
+        ])
+    )).unwrap();
+    let id = "approval-denied-agent";
+    studio.create_agent(Some(id.into()),"mock".into(),"mock-1".into(),Some("/tmp".into())).unwrap();
+    let runner = studio.clone();
+    let task = tokio::spawn(async move {
+        runner.send_message(id,"call denied tool".into(),"denied-user".into()).await
+    });
+    let pending = tokio::time::timeout(std::time::Duration::from_secs(8), async {
+        loop {
+            let result = studio.pending_tool_approvals(id).unwrap();
+            if let Some(row) = result["approvals"].as_array().unwrap().iter()
+                .find(|row|row["toolName"] == "alpha_tool" && row["callId"] == "deny-call") {
+                break row.clone();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }).await.expect("pending approval should appear");
+    let approval_id = pending["id"].as_str().unwrap();
+    assert_eq!(studio.decide_tool_approval(id,approval_id,false).unwrap()["approved"],false);
+    assert!(studio.decide_tool_approval(id,approval_id,true).is_err(),
+        "a denied request must not be approved after consumption");
+    tokio::time::timeout(std::time::Duration::from_secs(8),task)
+        .await.expect("denied tool should settle promptly").unwrap().unwrap();
+    let transcript = studio.transcript(id).unwrap();
+    let results:Vec<_> = transcript.iter().flat_map(|m|m.tool_results.iter()).collect();
+    let result = results.iter().find(|r|r.tool_call_id == "deny-call").expect("denial should reach transcript");
+    assert!(result.is_error,"denial must be reflected as a tool error");
+    assert!(!result.content.contains("ran"),"a denied guest tool must never execute");
+    assert!(studio.pending_tool_approvals(id).unwrap()["approvals"].as_array().unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn an_agent_calls_a_wasm_tool_in_a_real_turn() {
     // The headline: the agent loop dispatches into a WASM plugin's tool and the
     // result lands in the session transcript. Requires scripting the mock
@@ -763,10 +813,30 @@ async fn an_agent_calls_a_wasm_tool_in_a_real_turn() {
     studio
         .create_agent(Some("a1".into()), "mock".into(), "mock-1".into(), Some("/tmp".into()))
         .unwrap();
-    studio
-        .send_message("a1", "call the tool".into(), "u1".into())
-        .await
-        .unwrap();
+    // Production defaults to ask. A live WASM tool needs an explicit,
+    // single-use user decision instead of silently running in a test.
+    let run_studio = studio.clone();
+    let turn = tokio::spawn(async move {
+        run_studio.send_message("a1", "call the tool".into(), "u1".into()).await
+    });
+    let approval = tokio::time::timeout(std::time::Duration::from_secs(8), async {
+        loop {
+            let pending = studio.pending_tool_approvals("a1").unwrap();
+            if let Some(row) = pending["approvals"].as_array().unwrap().iter()
+                .find(|row|row["toolName"] == "alpha_tool" && row["callId"] == "call-1") {
+                break row.clone();
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }).await.expect("tool approval should become visible");
+    let approval_id = approval["id"].as_str().unwrap();
+    assert_eq!(approval["agentId"],"a1");
+    assert_eq!(approval["arguments"],json!({}));
+    assert!(studio.decide_tool_approval("a1", approval_id, true).unwrap()["approved"] == true);
+    assert!(studio.decide_tool_approval("a1", approval_id, true).is_err(),
+        "grants must be consumed exactly once");
+    tokio::time::timeout(std::time::Duration::from_secs(8),turn)
+        .await.expect("approved tool turn timed out").unwrap().unwrap();
 
     let transcript = studio.transcript("a1").unwrap();
     // The tool call was requested…
