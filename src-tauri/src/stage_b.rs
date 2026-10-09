@@ -346,6 +346,15 @@ impl Studio {
         if action == "run" {
             bail!("use native run_automation_job for execution");
         }
+        // The native scheduler executes Agent prompts, not arbitrary plugin
+        // actions or a per-job model override. Never ACK unsupported settings.
+        ensure!(
+            !payload.get("model").is_some_and(|value| !value.is_null())
+                && !payload
+                    .get("executor")
+                    .is_some_and(|value| !value.is_null()),
+            "native scheduler does not support per-job model or executor overrides"
+        );
         // Maintain one lock order (running, then persisted jobs) in every path.
         let running = self.shared.running_automations.lock().unwrap();
         let mut state = self.shared.stage_b.lock().unwrap();
@@ -387,6 +396,9 @@ impl Studio {
                 } else {
                     &payload
                 };
+                ensure!(!item.get("model").is_some_and(|value| !value.is_null())
+                    && !item.get("executor").is_some_and(|value| !value.is_null()),
+                    "native scheduler does not support per-job model or executor overrides");
                 let id = loop {
                     let seq = self
                         .shared
@@ -686,9 +698,17 @@ fn validate_job(job: &ScheduledJob) -> Result<()> {
         "invalid UTC offset"
     );
     ensure!(
-        job.label.len() <= 160 && job.prompt.len() <= 65_536 && !job.prompt.trim().is_empty(),
+        job.label.len() <= 160 && job.prompt.len() <= 65_536,
         "invalid automation label/prompt"
     );
+    // A disabled job is a durable editable draft. Empty prompts are allowed
+    // only while disabled; no draft can silently become executable.
+    if job.enabled {
+        ensure!(
+            !job.prompt.trim().is_empty(),
+            "automation prompt required before enabling"
+        );
+    }
     if let Some(id) = &job.actor_agent_id {
         ensure!(validate_id(id), "invalid automation agent ID");
     }
@@ -905,6 +925,48 @@ mod tests {
             None
         );
     }
+    #[tokio::test]
+    async fn native_scheduler_disabled_drafts_can_be_saved_but_not_executed() {
+        let path = std::env::temp_dir().join(format!("studio-draft-{}", std::process::id()));
+        std::fs::create_dir_all(&path).unwrap();
+        let studio = Studio::with_hook(None, None, path.clone()).await.unwrap();
+        let draft = studio
+            .mutate_automation(json!({"action":"add","scheduleType":"cron",
+            "schedule":"0 9 * * *","prompt":"","label":"Draft","enabled":false}))
+            .unwrap();
+        let id = draft["job"]["id"].as_str().unwrap().to_owned();
+        assert!(draft["job"]["enabled"] == false);
+        assert!(studio
+            .mutate_automation(json!({"action":"toggle","id":id}))
+            .is_err());
+        assert!(studio.run_automation_job(&id).await.is_err());
+        assert_eq!(studio.automation_jobs()["jobs"][0]["enabled"], false);
+        assert!(
+            studio
+                .mutate_automation(json!({"action":"update","id":id,
+            "model":"other-provider/model"}))
+                .is_err(),
+            "no fake model override ack"
+        );
+        assert!(
+            studio
+                .mutate_automation(json!({"action":"update","id":id,
+            "executor":{"kind":"plugin"}}))
+                .is_err(),
+            "no fake plugin executor ack"
+        );
+        let enabled = studio
+            .mutate_automation(json!({"action":"update","id":id,
+            "prompt":"Actually do the job","enabled":true}))
+            .unwrap();
+        assert_eq!(enabled["job"]["enabled"], true);
+        assert!(enabled["job"]["nextRunAt"].is_string());
+        let stored = StageBStore::load(&studio.shared.stage_b_path).unwrap();
+        assert_eq!(stored.jobs.len(), 1);
+        assert_eq!(stored.jobs[0].prompt, "Actually do the job");
+        let _ = std::fs::remove_dir_all(path);
+    }
+
     #[tokio::test]
     async fn native_project_cas_and_scheduler_are_persistent() {
         let path = std::env::temp_dir().join(format!("stage-b-project-{}", std::process::id()));
